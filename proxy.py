@@ -32,7 +32,8 @@ from jsonschema import SchemaError, ValidationError, validate
 
 try:  # optional: lenient parsing of almost-JSON produced by weaker models
     import json_repair
-except ImportError:  # pragma: no cover
+except Exception as _e:  # pragma: no cover  (ImportError, or a release broken on this Python)
+    logging.getLogger("pi_bridge").warning("json_repair unavailable, sloppy JSON will not be repaired: %r", _e)
     json_repair = None
 
 log = logging.getLogger("pi_bridge")

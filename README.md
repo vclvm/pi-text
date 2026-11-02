@@ -32,7 +32,12 @@ Pi executes them as usual.
 - No client key: the bridge accepts any local client. It requires
   `Content-Type: application/json`, so web pages in your browser cannot use it.
 
-## Setup (Linux/Fedora)
+## Setup (Linux/Fedora, macOS)
+
+Python 3.9+ (3.10+ recommended). On macOS `/usr/bin/python3` is 3.9; it works, but a
+newer one avoids old dependency releases: `brew install python@3.12` and use
+`python3.12 -m venv .venv`. After pulling a requirements change, re-run
+`.venv/bin/pip install -r requirements.txt`.
 
 ```bash
 python3 -m venv .venv
@@ -115,7 +120,7 @@ Checked against Pi 1.5.0.
 
 ### 1. Start the bridge
 
-Keep it running in its own terminal (see [Setup](#setup-linuxfedora)). Pi will show
+Keep it running in its own terminal (see [Setup](#setup-linuxfedora-macos)). Pi will show
 connection errors if the bridge is down.
 
 ### 2. Register the provider in `models.json`
