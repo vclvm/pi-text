@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local secrets and real configs (only *.example files are committed)
+.env
+.env.*
+models.json
+
+# Bridge debug dumps (contain prompts and code)
+bridge-dumps/

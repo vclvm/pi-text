@@ -46,7 +46,18 @@ RESULT_TAG = "<tool_result"
 # Only these request fields are forwarded upstream. Never forward tools, tool_choice,
 # parallel_tool_calls, store, stream_options or other agent metadata.
 PASSTHROUGH_FIELDS = ("model", "temperature", "top_p", "max_tokens", "max_completion_tokens",
-                      "stop", "seed", "presence_penalty", "frequency_penalty", "reasoning_effort")
+                      "stop", "seed", "presence_penalty", "frequency_penalty", "reasoning_effort",
+                      # OpenRouter extensions: forwarded only when the client sends them, so a plain
+                      # OpenAI-compatible router never sees them unless asked to.
+                      "provider", "reasoning", "models", "route", "transforms", "plugins", "usage",
+                      "top_k", "min_p", "top_a", "repetition_penalty")
+
+# Fields UPSTREAM_EXTRA_BODY must not set: they are owned by the bridge.
+RESERVED_EXTRA_FIELDS = ("messages", "input", "instructions", "tools", "tool_choice", "functions",
+                         "function_call", "parallel_tool_calls", "stream", "stream_options", "store")
+# Chat Completions fields that have no Responses API equivalent (or are mapped explicitly).
+CHAT_ONLY_FIELDS = ("messages", "max_tokens", "max_completion_tokens", "reasoning_effort", "stop", "seed",
+                    "presence_penalty", "frequency_penalty", "stream", "stream_options")
 
 
 # --------------------------------------------------------------------------- settings
@@ -58,11 +69,44 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+API_SUFFIXES = {"chat": "/chat/completions", "responses": "/responses", "completions": "/completions"}
+
+
+def _env_json(name: str) -> dict:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+    except ValueError as e:
+        raise ValueError(f"{name} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return data
+
+
+def resolve_endpoint(url: str, api: str = "") -> tuple[str, str]:
+    """Return (endpoint_url, api). `url` may be a base URL (…/v1) or a full endpoint;
+    the API kind is detected from the suffix unless `api` is given."""
+    url = url.strip().rstrip("/")
+    api = api.strip().lower()
+    if api and api not in API_SUFFIXES:
+        raise ValueError(f"PI_TEXT_API must be one of: chat, responses (got {api!r})")
+    detected = next((name for name, suffix in API_SUFFIXES.items() if url.endswith(suffix)), None)
+    if detected and api and api != detected:
+        raise ValueError(f"PI_TEXT_URL ends with {API_SUFFIXES[detected]} but PI_TEXT_API={api}")
+    api = api or detected or "chat"
+    if api == "completions":
+        raise ValueError("The legacy /completions API (prompt strings) is not supported yet; "
+                         "use /chat/completions or /responses")
+    return (url if detected else url + API_SUFFIXES[api]), api
+
+
 @dataclass
 class Settings:
-    upstream_base_url: str = ""
+    upstream_url: str = ""            # base URL (…/v1) or a full endpoint URL
     upstream_api_key: str = ""
-    bridge_api_key: str = ""          # if set, clients must send `Authorization: Bearer <key>`
+    upstream_api: str = ""            # "chat" | "responses"; empty = detect from upstream_url
     injection_role: str = "user"      # "user": append protocol to the last user turn; "system": to the system prompt
     timeout: float = 600.0
     upstream_stream: bool = True      # use streaming towards the upstream router
@@ -72,14 +116,30 @@ class Settings:
     schema_mismatch: str = "retry"    # "retry" (re-ask the model) or "passthrough" (let the client validate)
     ping_interval: float = 15.0       # SSE keep-alive comments while waiting for the model
     debug_dump_dir: str = ""          # if set, every exchange is written there as JSON
+    extra_body: dict = field(default_factory=dict)     # merged into every upstream request (client wins)
+    extra_headers: dict = field(default_factory=dict)  # added to every upstream request
     nonce_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
+    api: str = field(init=False, default="")       # resolved API kind
+    endpoint: str = field(init=False, default="")  # resolved full endpoint URL
+    models_url: str = field(init=False, default="")  # upstream …/models, for GET /v1/models
+
+    def __post_init__(self) -> None:
+        if self.upstream_url:
+            self.endpoint, self.api = resolve_endpoint(self.upstream_url, self.upstream_api)
+            self.models_url = self.endpoint.removesuffix(API_SUFFIXES[self.api]) + "/models"
+        reserved = sorted(set(self.extra_body) & set(RESERVED_EXTRA_FIELDS))
+        if reserved:
+            raise ValueError(f"UPSTREAM_EXTRA_BODY must not set: {', '.join(reserved)}")
+        bad = [k for k, v in self.extra_headers.items() if not isinstance(v, str)]
+        if bad:
+            raise ValueError(f"UPSTREAM_HEADERS values must be strings: {', '.join(bad)}")
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
-            upstream_base_url=os.environ.get("UPSTREAM_BASE_URL", "").rstrip("/"),
-            upstream_api_key=os.environ.get("UPSTREAM_API_KEY", ""),
-            bridge_api_key=os.environ.get("BRIDGE_API_KEY", ""),
+            upstream_url=os.environ.get("PI_TEXT_URL", ""),
+            upstream_api_key=os.environ.get("PI_TEXT_KEY", ""),
+            upstream_api=os.environ.get("PI_TEXT_API", ""),
             injection_role=os.environ.get("INJECTION_ROLE", "user"),
             timeout=float(os.environ.get("UPSTREAM_TIMEOUT", "600")),
             upstream_stream=_env_bool("UPSTREAM_STREAM", True),
@@ -89,6 +149,8 @@ class Settings:
             schema_mismatch=os.environ.get("SCHEMA_MISMATCH", "retry"),
             ping_interval=float(os.environ.get("PING_INTERVAL", "15")),
             debug_dump_dir=os.environ.get("DEBUG_DUMP_DIR", ""),
+            extra_body=_env_json("UPSTREAM_EXTRA_BODY"),
+            extra_headers=_env_json("UPSTREAM_HEADERS"),
         )
 
 
@@ -311,11 +373,8 @@ def prepare_request(payload: dict, settings: Settings) -> Prepared:
             messages[-1]["content"] += "\n\n" + instruction
         else:
             messages.append({"role": "user", "content": instruction})
-    upstream = {k: payload[k] for k in PASSTHROUGH_FIELDS if k in payload}
-    upstream["messages"] = messages
-    upstream["stream"] = settings.upstream_stream
-    if settings.upstream_stream and settings.upstream_stream_usage:
-        upstream["stream_options"] = {"include_usage": True}
+    upstream = {**settings.extra_body, **{k: payload[k] for k in PASSTHROUGH_FIELDS if k in payload}}
+    upstream["messages"] = messages  # chat-shaped; converted per upstream API in Bridge.open()
     must_call = bool(tools) and (choice == "required" or isinstance(choice, dict))
     return Prepared(upstream, tools, nonce, must_call, payload["model"])
 
@@ -502,11 +561,136 @@ def correction_message(error: str, nonce: str) -> str:
 
 # --------------------------------------------------------------------------- upstream + engine
 
-def _chunk_events(chunk: dict) -> list[tuple[str, Any]]:
-    if "error" in chunk:
-        err = chunk["error"]
+def _raise_if_error(obj: dict) -> None:
+    err = obj.get("error")
+    if err:
         message = err.get("message") if isinstance(err, dict) else str(err)
         raise BridgeError(502, f"upstream: {message}", "upstream_error")
+
+
+def to_chat_payload(chat: dict, settings: Settings) -> dict:
+    payload = dict(chat)
+    payload["stream"] = settings.upstream_stream
+    if settings.upstream_stream and settings.upstream_stream_usage:
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def to_responses_payload(chat: dict, settings: Settings) -> dict:
+    """Chat-shaped payload -> stateless OpenAI/OpenRouter Responses API request."""
+    messages = chat["messages"]
+    payload: dict[str, Any] = {"model": chat["model"], "stream": settings.upstream_stream, "store": False}
+    if messages and messages[0]["role"] == "system":
+        payload["instructions"] = messages[0]["content"]
+        messages = messages[1:]
+    items = []
+    for message in messages:
+        if message["role"] == "assistant":
+            items.append({"type": "message", "role": "assistant", "id": "msg_" + uuid4().hex,
+                          "status": "completed",
+                          "content": [{"type": "output_text", "text": message["content"], "annotations": []}]})
+        else:
+            items.append({"type": "message", "role": message["role"],
+                          "content": [{"type": "input_text", "text": message["content"]}]})
+    payload["input"] = items
+    for key, value in chat.items():  # temperature, top_p, provider, reasoning, extra body, ...
+        if key not in CHAT_ONLY_FIELDS and key not in payload:
+            payload[key] = value
+    max_tokens = chat.get("max_completion_tokens", chat.get("max_tokens"))
+    if max_tokens is not None:
+        payload["max_output_tokens"] = max_tokens
+    if chat.get("reasoning_effort"):
+        reasoning = payload.get("reasoning")
+        payload["reasoning"] = {"effort": chat["reasoning_effort"],
+                                **(reasoning if isinstance(reasoning, dict) else {})}
+    dropped = [k for k in ("stop", "seed", "presence_penalty", "frequency_penalty") if k in chat]
+    if dropped:
+        log.debug("not supported by the Responses API, dropped: %s", ", ".join(dropped))
+    return payload
+
+
+# Event names differ between OpenAI and OpenRouter; accept both.
+RESPONSES_TEXT_DELTAS = ("response.output_text.delta", "response.content_part.delta")
+RESPONSES_REASONING_DELTAS = ("response.reasoning_text.delta", "response.reasoning.delta",
+                              "response.reasoning_summary_text.delta")
+RESPONSES_TERMINAL = ("response.completed", "response.done", "response.incomplete", "response.failed")
+
+
+def _responses_usage(usage: Any) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+    prompt, completion = usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
+    out: dict[str, Any] = {"prompt_tokens": prompt, "completion_tokens": completion,
+                           "total_tokens": usage.get("total_tokens") or prompt + completion}
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+    if cached is not None:
+        out["prompt_tokens_details"] = {"cached_tokens": cached}
+    reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    if reasoning is not None:
+        out["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+    return out
+
+
+def _responses_final(response: dict, *, text: bool, reasoning: bool) -> list[tuple[str, Any]]:
+    """Events from a complete Response object. Text/reasoning are taken from `output`
+    only when they were not streamed as deltas (or in non-streaming mode)."""
+    if response.get("status") == "failed" or response.get("error"):
+        err = response.get("error") or {}
+        message = err.get("message") if isinstance(err, dict) else str(err)
+        raise BridgeError(502, f"upstream: {message or 'response failed'}", "upstream_error")
+    events: list[tuple[str, Any]] = []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "reasoning" and reasoning:
+            for part in (item.get("content") or []) + (item.get("summary") or []):
+                if isinstance(part, dict) and part.get("text"):
+                    events.append(("reasoning", part["text"]))
+        elif item.get("type") == "message" and text:
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") in ("output_text", "text") and part.get("text"):
+                    events.append(("content", part["text"]))
+    finish = "stop"
+    if response.get("status") == "incomplete":
+        reason = (response.get("incomplete_details") or {}).get("reason")
+        finish = {"max_output_tokens": "length", "max_tokens": "length",
+                  "content_filter": "content_filter"}.get(reason, "stop")
+    events.append(("finish", finish))
+    usage = _responses_usage(response.get("usage"))
+    if usage:
+        events.append(("usage", usage))
+    return events
+
+
+class ResponsesStream:
+    """Stateful parser for Responses API SSE events."""
+
+    def __init__(self) -> None:
+        self.text_type: str | None = None       # lock onto one delta event type: no duplicates
+        self.reasoning_type: str | None = None
+        self.done = False                        # only the first terminal event counts
+
+    def events(self, obj: dict) -> list[tuple[str, Any]]:
+        kind = obj.get("type", "")
+        if kind == "error" or (not kind.startswith("response.") and obj.get("error")):
+            message = obj.get("message") or (obj.get("error") or {}).get("message") or json.dumps(obj)[:500]
+            raise BridgeError(502, f"upstream: {message}", "upstream_error")
+        delta = obj.get("delta")
+        if kind in RESPONSES_TEXT_DELTAS and isinstance(delta, str):
+            self.text_type = self.text_type or kind
+            return [("content", delta)] if kind == self.text_type and delta else []
+        if kind in RESPONSES_REASONING_DELTAS and isinstance(delta, str):
+            self.reasoning_type = self.reasoning_type or kind
+            return [("reasoning", delta)] if kind == self.reasoning_type and delta else []
+        if kind in RESPONSES_TERMINAL and not self.done:
+            self.done = True
+            return _responses_final(obj.get("response") or {}, text=self.text_type is None,
+                                    reasoning=self.reasoning_type is None)
+        return []
+
+
+def _chunk_events(chunk: dict) -> list[tuple[str, Any]]:
+    _raise_if_error(chunk)
     events: list[tuple[str, Any]] = []
     choices = chunk.get("choices") or []
     if choices:
@@ -532,15 +716,34 @@ class Bridge:
         self.client = client
 
     def _headers(self) -> dict:
-        headers = {"Content-Type": "application/json"}
+        headers = {**self.s.extra_headers, "Content-Type": "application/json"}
         if self.s.upstream_api_key:
             headers["Authorization"] = f"Bearer {self.s.upstream_api_key}"
         return headers
 
+    async def models(self) -> tuple[int, Any]:
+        """Proxy GET …/models (used by Continue/ProxyAI to list models)."""
+        headers = {k: v for k, v in self._headers().items() if k != "Content-Type"}
+        try:
+            response = await self.client.get(self.s.models_url, headers=headers)
+        except httpx.TimeoutException as e:
+            raise BridgeError(504, f"Upstream timeout: {e!r}", "upstream_timeout") from e
+        except httpx.HTTPError as e:
+            raise BridgeError(502, f"Upstream connection error: {e!r}", "upstream_error") from e
+        if response.status_code >= 400:
+            raise _upstream_error(response.status_code, response.content)
+        try:
+            return response.status_code, response.json()
+        except ValueError as e:
+            raise BridgeError(502, "Upstream /models returned non-JSON body", "upstream_error") from e
+
     async def open(self, payload: dict) -> httpx.Response:
         """Send the upstream request; raises BridgeError on HTTP/transport errors.
-        In streaming mode only the headers have been received when this returns."""
-        url = f"{self.s.upstream_base_url}/chat/completions"
+        In streaming mode only the headers have been received when this returns.
+        `payload` is chat-shaped and converted here for the configured upstream API."""
+        url = self.s.endpoint
+        convert = to_responses_payload if self.s.api == "responses" else to_chat_payload
+        payload = convert(payload, self.s)
         try:
             if self.s.upstream_stream:
                 request = self.client.build_request("POST", url, json=payload, headers=self._headers())
@@ -558,6 +761,8 @@ class Bridge:
         return response
 
     async def events(self, response: httpx.Response) -> AsyncIterator[tuple[str, Any]]:
+        responses = self.s.api == "responses"
+        stream_parser = ResponsesStream() if responses else None
         try:
             if self.s.upstream_stream:
                 async for line in response.aiter_lines():
@@ -571,16 +776,27 @@ class Bridge:
                     except ValueError:
                         log.warning("ignoring unparsable upstream SSE line: %.200s", data)
                         continue
-                    for event in _chunk_events(chunk):
+                    if not isinstance(chunk, dict):
+                        continue
+                    for event in (stream_parser.events(chunk) if stream_parser else _chunk_events(chunk)):
                         yield event
             else:
                 try:
                     data = response.json()
                 except ValueError as e:
                     raise BridgeError(502, "Upstream returned non-JSON body", "upstream_error") from e
-                if not isinstance(data, dict) or ("error" not in data and not data.get("choices")):
+                if not isinstance(data, dict):
+                    raise BridgeError(502, "Malformed upstream response", "upstream_error")
+                _raise_if_error(data)
+                if responses:
+                    if "output" not in data:
+                        raise BridgeError(502, "Malformed upstream response (no output)", "upstream_error")
+                    events = _responses_final(data, text=True, reasoning=True)
+                elif not data.get("choices"):
                     raise BridgeError(502, "Malformed upstream response (no choices)", "upstream_error")
-                for event in _chunk_events(data):
+                else:
+                    events = _chunk_events(data)
+                for event in events:
                     yield event
         except httpx.TimeoutException as e:
             raise BridgeError(504, f"Upstream timeout: {e!r}", "upstream_timeout") from e
@@ -779,10 +995,6 @@ async def collect(events: AsyncIterator, model: str) -> dict:
 
 
 def _check_client(request: Request, settings: Settings) -> None:
-    if settings.bridge_api_key:
-        expected = f"Bearer {settings.bridge_api_key}"
-        if not hmac.compare_digest(request.headers.get("authorization", ""), expected):
-            raise BridgeError(401, "Invalid or missing bridge API key", "authentication_error")
     # Requiring JSON forces a CORS preflight, so random web pages cannot hit the local bridge.
     if "application/json" not in request.headers.get("content-type", ""):
         raise BridgeError(415, "Content-Type must be application/json", "invalid_request_error")
@@ -800,12 +1012,22 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     app = FastAPI(title="Text Tool Calls Bridge", lifespan=lifespan)
 
+    @app.get("/v1/models")
+    async def models(request: Request):
+        try:
+            if not settings.endpoint:
+                raise BridgeError(500, "Set PI_TEXT_URL", "configuration_error")
+            status, body = await request.app.state.bridge.models()
+            return JSONResponse(body, status_code=status)
+        except BridgeError as e:
+            return JSONResponse(e.to_dict(), status_code=e.status)
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         bridge: Bridge = request.app.state.bridge
         try:
-            if not settings.upstream_base_url:
-                raise BridgeError(500, "Set UPSTREAM_BASE_URL", "configuration_error")
+            if not settings.endpoint:
+                raise BridgeError(500, "Set PI_TEXT_URL", "configuration_error")
             _check_client(request, settings)
             try:
                 payload = await request.json()
