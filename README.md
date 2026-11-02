@@ -5,10 +5,15 @@ refuses requests containing native `tools`. The bridge describes the tools in th
 prompt, lets the model answer with text blocks
 
 ```
-<tool_call id="SESSION_NONCE">
+<pi_tool_call id="SESSION_NONCE">
 {"name": "bash", "arguments": {"command": "ls"}}
-</tool_call>
+</pi_tool_call>
 ```
+
+The tag is deliberately not `<tool_call>` (see `PROTOCOL_TAG`): routers serving Qwen
+on vLLM/sglang often run a tool parser on the output that cuts `<tool_call>…</tool_call>`
+out of the text even when the request has no `tools`. `<tool_call>` in a reply is
+still accepted as an alias.
 
 and turns them back into regular OpenAI `tool_calls`. It **never executes tools**;
 Pi executes them as usual.
@@ -16,6 +21,10 @@ Pi executes them as usual.
 ## Features
 
 - Text before tool calls is allowed and shown to the user; several tool calls per reply.
+- Talking *about* the protocol is safe (e.g. "describe this project"): only a real block,
+  meaning the tag directly followed by a JSON object and with the session id (or no id,
+  outside code/quotes), is a call. Quoted examples (`id="SESSION_NONCE"`, source code,
+  fenced snippets) and `<think>` mentioned in the middle of the text stay plain text.
 - True streaming: text is forwarded token by token, the tool-call region is
   buffered and parsed at the end. SSE `: ping` keep-alives while buffering.
 - Reasoning: upstream `reasoning_content`/`reasoning` and inline `<think>…</think>`
@@ -28,10 +37,11 @@ Pi executes them as usual.
   with the error (`MAX_RETRIES`). Complete-but-sloppy JSON (trailing commas, raw
   newlines) is repaired with `json-repair`; truncated output (`finish_reason=length`)
   is never repaired or retried.
-- If the router runs its own tool parser (vLLM/sglang for Qwen: it strips `<tool_call>`
+- If the router runs its own tool parser anyway (vLLM/sglang for Qwen: it strips `<tool_call>`
   from the text and returns native `tool_calls` although no `tools` were sent), those
   calls are converted back and validated the same way. An upstream
-  `finish_reason: tool_calls` is never passed on without actual calls.
+  `finish_reason: tool_calls` is never passed on without actual calls; if the router
+  dropped the calls entirely, the bridge logs a warning.
 - Upstream errors keep their HTTP status and OpenAI `{"error": {...}}` body.
 - No client key: the bridge accepts any local client. It requires
   `Content-Type: application/json`, so web pages in your browser cannot use it.
@@ -266,12 +276,20 @@ with the existing keys):
 | `upstream: …` with 401/403/404 | Wrong `PI_TEXT_KEY`, wrong URL, or a model `id` the router does not know |
 | `upstream returned 400` mentioning `stream_options` | `UPSTREAM_STREAM_USAGE=false` |
 | `upstream …` mentioning `reasoning_effort` | `compat.supportsReasoningEffort: false` for that model |
-| `bridge_protocol_error` … `id=None` | The model writes `<tool_call>` without the id (common for Qwen/Hermes-style models): `REQUIRE_NONCE=false` |
+| `bridge_protocol_error` … `id=None` | The model writes the block (often `<tool_call>`) without the id (common for Qwen/Hermes-style models): `REQUIRE_NONCE=false` |
 | `bridge_protocol_error` with other errors | The model can't follow the format: raise `MAX_RETRIES`, try `INJECTION_ROLE=system`, or use a stronger model |
 | `cut off (max tokens) inside a tool call` | `maxTokens` too low for big `write`/`edit` calls: raise it in `models.json` |
 | Pi stops after one step / writes fake results | Inspect the exchange with `DEBUG_DUMP_DIR=/tmp/bridge-dumps` |
-| Pi stops after a text like "reading files…", `stopReason: toolUse` but no `toolCall` (old bridge versions) | The router parsed `<tool_call>` itself (vLLM/sglang hermes parser for Qwen) and returned native `tool_calls`. The bridge now converts them back; `TRACE=-` shows `upstream parsed N tool call(s) itself` |
+| Pi stops after a text like "reading files…", `stopReason: toolUse` but no `toolCall` (old bridge versions) | The router parsed `<tool_call>` itself (vLLM/sglang hermes parser for Qwen). Fixed by the default `PROTOCOL_TAG=pi_tool_call`; native `tool_calls` are converted back as well. `TRACE=-` shows `upstream parsed N tool call(s) itself` or `returned no tool calls (router stripped them?)`; `DEBUG_DUMP_DIR` dumps keep the raw upstream chunks (`attempts[].upstream_chunks`) |
 | Images pasted into Pi are rejected | The models are configured as text-only (`"input": ["text"]`) |
+
+## Running Pi safely (macOS)
+
+[pi-setup.md](pi-setup.md) is a guide for developers new to Pi and to macOS isolation. It explains
+how Pi works and which isolation tools exist, then shows how to confine Pi on macOS 26 so it sees
+only the projects folder and reads the web (GET only) with per-request approval. Options: a Seatbelt
+sandbox, a Colima VM, Colima + Docker Compose with a GET-only egress proxy (recommended), Apple
+`container`, and tools-only VMs. It includes Pi extensions for approvals, a path guard and web search/fetch.
 
 ## Full visibility: requests, model replies, executed commands
 
@@ -304,7 +322,7 @@ Bridge trace for one turn (`<-` from Pi, `->` to Pi; the id in brackets groups o
 12:01:05 [a1b2c3]    request: model=qwen/qwen3.8-27b stream=True messages=5 tools=read,bash,edit,write …
 12:01:07 [a1b2c3]    model reasoning
 12:01:07 [a1b2c3]    model reply (attempt 1, finish=stop, 1.9s)
-    <tool_call id="…">{"name": "read", "arguments": {"path": "a.txt"}}</tool_call>
+    <pi_tool_call id="…">{"name": "read", "arguments": {"path": "a.txt"}}</pi_tool_call>
 12:01:07 [a1b2c3] -> client: call read (call_4e…)
 12:01:07 [a1b2c3] -> client: finish=tool_calls usage={…}
 ```
@@ -331,7 +349,8 @@ The trace and dumps contain your prompts, code and command output: keep them loc
 | `UPSTREAM_STREAM` | `true` | Stream from the router. With `false` the full reply is awaited (no pings until the router responds) |
 | `UPSTREAM_STREAM_USAGE` | `true` | Chat API only: send `stream_options.include_usage`; disable if the router rejects it |
 | `MAX_RETRIES` | `2` | Corrective re-asks after an invalid tool call |
-| `REQUIRE_NONCE` | `true` | Reject `<tool_call>` blocks without the session id. `false` accepts a missing id (Hermes-style models often drop it) but still rejects a wrong one |
+| `PROTOCOL_TAG` | `pi_tool_call` | Tag name of tool-call blocks. `tool_call` is the Qwen/Hermes-native tag: models follow it best, but routers with a server-side tool parser swallow it |
+| `REQUIRE_NONCE` | `true` | Reject tool-call blocks without the session id. `false` accepts a missing id (Hermes-style models often drop it) but still rejects a wrong one |
 | `SCHEMA_MISMATCH` | `retry` | `passthrough` hands schema-invalid arguments to Pi and lets Pi report the error to the model |
 | `PING_INTERVAL` | `15` | Seconds between SSE keep-alives |
 | `UPSTREAM_TIMEOUT` | `600` | Upstream read timeout, seconds |

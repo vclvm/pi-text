@@ -45,12 +45,12 @@ def all_text(obj):
 
 
 def nonce_of(upstream_json):
-    match = re.search(r'<tool_call id="([0-9a-f]+)">', all_text(upstream_json))
+    match = re.search(r'<[A-Za-z][\w-]* id="([0-9a-f]{16})">', all_text(upstream_json))
     return match.group(1) if match else None
 
 
-def call_block(nonce, name, arguments):
-    return f'<tool_call id="{nonce}">\n' + json.dumps({"name": name, "arguments": arguments}) + "\n</tool_call>"
+def call_block(nonce, name, arguments, tag="pi_tool_call"):
+    return f'<{tag} id="{nonce}">\n' + json.dumps({"name": name, "arguments": arguments}) + f"\n</{tag}>"
 
 
 class FakeRouter:
@@ -217,7 +217,7 @@ def test_nonce_required_by_default():
     router = FakeRouter(lambda n: '<tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>')
     with make_client(router, max_retries=0, require_nonce=False) as client:
         assert client.post("/v1/chat/completions", json=tools_payload()).status_code == 200
-    router = FakeRouter(lambda n: call_block("deadbeef", "bash", {"command": "ls"}))
+    router = FakeRouter(lambda n: call_block("deadbeefdeadbeef", "bash", {"command": "ls"}))
     with make_client(router, max_retries=0, require_nonce=False) as client:
         assert client.post("/v1/chat/completions", json=tools_payload()).status_code == 502
 
@@ -381,8 +381,8 @@ def test_scanner_holds_partial_tags():
     scanner = proxy.ReplyScanner(detect_calls=True)
     assert scanner.feed("Hello <too") == [("text", "Hello ")]
     assert scanner.feed("l_call id") == []
-    tail, raw = scanner.finish()
-    assert raw == "<tool_call id" and tail == []
+    tail, raw = scanner.finish()  # never completed into a real block: it was text
+    assert raw is None and tail == [("text", "<tool_call id")]
 
 
 @pytest.mark.parametrize("content", ["plain", "<think>a</think>b", "x <thin", "<think>unterminated"])
@@ -508,7 +508,7 @@ def test_responses_history_replays_assistant_as_output_text():
     body = proxy.to_responses_payload(prep.upstream, proxy.Settings(upstream_url=RESPONSES_URL))
     assistant = [i for i in body["input"] if i["role"] == "assistant"][0]
     assert assistant["content"][0]["type"] == "output_text" and assistant["id"].startswith("msg_")
-    assert assistant["status"] == "completed" and "<tool_call id=" in assistant["content"][0]["text"]
+    assert assistant["status"] == "completed" and "<pi_tool_call id=" in assistant["content"][0]["text"]
     assert [i["role"] for i in body["input"]] == ["user", "assistant", "user"]
 
 
@@ -694,7 +694,7 @@ def test_models_endpoint_error_status():
 
 def test_trace_shows_tool_results_retry_and_calls(tmp_path):
     log_file = tmp_path / "trace.log"
-    router = FakeRouter(lambda n: '<tool_call id="wrong">{"name": "bash", "arguments": {}}</tool_call>',
+    router = FakeRouter(lambda n: call_block("0123456789abcdef", "bash", {}),
                         lambda n: call_block(n, "bash", {"command": "cat a.txt"}))
     payload = tools_payload(messages=[
         {"role": "user", "content": "show a.txt"},
@@ -789,3 +789,111 @@ def test_responses_function_call_item_is_converted():
     with TestClient(proxy.create_app(settings, transport=transport)) as c:
         r = c.post("/v1/chat/completions", json=tools_payload())
     assert r.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "bash"
+
+
+# --------------------------------------------------------------------------- protocol tag
+
+def test_default_tag_is_not_tool_call_and_tool_call_alias_works():
+    router = FakeRouter(lambda n: call_block(n, "bash", {"command": "ls"}, tag="tool_call"))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    upstream = all_text(router.requests[0]["json"])
+    assert "<pi_tool_call id=" in upstream and "<tool_call" not in upstream
+    assert r.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "bash"
+
+
+def test_custom_tag_end_to_end_streaming(monkeypatch):
+    monkeypatch.setenv("PROTOCOL_TAG", "<act>")
+    assert proxy.Settings.from_env().protocol_tag == "act"
+    router = FakeRouter(lambda n: "ok\n" + call_block(n, "bash", {"command": "ls"}, tag="act"),
+                        stream=True, chunk_size=2)
+    with make_client(router, protocol_tag="act") as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert '<act id="' in all_text(router.requests[0]["json"])
+    events = sse_events(r)
+    assert deltas(events, "content").strip() == "ok"
+    assert any(e["choices"] and "tool_calls" in e["choices"][0]["delta"] for e in events)
+
+
+def test_bad_protocol_tag_rejected():
+    with pytest.raises(ValueError, match="PROTOCOL_TAG"):
+        proxy.Settings(protocol_tag="a b")
+
+
+def test_dump_has_raw_chunks_and_trace_flags_stripped_calls(tmp_path):
+    chunks = [{"choices": [{"index": 0, "delta": {"content": "reading all project files"}}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}]
+    settings = proxy.Settings(upstream_url=BASE, upstream_stream=True, debug_dump_dir=str(tmp_path / "d"),
+                              trace=str(tmp_path / "t.log"))
+    with TestClient(proxy.create_app(settings, transport=httpx.MockTransport(native_stream(chunks)))) as c:
+        c.post("/v1/chat/completions", json=tools_payload(stream=True))
+    dump = json.loads(next((tmp_path / "d").iterdir()).read_text())
+    assert dump["attempts"][0]["upstream_chunks"] == chunks
+    assert "returned no tool calls" in (tmp_path / "t.log").read_text()
+
+
+# --------------------------------------------------------------------------- talking ABOUT the protocol
+
+DESCRIBE_PROJECT = (
+    "This bridge asks the model to write `<pi_tool_call id=\"NONCE\">` blocks; Qwen likes `<tool_call>`.\n"
+    "Example from the README:\n```\n<pi_tool_call id=\"SESSION_NONCE\">\n"
+    '{"name": "bash", "arguments": {"command": "ls"}}\n</pi_tool_call>\n```\n'
+    "Source: `return f'<{tag} id=\"{nonce}\">\\n{body}\\n</{tag}>'`; reasoning in inline `<think>…</think>`;\n"
+    "results come back as <tool_result name=\"bash\" call_id=\"x\"> blocks.")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_describing_the_protocol_is_plain_text(stream):
+    router = FakeRouter(lambda n: DESCRIBE_PROJECT, stream=stream, chunk_size=3)
+    with make_client(router, max_retries=0) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=stream))
+    assert r.status_code == 200 and len(router.requests) == 1  # no retry
+    if stream:
+        events = sse_events(r)
+        text, calls = deltas(events, "content"), [e for e in events if e["choices"]
+                                                  and "tool_calls" in e["choices"][0]["delta"]]
+        assert deltas(events, "reasoning_content") == "" and not calls
+    else:
+        message = r.json()["choices"][0]["message"]
+        text = message["content"]
+        assert "tool_calls" not in message and "reasoning_content" not in message
+    assert text == DESCRIBE_PROJECT
+
+
+def test_description_then_real_call():
+    router = FakeRouter(lambda n: "Uses `<tool_call>` tags, see <pi_tool_call id=\"X\"> docs. Reading:\n"
+                        + call_block(n, "read", {"path": "README.md"}) + "\n" + call_block(n, "bash", {"command": "ls"}))
+    tools = tools_payload()["tools"] + [{"type": "function", "function": {
+        "name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+    with make_client(router, max_retries=0) as client:
+        message = client.post("/v1/chat/completions", json=tools_payload(tools=tools)).json()["choices"][0]["message"]
+    assert message["content"].startswith("Uses `<tool_call>` tags, see <pi_tool_call id=\"X\"> docs.")
+    assert [c["function"]["name"] for c in message["tool_calls"]] == ["read", "bash"]
+
+
+def test_quoted_block_after_real_call_stays_text():
+    calls, text = proxy.parse_tool_calls(
+        call_block("n" * 16, "bash", {"command": "ls"}).replace("n" * 16, "0" * 16)
+        + '\nlike <tool_call id="SESSION_NONCE">{"name": "bash"}</tool_call>',
+        [{"name": "bash", "parameters": {"type": "object"}}], "0" * 16)
+    assert len(calls) == 1 and "SESSION_NONCE" in text
+
+
+def test_think_only_at_start():
+    scanner = proxy.ReplyScanner(detect_calls=True)
+    out = scanner.feed("<think>plan</think>Answer mentions <think> tags.")
+    tail, _ = scanner.finish()
+    pieces = out + tail
+    assert ("reasoning", "plan") in pieces
+    assert "".join(v for k, v in pieces if k == "text") == "Answer mentions <think> tags."
+
+
+def test_idless_tag_in_code_is_text_but_outside_is_a_call_attempt():
+    code = "The test does:\n```python\nreply = '<tool_call>{\"name\":\"bash\",\"arguments\":{}}</tool_call>'\n```\nDone."
+    router = FakeRouter(lambda n: code)
+    with make_client(router, max_retries=0) as client:
+        assert client.post("/v1/chat/completions", json=tools_payload()).json()["choices"][0]["message"]["content"] == code
+    router = FakeRouter(lambda n: 'Running:\n<tool_call>{"name":"bash","arguments":{"command":"ls"}}</tool_call>')
+    with make_client(router, max_retries=0, require_nonce=False) as client:
+        message = client.post("/v1/chat/completions", json=tools_payload()).json()["choices"][0]["message"]
+    assert message["tool_calls"][0]["function"]["name"] == "bash"
