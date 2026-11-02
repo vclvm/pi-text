@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -119,6 +120,8 @@ class Settings:
     debug_dump_dir: str = ""          # if set, every exchange is written there as JSON
     extra_body: dict = field(default_factory=dict)     # merged into every upstream request (client wins)
     extra_headers: dict = field(default_factory=dict)  # added to every upstream request
+    trace: str = ""                   # "" off, "-" stderr, otherwise a file to append a readable trace to
+    trace_max: int = 4000             # truncate long trace entries to this many characters (0 = never)
     nonce_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     api: str = field(init=False, default="")       # resolved API kind
     endpoint: str = field(init=False, default="")  # resolved full endpoint URL
@@ -152,7 +155,67 @@ class Settings:
             debug_dump_dir=os.environ.get("DEBUG_DUMP_DIR", ""),
             extra_body=_env_json("UPSTREAM_EXTRA_BODY"),
             extra_headers=_env_json("UPSTREAM_HEADERS"),
+            trace=os.environ.get("TRACE", ""),
+            trace_max=int(os.environ.get("TRACE_MAX", "4000")),
         )
+
+
+# --------------------------------------------------------------------------- trace
+
+class Tracer:
+    """Human-readable log of one exchange: what the client sent since its last turn
+    (new prompts, tool results = what the client actually executed), every upstream
+    attempt (raw reply, reasoning, parse result) and what was returned."""
+
+    def __init__(self, settings: "Settings"):
+        self.target, self.max = settings.trace, settings.trace_max
+        self.rid = uuid4().hex[:6]
+
+    def __bool__(self) -> bool:
+        return bool(self.target)
+
+    def _cut(self, text: str) -> str:
+        if self.max and len(text) > self.max:
+            return text[:self.max] + f"\n… [{len(text) - self.max} more chars]"
+        return text
+
+    def __call__(self, title: str, body: Any = None) -> None:
+        if not self.target:
+            return
+        if body is not None and not isinstance(body, str):
+            body = json.dumps(body, ensure_ascii=False, indent=2, default=str)
+        line = f"{time.strftime('%H:%M:%S')} [{self.rid}] {title}"
+        if body:
+            line += "\n" + "\n".join("    " + l for l in self._cut(body).splitlines())
+        try:
+            if self.target == "-":
+                print(line, file=sys.stderr, flush=True)
+            else:
+                with open(self.target, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except OSError as e:
+            log.warning("trace write failed: %s", e)
+
+    def incoming(self, payload: dict) -> None:
+        """Messages after the client's last assistant turn: the new prompt and/or tool results."""
+        if not self.target:
+            return
+        messages = [m for m in payload.get("messages") or [] if isinstance(m, dict)]
+        last = max((i for i, m in enumerate(messages) if m.get("role") == "assistant"), default=-1)
+        if last >= 0:
+            for call in messages[last].get("tool_calls") or []:
+                fn = call.get("function") or {}
+                self(f"<- client ran {fn.get('name')} ({call.get('id')})", fn.get("arguments"))
+        for m in messages[last + 1:]:
+            role = m.get("role")
+            if role == "tool":
+                self(f"<- tool result {m.get('name') or ''} ({m.get('tool_call_id')})",
+                     _text(m.get("content"), placeholder=True))
+            else:
+                self(f"<- {role}", _text(m.get("content"), placeholder=True))
+        tools = [t["name"] for t in _allowed_tools(payload)]
+        self(f"   request: model={payload.get('model')} stream={bool(payload.get('stream'))} "
+             f"messages={len(messages)} tools={','.join(tools) or '-'} tool_choice={payload.get('tool_choice')}")
 
 
 # --------------------------------------------------------------------------- errors
@@ -647,6 +710,9 @@ def _responses_final(response: dict, *, text: bool, reasoning: bool) -> list[tup
             for part in (item.get("content") or []) + (item.get("summary") or []):
                 if isinstance(part, dict) and part.get("text"):
                     events.append(("reasoning", part["text"]))
+        elif item.get("type") == "function_call":
+            events.append(("native_call", (item.get("call_id") or item.get("id"), item.get("name"),
+                                           item.get("arguments"))))
         elif item.get("type") == "message" and text:
             for part in item.get("content") or []:
                 if isinstance(part, dict) and part.get("type") in ("output_text", "text") and part.get("text"):
@@ -704,6 +770,13 @@ def _chunk_events(chunk: dict) -> list[tuple[str, Any]]:
             content = _text(content, placeholder=True)
         if isinstance(content, str) and content:
             events.append(("content", content))
+        # The router may run its own tool parser (e.g. vLLM hermes for Qwen) even though we never
+        # send `tools`: it cuts <tool_call> out of the text and returns native tool_calls instead.
+        for position, call in enumerate(delta.get("tool_calls") or []):
+            if isinstance(call, dict):
+                function = call.get("function") or {}
+                events.append(("native_call", (call.get("index", position), function.get("name"),
+                                               function.get("arguments"))))
         if choices[0].get("finish_reason"):
             events.append(("finish", choices[0]["finish_reason"]))
     if chunk.get("usage"):
@@ -807,8 +880,9 @@ class Bridge:
             await response.aclose()
 
     async def run(self, prep: Prepared, first: httpx.Response | None = None,
-                  record: dict | None = None) -> AsyncIterator[tuple[str, Any]]:
+                  record: dict | None = None, trace: Tracer | None = None) -> AsyncIterator[tuple[str, Any]]:
         """Yields ("text"|"reasoning", str), ("tool_calls", list), ("usage", dict), ("finish", str)."""
+        trace = trace or Tracer(Settings())
         messages = list(prep.upstream["messages"])
         streamed_text = False
         usage = None
@@ -818,10 +892,15 @@ class Bridge:
                 payload = {**prep.upstream, "messages": messages}
                 info: dict[str, Any] = {"upstream_request": payload if attempt else "(see upstream)"}
                 attempts.append(info)
+                if attempt:
+                    trace(f"-> upstream retry {attempt}/{self.s.max_retries}", messages[-1]["content"])
+                started = time.monotonic()
                 response = first if attempt == 0 and first is not None else await self.open(payload)
                 scanner = ReplyScanner(detect_calls=bool(prep.tools))
                 held: list[str] = []  # text of retry attempts, shown only if useful
                 raw: list[str] = []
+                thoughts: list[str] = []
+                native: dict[Any, list] = {}  # key -> [name, arguments] of upstream-parsed tool calls
                 finish = None
 
                 def route(pieces):
@@ -841,15 +920,44 @@ class Bridge:
                         for event in route(scanner.feed(value)):
                             yield event
                     elif kind == "reasoning":
+                        thoughts.append(value)
                         yield "reasoning", value
+                    elif kind == "native_call":
+                        key, name, args = value
+                        slot = native.setdefault(key, [None, ""])
+                        slot[0] = name or slot[0]
+                        if isinstance(args, str):
+                            slot[1] += args
+                        elif args is not None:
+                            slot[1] = json.dumps(args, ensure_ascii=False)
                     elif kind == "finish":
                         finish = value
                     elif kind == "usage":
                         usage = value  # last attempt only: it reflects the real context size
+                if native:
+                    # Put the calls back as protocol text so they are validated like any other call.
+                    log.info("upstream returned %d native tool call(s); converting", len(native))
+                    trace(f"   upstream parsed {len(native)} tool call(s) itself (native tool_calls)",
+                          [{"name": n, "arguments": a} for n, a in native.values()])
+                    if prep.tools:
+                        text = "".join("\n" + render_call(n, _decode_arguments(a or "{}"), prep.nonce)
+                                       for n, a in native.values())
+                        raw.append(text)
+                        for event in route(scanner.feed(text)):
+                            yield event
+                    else:
+                        log.warning("upstream returned tool calls but the client offered no tools; dropped")
+                if finish == "tool_calls":
+                    finish = "stop"  # only the bridge decides whether there are tool calls
                 tail, calls_raw = scanner.finish()
                 for event in route(tail):
                     yield event
                 info.update(raw="".join(raw), finish_reason=finish)
+                if trace:
+                    if thoughts:
+                        trace("   model reasoning", "".join(thoughts))
+                    trace(f"   model reply (attempt {attempt + 1}, finish={finish}, "
+                          f"{time.monotonic() - started:.1f}s)", "".join(raw) or "(empty)")
                 try:
                     if calls_raw is None:
                         if prep.must_call:
@@ -862,6 +970,7 @@ class Bridge:
                                                         schema_mismatch=self.s.schema_mismatch)
                 except ProtocolError as e:
                     info["error"] = str(e)
+                    trace(f"!! invalid tool protocol: {e}")
                     log.warning("attempt %d: invalid tool protocol: %s | raw reply: %.2000s",
                                 attempt + 1, e, "".join(raw))
                     if e.retryable and attempt < self.s.max_retries:
@@ -881,9 +990,15 @@ class Bridge:
                 if usage:
                     yield "usage", usage
                 info["result"] = {"tool_calls": calls, "finish_reason": "tool_calls" if calls else finish or "stop"}
+                for call in calls:
+                    trace(f"-> client: call {call['function']['name']} ({call['id']})", call["function"]["arguments"])
+                if stray:
+                    trace("-> client: extra text", stray)
+                trace(f"-> client: finish={'tool_calls' if calls else finish or 'stop'} usage={json.dumps(usage)}")
                 yield "finish", "tool_calls" if calls else (finish or "stop")
                 return
         except BridgeError as e:
+            trace(f"!! error {e.status}: {e.message}")
             if record is not None:
                 record["error"] = e.to_dict()
             raise
@@ -1038,13 +1153,20 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             except (ValueError, KeyError, TypeError, AttributeError) as e:
                 raise BridgeError(400, f"Invalid request: {e}", "invalid_request_error") from e
             record = {"request": payload, "upstream": prep.upstream} if settings.debug_dump_dir else None
+            trace = Tracer(settings)
+            trace.incoming(payload)
             if payload.get("stream", False):
                 # Open upstream before answering so HTTP errors keep their status code.
-                first = await bridge.open(prep.upstream)
-                return StreamingResponse(sse(bridge.run(prep, first, record), prep.model, settings.ping_interval),
+                try:
+                    first = await bridge.open(prep.upstream)
+                except BridgeError as e:
+                    trace(f"!! upstream error {e.status}: {e.message}")
+                    raise
+                return StreamingResponse(sse(bridge.run(prep, first, record, trace), prep.model,
+                                             settings.ping_interval),
                                          media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-            return JSONResponse(await collect(bridge.run(prep, None, record), prep.model))
+            return JSONResponse(await collect(bridge.run(prep, None, record, trace), prep.model))
         except BridgeError as e:
             return JSONResponse(e.to_dict(), status_code=e.status)
 

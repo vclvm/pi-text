@@ -28,6 +28,10 @@ Pi executes them as usual.
   with the error (`MAX_RETRIES`). Complete-but-sloppy JSON (trailing commas, raw
   newlines) is repaired with `json-repair`; truncated output (`finish_reason=length`)
   is never repaired or retried.
+- If the router runs its own tool parser (vLLM/sglang for Qwen: it strips `<tool_call>`
+  from the text and returns native `tool_calls` although no `tools` were sent), those
+  calls are converted back and validated the same way. An upstream
+  `finish_reason: tool_calls` is never passed on without actual calls.
 - Upstream errors keep their HTTP status and OpenAI `{"error": {...}}` body.
 - No client key: the bridge accepts any local client. It requires
   `Content-Type: application/json`, so web pages in your browser cannot use it.
@@ -266,7 +270,55 @@ with the existing keys):
 | `bridge_protocol_error` with other errors | The model can't follow the format: raise `MAX_RETRIES`, try `INJECTION_ROLE=system`, or use a stronger model |
 | `cut off (max tokens) inside a tool call` | `maxTokens` too low for big `write`/`edit` calls: raise it in `models.json` |
 | Pi stops after one step / writes fake results | Inspect the exchange with `DEBUG_DUMP_DIR=/tmp/bridge-dumps` |
+| Pi stops after a text like "reading files…", `stopReason: toolUse` but no `toolCall` (old bridge versions) | The router parsed `<tool_call>` itself (vLLM/sglang hermes parser for Qwen) and returned native `tool_calls`. The bridge now converts them back; `TRACE=-` shows `upstream parsed N tool call(s) itself` |
 | Images pasted into Pi are rejected | The models are configured as text-only (`"input": ["text"]`) |
+
+## Full visibility: requests, model replies, executed commands
+
+Three layers, each with its own tool:
+
+| What | Where | How |
+|---|---|---|
+| What Pi sends, what the model answers raw (incl. `<think>`/reasoning and broken replies + retries), what the bridge returns | bridge | `TRACE=-` (live, stderr) or `TRACE=/path/trace.log` |
+| Exact JSON of every exchange (full prompt with the injected protocol) | bridge | `DEBUG_DUMP_DIR=/tmp/bridge-dumps` |
+| What Pi actually executed: tool, arguments, output, error flag, duration | Pi session | `python3 pi-trace.py -f` |
+
+Typical setup, three terminals:
+
+```bash
+# 1: bridge with a live trace
+TRACE=- .venv/bin/uvicorn proxy:app --host 127.0.0.1 --port 8788
+# 2: Pi
+pi --model openrouter-text/qwen/qwen3.8-27b
+# 3: what Pi runs, live (latest session of this directory)
+python3 pi-trace.py -f --cwd /path/where/pi/runs
+```
+
+Bridge trace for one turn (`<-` from Pi, `->` to Pi; the id in brackets groups one request):
+
+```
+12:01:05 [a1b2c3] <- client ran bash (call_9f…)        # the call Pi executed last turn
+    {"command": "ls"}
+12:01:05 [a1b2c3] <- tool result  (call_9f…)           # and what it got back
+    a.txt
+12:01:05 [a1b2c3]    request: model=qwen/qwen3.8-27b stream=True messages=5 tools=read,bash,edit,write …
+12:01:07 [a1b2c3]    model reasoning
+12:01:07 [a1b2c3]    model reply (attempt 1, finish=stop, 1.9s)
+    <tool_call id="…">{"name": "read", "arguments": {"path": "a.txt"}}</tool_call>
+12:01:07 [a1b2c3] -> client: call read (call_4e…)
+12:01:07 [a1b2c3] -> client: finish=tool_calls usage={…}
+```
+
+`!! invalid tool protocol` and `-> upstream retry` lines show corrective re-asks.
+Long entries are cut at `TRACE_MAX` characters (`0` = never).
+
+`pi-trace.py` (stdlib only) prints a Pi session: prompts, thinking, every `CALL` with
+arguments, `RESULT`/`FAILED` with output and duration, token usage per step. Without `-f`
+it prints the whole session and exits; pass a `.jsonl` path for an older session. Pi
+itself also offers `pi --export SESSION.jsonl out.html` and `pi --mode json -p "…"`
+(events as JSON lines).
+
+The trace and dumps contain your prompts, code and command output: keep them local.
 
 ## Configuration
 
@@ -285,6 +337,8 @@ with the existing keys):
 | `UPSTREAM_TIMEOUT` | `600` | Upstream read timeout, seconds |
 | `UPSTREAM_EXTRA_BODY` | empty | JSON object merged into every upstream request, e.g. OpenRouter `provider`. Must not set `messages`, `tools`, `stream` and other bridge-owned fields |
 | `UPSTREAM_HEADERS` | empty | JSON object of extra upstream headers (e.g. `HTTP-Referer`, `X-Title`) |
+| `TRACE` | empty (off) | Readable trace of every turn: `-` = stderr, otherwise a file to append to |
+| `TRACE_MAX` | `4000` | Truncate long trace entries to N characters; `0` = never |
 | `DEBUG_DUMP_DIR` | empty (off) | Write every exchange (requests, raw replies, errors) as JSON. Contains your code and prompts |
 | `LOG_LEVEL` | `INFO` | Invalid model replies are logged at `WARNING` with the raw text |
 

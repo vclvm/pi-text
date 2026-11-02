@@ -688,3 +688,104 @@ def test_models_endpoint_error_status():
     with TestClient(proxy.create_app(proxy.Settings(upstream_url=BASE), transport=transport)) as client:
         r = client.get("/v1/models")
     assert r.status_code == 401 and "no auth" in r.json()["error"]["message"]
+
+
+# --------------------------------------------------------------------------- trace
+
+def test_trace_shows_tool_results_retry_and_calls(tmp_path):
+    log_file = tmp_path / "trace.log"
+    router = FakeRouter(lambda n: '<tool_call id="wrong">{"name": "bash", "arguments": {}}</tool_call>',
+                        lambda n: call_block(n, "bash", {"command": "cat a.txt"}))
+    payload = tools_payload(messages=[
+        {"role": "user", "content": "show a.txt"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "a.txt\n"}])
+    with make_client(router, trace=str(log_file)) as client:
+        assert client.post("/v1/chat/completions", json=payload).status_code == 200
+    text = log_file.read_text()
+    assert "<- client ran bash (call_1)" in text and '"command": "ls"' in text
+    assert "<- tool result" in text and "a.txt" in text
+    assert "invalid tool protocol" in text and "upstream retry 1/2" in text
+    assert "-> client: call bash" in text and "cat a.txt" in text and "finish=tool_calls" in text
+
+
+def test_trace_truncates(tmp_path):
+    log_file = tmp_path / "t.log"
+    tracer = proxy.Tracer(proxy.Settings(trace=str(log_file), trace_max=10))
+    tracer("x", "a" * 50)
+    assert "[40 more chars]" in log_file.read_text()
+
+
+# --------------------------------------------------------------------------- upstream-parsed (native) tool calls
+
+def native_stream(chunks):
+    sse = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+    return lambda request: httpx.Response(200, content=sse.encode(), headers={"content-type": "text/event-stream"})
+
+
+def tc_delta(**function):
+    return {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": function}]}}]}
+
+
+QWEN_NATIVE = [  # what a vLLM/sglang hermes parser makes of "<text> <tool_call>…</tool_call>"
+    {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "reading all project files"}}]},
+    {"choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "id": "chatcmpl-tool-1", "type": "function", "function": {"name": "bash", "arguments": ""}}]}}]},
+    tc_delta(arguments='{"command": '),
+    tc_delta(arguments='"ls -la"}'),
+    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+]
+
+
+def test_native_tool_calls_from_upstream_are_converted_stream():
+    settings = proxy.Settings(upstream_url=BASE, upstream_stream=True)
+    with TestClient(proxy.create_app(settings, transport=httpx.MockTransport(native_stream(QWEN_NATIVE)))) as c:
+        r = c.post("/v1/chat/completions", json=tools_payload(stream=True))
+    events = sse_events(r)
+    assert deltas(events, "content").strip() == "reading all project files"
+    calls = [e["choices"][0]["delta"]["tool_calls"] for e in events
+             if e["choices"] and "tool_calls" in e["choices"][0]["delta"]]
+    assert calls and calls[0][0]["function"]["name"] == "bash"
+    assert json.loads(calls[0][0]["function"]["arguments"]) == {"command": "ls -la"}
+    assert [e["choices"][0]["finish_reason"] for e in events if e["choices"]][-1] == "tool_calls"
+
+
+def test_native_tool_calls_non_stream_and_invalid_one_is_retried():
+    replies = [
+        {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "x", "type": "function", "function": {"name": "nope", "arguments": "{}"}}]},
+            "finish_reason": "tool_calls"}]},
+        {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "y", "type": "function", "function": {"name": "bash", "arguments": '{"command": "pwd"}'}}]},
+            "finish_reason": "tool_calls"}]},
+    ]
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=replies.pop(0)))
+    with TestClient(proxy.create_app(proxy.Settings(upstream_url=BASE, upstream_stream=False),
+                                     transport=transport)) as c:
+        r = c.post("/v1/chat/completions", json=tools_payload())
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]) == {"command": "pwd"}
+
+
+def test_upstream_tool_calls_finish_without_calls_becomes_stop():
+    chunks = [{"choices": [{"index": 0, "delta": {"content": "reading all project files"}}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}]
+    settings = proxy.Settings(upstream_url=BASE, upstream_stream=True)
+    with TestClient(proxy.create_app(settings, transport=httpx.MockTransport(native_stream(chunks)))) as c:
+        r = c.post("/v1/chat/completions", json=tools_payload(stream=True))
+    events = sse_events(r)
+    assert [e["choices"][0]["finish_reason"] for e in events if e["choices"]][-1] == "stop"
+    assert not any(e["choices"] and "tool_calls" in e["choices"][0]["delta"] for e in events)
+
+
+def test_responses_function_call_item_is_converted():
+    final = {"id": "r", "status": "completed", "output": [
+        {"type": "function_call", "call_id": "fc_1", "name": "bash", "arguments": '{"command": "ls"}'}],
+        "usage": {"input_tokens": 1, "output_tokens": 1}}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=final))
+    settings = proxy.Settings(upstream_url=RESPONSES_URL, upstream_stream=False)
+    with TestClient(proxy.create_app(settings, transport=transport)) as c:
+        r = c.post("/v1/chat/completions", json=tools_payload())
+    assert r.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "bash"
