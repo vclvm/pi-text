@@ -287,9 +287,12 @@ with the existing keys):
 
 [pi-setup.md](pi-setup.md) is a guide for developers new to Pi and to macOS isolation. It explains
 how Pi works and which isolation tools exist, then shows how to confine Pi on macOS 26 so it sees
-only the projects folder and reads the web (GET only) with per-request approval. Options: a Seatbelt
-sandbox, a Colima VM, Colima + Docker Compose with a GET-only egress proxy (recommended), Apple
-`container`, and tools-only VMs. It includes Pi extensions for approvals, a path guard and web search/fetch.
+only the projects folder and an Obsidian vault, and reads the web (GET only) with per-request
+approval. Package sources, extra root certificates and an upstream proxy are set in one `.env` file,
+so it also works with registry mirrors. Options: a Seatbelt sandbox, a Colima VM, Colima + Docker
+Compose with a GET-only egress proxy (recommended), Apple `container`, and tools-only VMs. It includes
+Pi extensions for approvals, a path guard and web search/fetch, launchers, and a post-session check
+for git hooks and Obsidian plugins.
 
 ## Full visibility: requests, model replies, executed commands
 
