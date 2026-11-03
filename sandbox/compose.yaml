@@ -180,7 +180,7 @@ services:
       - ./generated/c/init.gradle:/home/pi/.gradle/init.d/pi-sandbox.gradle:ro
       - ./generated/c/docker-config.json:/home/pi/.docker/config.json:ro
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs: ["/tmp:exec"]                     # exec: virtualenvs, build tools run things from /tmp
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: ${PI_PIDS:-4096}

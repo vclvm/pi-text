@@ -742,14 +742,21 @@ Step by step:
   JDK 17, 21 and 25, Maven, Gradle, and the Docker CLI with its `compose` and `buildx` plugins. All
   names come from `config.yaml`, so they are pulled through your registry like any other image, and no
   separate download source is needed. The `COPY --from=…` lines later take just the tool folders out of them.
-- **`FROM ${NODE_IMAGE}`**: the base is Node.js 24 on Debian (Pi needs Node).
-- **`repository.apt_sources`:** a file with the Debian line(s) of your Artifactory's "Set Me Up"
-  (`deb https://user:token@…/debian-remote <DISTRIBUTION> <COMPONENT>`). `pibox setup` turns it into
-  `generated/apt/`: a deb822 `sources` file (`<DISTRIBUTION>` becomes the base image's release,
-  `bookworm` and `bookworm-updates`, or `bookworm-security` for a URL with "security" in it;
-  `<COMPONENT>` becomes `main`) and an apt `auth.conf` with the login. The build mounts them for
-  the `apt-get` step only (`RUN --mount`), so the login isn't stored in the image. Without the file,
-  packages come from `deb.debian.org`.
+- **`FROM ${BASE_IMAGE}`**: the base is Ubuntu 24.04 (`images.base`). Node.js 24 (node, npm,
+  corepack) is copied from the official Node image (`images.node`); its binaries run on Ubuntu as
+  they are.
+- **`repository.apt_sources`:** a file with the line(s) of your Artifactory's "Set Me Up" for its
+  Ubuntu remote (`deb https://user:token@…/ubuntu-remote <DISTRIBUTION> <COMPONENT>`, any `<…>`
+  placeholder). `pibox setup` asks each remote, from the Mac, which of `noble`, `noble-updates` and
+  `noble-security` it has with packages for the VM's architecture, and writes exactly those into
+  `generated/apt/` (a deb822 `sources` file, `<COMPONENT>` = `main universe`) with an apt
+  `auth.conf` for the login. It stops with a clear message if a remote can't be reached, refuses
+  the login, has no packages for the architecture, or no remote has `noble-security` (the base
+  image's libraries are newer than the release's). **On Apple Silicon** the VM is arm64, and
+  Ubuntu's arm64 packages are on `ports.ubuntu.com/ubuntu-ports`, not `archive.ubuntu.com`: the
+  remote must be one of `ports.ubuntu.com`. The build mounts the files for the `apt-get` step only
+  (`RUN --mount`), so the login isn't stored in the image, stops if `apt-get update` fails or
+  fetches no package list, and trusts your company's CA before `ca-certificates` is installed.
 - **`apt-get install $PI_APT_PACKAGES`**: the system tools the agent may use: git, ripgrep, curl,
   `jq` and HTTPie for API calls, a C compiler (`build-essential`, for native npm and pip packages),
   Python 3 with venv and pip. **Bake everything it needs into the image** by adding packages to
@@ -1054,7 +1061,10 @@ could start a container with your folders, on any network, as root. Its own engi
 - `DOCKER_MIN_API_VERSION=1.24` keeps older clients working: Testcontainers 1.x speaks API 1.32,
   which Docker 29 otherwise rejects.
 - Testcontainers asks the engine for Docker Hub names (`postgres:16`, its Ryuk helper), and the
-  engine gets them through the `registry-mirrors` of your `daemon.json`.
+  engine gets them through the `registry-mirrors` of your `daemon.json`. The engine logs in to a
+  mirror with the login the client gives for Docker Hub, so `pibox setup` gives the mirror's login
+  (from `repository.docker_config`) for Docker Hub too: `docker pull postgres:16` and
+  Testcontainers work with a mirror that needs a login.
 - Images and stopped containers stay in the `docker-data` volume between runs. `docker system prune`
   inside the sandbox frees space.
 - `network.sandbox_subnet` and `agent_docker.address_pool` are private address ranges. Change them if they overlap
@@ -1133,7 +1143,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `check` | Prerequisites, `config.yaml`, placeholders, folders (§6.1) |
 | `setup` | Generate every configuration from `config.yaml` (§6.6) |
 | `config` | Print the settings in effect, secrets masked |
-| `up` | Start the VM, install sysbox if needed (mode `sysbox`), build the images, start bridge, proxy and the agent's Docker engine (§6.7) |
+| `up` | Start the VM (restarted when `pibox setup` changed its settings), install sysbox if needed (mode `sysbox`), build the images, start bridge, proxy and the agent's Docker engine, always as new containers (they mount files `init`/`setup` replace) (§6.7) |
 | `run [args]` | Pi in a fresh container, in the current folder; `args` go to Pi (§7.1) |
 | `approve` | The approval console of the proxy; detach with Ctrl-P Ctrl-Q (§7.1) |
 | `log` | Follow the web journal |
@@ -1221,7 +1231,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `certificate verify failed`, `self-signed certificate`, `PKIX path building failed`, `unable to get local issuer certificate` | Your company's CA isn't in the sandbox: check what `pibox setup` prints about CA certificates. If it finds none in the System keychain, export your company's root CA from Keychain Access as a `.pem` and set `network.ca_certs` to it; then `pibox setup && pibox up` (the images are rebuilt with it) |
 | `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | Set `repository.npmrc` / `repository.pip_conf` to your files with your mirror; public registries answer only over HTTPS |
 | Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
-| `apt-get update` fails during the build | Check the file in `repository.apt_sources` (one "Set Me Up" line per Debian remote) and what `pibox setup` made of it: `~/.pi-sandbox/generated/apt/debian.sources`. A `401` is the login; `Certificate verification failed` is `network.ca_certs` |
+| `apt-get update` fails during the build | Check the file in `repository.apt_sources` (one "Set Me Up" line per Ubuntu remote) and what `pibox setup` made of it: `~/.pi-sandbox/generated/apt/debian.sources`. A `401` is the login; `Certificate verification failed` is `network.ca_certs` |
 | `docker compose` / `docker buildx`: unknown command | Run `pibox check`: it adds Homebrew's plugin folder to `cliPluginsExtraDirs` itself, and names what it can't fix: a plugin that isn't installed (`brew install docker-buildx`), a broken link in `~/.docker/cli-plugins` left by Docker Desktop (`rm` it), or the error docker gives when it can't run the plugin |
 | `docker` not found although `brew install docker` says it's installed | It isn't linked: `brew link docker`; if brew names files of another Docker (Docker Desktop), `brew link --overwrite docker` |
 | Requests hang | They're waiting for approval: `pibox approve`. The journal (`pibox log`) shows `ASK` for them |
