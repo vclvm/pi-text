@@ -27,6 +27,7 @@ generates every other configuration from it and runs the sandbox.
 | git | `xcode-select --install`, or `brew install git` |
 | An OpenAI-compatible model router and its key | see [bridge/README.md](bridge/README.md) |
 | An artifact repository (recommended) | Artifactory, Nexus…: Maven, npm, PyPI and Docker remotes, reachable over plain HTTP |
+| For sysbox (default `agent_docker.mode: sysbox`): git on the Mac reaching github.com | The first `pibox up` clones the [sysbox](https://github.com/nestybox/sysbox) sources and builds them in the VM (Go modules from proxy.golang.org, the `golang` image); no binaries from GitHub |
 
 Pi, Node.js and Python are **not** needed on the Mac: Pi runs inside the agent's container.
 `pibox check` lists whatever is missing. Details: [docs/pi-setup.md §6.1](docs/pi-setup.md#61-prerequisites).
@@ -60,7 +61,7 @@ After a session: `pibox review` (git hooks, risky git config, `.obsidian` change
 | `pibox check` | Check the prerequisites and `config.yaml` |
 | `pibox setup` | (Re)generate every configuration from `config.yaml`: `.env` for Compose, the bridge's environment, Pi's `models.json`, Maven/Gradle/npm/pip/Docker settings, the Colima VM |
 | `pibox config` | Show the settings in effect, secrets masked |
-| `pibox up` | Start the VM, install sysbox if needed, build the images, start bridge, proxy and the agent's Docker engine |
+| `pibox up` | Start the VM, build and install sysbox if needed (once), build the images, start bridge, proxy and the agent's Docker engine |
 | `pibox run [args]` | Pi in a fresh container in the current folder (`args` go to Pi) |
 | `pibox approve` | The approval console (detach: Ctrl-P Ctrl-Q) |
 | `pibox log` | Follow the web journal |

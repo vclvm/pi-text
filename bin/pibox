@@ -7,7 +7,7 @@ setopt err_exit no_unset pipe_fail
 SELF="${0:A}"                               # this script; $0 means the function name inside functions
 SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
 CONFIG="$SB/config.yaml"
-SYSBOX_VERSION=0.7.1                        # the default of agent_docker.sysbox_deb_url
+SYSBOX_VERSION=0.7.1                        # the sysbox release pibox builds (agent_docker.mode: sysbox)
 MAC_FROM_VM=192.168.5.2                     # the Mac, seen from Colima's VM (host.lima.internal)
 die()  { print -u2 "pibox: $*"; exit 1 }
 warn() { print -u2 "pibox: warning: $*" }
@@ -40,7 +40,7 @@ Check:
 # ---------------------------------------------------------------- init (runs from the repository)
 # Copies the components into ~/.pi-sandbox. The agent can write to your projects, so the files that
 # hold the key and define the guard rails are copies outside its reach, never the repository itself.
-COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json)
+COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json sysbox)
 BRIDGE_FILES=(Dockerfile proxy.py requirements.txt pi-trace.py)
 
 cmd_init() {
@@ -313,6 +313,13 @@ check_config() {                            # values that are certainly wrong; w
   done
   [[ "$SB/" != "$PROJECTS"/* ]] || bad folders.projects "must not contain $SB (the agent could change its own sandbox)"
   [[ "$SB/" != "$VAULT"/* ]] || bad folders.vault "must not contain $SB (the agent could change its own sandbox)"
+  if [[ "$AGENT_DOCKER" == sysbox && "$SYSBOX_DEB_URL" == /* && ! -r "$SYSBOX_DEB_URL" ]]; then
+    bad agent_docker.sysbox_deb_url "the file $SYSBOX_DEB_URL doesn't exist"
+  elif [[ "$AGENT_DOCKER" == sysbox && "$SYSBOX_DEB_URL" == http* ]] && have curl && ! sysbox_installed; then
+    curl -fsIL -m 20 ${MAC_PROXY_PORT:+-x http://127.0.0.1:$MAC_PROXY_PORT} --noproxy "${UPSTREAM_NO_PROXY:-}" \
+        -o /dev/null "$SYSBOX_DEB_URL" 2>/dev/null ||
+      bad agent_docker.sysbox_deb_url "$SYSBOX_DEB_URL can't be downloaded${MAC_PROXY_PORT:+ through the proxy on this Mac (port $MAC_PROXY_PORT)}; leave it empty to build sysbox from its sources"
+  fi
   for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config; do
     f=${(P)SETTING[$k]}; [[ -z "$f" || -r "$f" ]] || bad $k "the file $f doesn't exist or isn't readable"
   done
@@ -355,6 +362,7 @@ typeset -A SETTING=(
   images.jdk21 JDK21_IMAGE                       images.jdk25 JDK25_IMAGE
   images.maven MAVEN_IMAGE                       images.gradle GRADLE_IMAGE
   images.docker_cli DOCKER_CLI_IMAGE             images.dind DIND_IMAGE
+  images.golang GOLANG_IMAGE
   pi.package PI_PACKAGE                          pi.apt_packages PI_APT_PACKAGES
   pi.java_default JAVA_DEFAULT                   pi.memory PI_MEMORY
   pi.cpus PI_CPUS                                pi.pids PI_PIDS
@@ -391,13 +399,11 @@ load_config() {                             # defaults, then config.yaml on top
   NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
   JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
   MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
-  DIND_IMAGE=docker:29-dind
+  DIND_IMAGE=docker:29-dind GOLANG_IMAGE=golang:1.25-bookworm
   PI_PACKAGE=@earendil-works/pi-coding-agent JAVA_DEFAULT=21
   PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
   PI_MEMORY=8g PI_CPUS=4 PI_PIDS=4096
-  # sysbox from its GitHub releases, for the VM's architecture (the Mac's); the VM downloads it once
-  local arch=amd64; [[ "$(uname -m)" == (arm64|aarch64) ]] && arch=arm64
-  SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v$SYSBOX_VERSION/sysbox-ce_$SYSBOX_VERSION.linux_$arch.deb"
+  SYSBOX_DEB_URL=""
   AGENT_DOCKER=sysbox DIND_ADDRESS_POOL=172.31.0.0/16 DIND_MIN_API_VERSION=1.24
   VM_PROFILE=pi VM_CPUS=6 VM_MEMORY=12 VM_DISK=100 VM_DISK_IMAGE=""
   HOST_UID=$(id -u) HOST_GID=$(id -g)
@@ -536,7 +542,7 @@ typeset -A CHECK=(
   repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
   pi.apt_packages list                  pi.java_default 'one of:17 21 25'     pi.memory size
   pi.cpus number                        pi.pids int
-  agent_docker.mode 'one of:sysbox privileged off'                            agent_docker.sysbox_deb_url url
+  agent_docker.mode 'one of:sysbox privileged off'                            agent_docker.sysbox_deb_url urlorfile
   agent_docker.address_pool cidr        agent_docker.min_api_version apiversion
   vm.cpus int                           vm.memory int                         vm.disk int
   vm.disk_image file                    mac.uid int                           mac.gid int
@@ -568,6 +574,10 @@ check_value() {                             # check_value <setting> <kind> <valu
                items+=("$h")
              done
              val=${(j:,:)items} ;;
+    urlorfile) if [[ "$v" != http(|s)://* ]]; then
+               [[ "$v" == "~/"* ]] && val="$HOME/${v#\~/}"
+               [[ "$val" == /* ]] || { bad $key "must be an http(s):// URL or the path of a file on this Mac (/… or ~/…), not '$v'"; return 1 }
+             fi ;;
     dir)     [[ "$v" == /* ]] || { bad $key "must be an absolute path (/Users/…), not '$v'"; return 1 } ;;
     file)    [[ "$v" == "~/"* ]] && val="$HOME/${v#\~/}"
              [[ "$val" == /* ]] || { bad $key "must be an absolute path or ~/…, not '$v'"; return 1 } ;;
@@ -636,11 +646,15 @@ mounts:
     writable: true
   - location: \"$SB\"
     writable: false"
-  [[ -z "$UPSTREAM_PROXY" ]] || print -r -- "docker:
-  proxies:
+  [[ -n "$UPSTREAM_PROXY" || "$AGENT_DOCKER" == sysbox ]] || return 0
+  print -r -- "docker:"                     # the VM's daemon.json
+  [[ -z "$UPSTREAM_PROXY" ]] || print -r -- "  proxies:
     http-proxy: \"$UPSTREAM_PROXY\"
     https-proxy: \"$UPSTREAM_PROXY\"
     no-proxy: \"$UPSTREAM_NO_PROXY\""
+  [[ "$AGENT_DOCKER" != sysbox ]] || print -r -- "  runtimes:
+    sysbox-runc:
+      path: /usr/bin/sysbox-runc"
 }
 
 COLIMA_FILE() { print -r -- "${COLIMA_HOME:-$HOME/.colima}/$VM_PROFILE/colima.yaml" }
@@ -698,19 +712,65 @@ here() {                                    # the current folder, if the agent m
   print -r -- "$h"
 }
 
+sysbox_installed() {                        # is sysbox installed and running in the VM?
+  # Not `docker info`: colima.yaml registers the runtime with Docker before sysbox is installed.
+  vm_running 2>/dev/null &&
+    colima ssh -p "$VM_PROFILE" -- sh -c 'test -x /usr/bin/sysbox-runc && systemctl is-active -q sysbox' 2>/dev/null
+}
+
 sysbox() {                                  # install the sysbox runtime in the VM, once
-  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc && return 0
-  print "installing the sysbox runtime in the VM"
-  colima ssh -p "$VM_PROFILE" -- env URL="$SYSBOX_DEB_URL" UPSTREAM_PROXY="$UPSTREAM_PROXY" bash -s <<'EOF'
+  sysbox_installed && return 0
+  if [[ -n "$SYSBOX_DEB_URL" ]]; then sysbox_deb; else sysbox_build; fi
+}
+
+sysbox_build() {                            # sysbox from its sources: clone on the Mac, build in the VM
+  local src="$SB/build/sysbox-$SYSBOX_VERSION" out="$SB/generated/sysbox" url=https://github.com/nestybox/sysbox.git
+  if [[ "$(cat "$out/VERSION" 2>/dev/null)" != "$SYSBOX_VERSION" ]]; then
+    if [[ ! -e "$src/.pibox-complete" ]]; then
+      print "fetching the sources of sysbox $SYSBOX_VERSION ($url, with its submodules)"
+      rm -rf "$src"; mkdir -p "${src:h}"
+      git clone -q --depth 1 --branch "v$SYSBOX_VERSION" --recurse-submodules --shallow-submodules "$url" "$src" 2>/dev/null || {
+        rm -rf "$src"                         # a submodule's commit may not be the tip: full history
+        git -c advice.detachedHead=false clone -q --branch "v$SYSBOX_VERSION" --recurse-submodules "$url" "$src" ||
+          die "can't clone $url: git on this Mac must reach github.com (git config http.proxy, or https_proxy)"
+      }
+      touch "$src/.pibox-complete"
+    fi
+    print "building sysbox $SYSBOX_VERSION in the VM (once, a few minutes)"
+    rm -rf "$out"
+    docker buildx build --progress=plain -f "$SB/sysbox/Dockerfile" \
+      --build-arg GOLANG_IMAGE="$GOLANG_IMAGE" --build-arg APT_DEBIAN="$APT_DEBIAN" --build-arg APT_SECURITY="$APT_SECURITY" \
+      --build-arg HTTP_PROXY="$UPSTREAM_PROXY" --build-arg HTTPS_PROXY="$UPSTREAM_PROXY" --build-arg NO_PROXY="$UPSTREAM_NO_PROXY" \
+      --build-arg http_proxy="$UPSTREAM_PROXY" --build-arg https_proxy="$UPSTREAM_PROXY" --build-arg no_proxy="$UPSTREAM_NO_PROXY" \
+      --output "type=local,dest=$out" "$src" 2>&1 | tail -n 15 || die "building sysbox failed (output above)"
+    [[ "$(cat "$out/VERSION" 2>/dev/null)" == "$SYSBOX_VERSION" ]] || die "building sysbox failed: no binaries in $out"
+  fi
+  print "installing sysbox $SYSBOX_VERSION in the VM"
+  colima ssh -p "$VM_PROFILE" -- sudo bash "$SB/sysbox/install.sh" "$out" "$UPSTREAM_PROXY" ||
+    die "installing sysbox in the VM failed (output above)"
+}
+
+sysbox_deb() {                              # sysbox from a package: agent_docker.sysbox_deb_url
+  local src="$SYSBOX_DEB_URL"
+  if [[ "$src" == /* ]]; then               # a file on the Mac: through ~/.pi-sandbox, which the VM sees
+    cp "$src" "$SB/generated/sysbox.deb"; src="$SB/generated/sysbox.deb"
+  fi
+  print "installing the sysbox runtime in the VM from $SYSBOX_DEB_URL"
+  colima ssh -p "$VM_PROFILE" -- env SRC="$src" UPSTREAM_PROXY="$UPSTREAM_PROXY" NO_PROXY="$UPSTREAM_NO_PROXY" bash -s <<'EOF'
 set -euo pipefail
-[ -n "$UPSTREAM_PROXY" ] && export http_proxy="$UPSTREAM_PROXY" https_proxy="$UPSTREAM_PROXY"
 cd "$(mktemp -d)"
-curl -fsSL -o sysbox.deb "$URL" ||
-  { echo "pibox: the VM can't download $URL: set agent_docker.sysbox_deb_url to a copy it can reach" >&2; exit 1; }
+if [ -f "$SRC" ]; then
+  cp "$SRC" sysbox.deb
+else
+  [ -n "$UPSTREAM_PROXY" ] && export http_proxy="$UPSTREAM_PROXY" https_proxy="$UPSTREAM_PROXY" no_proxy="$NO_PROXY"
+  curl -fsSL -o sysbox.deb "$SRC" ||
+    { echo "pibox: the VM can't download $SRC: leave agent_docker.sysbox_deb_url empty to build sysbox from its sources" >&2; exit 1; }
+fi
 docker ps -q | xargs -r docker stop                   # the installer restarts Docker
 sudo apt-get install -y ./sysbox.deb
 docker info --format '{{json .Runtimes}}' | grep -q sysbox-runc && echo "sysbox-runc is available"
 EOF
+  rm -f "$SB/generated/sysbox.deb"
 }
 
 gq() { local s="$1"; s=${s//\\/\\\\}; s=${s//\'/\\\'}; print -rn -- "'$s'" }   # a Groovy string literal
