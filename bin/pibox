@@ -390,7 +390,8 @@ typeset -A SETTING=(
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
   repository.docker_daemon DOCKER_DAEMON_FILE    repository.pip_conf PIP_CONF_FILE
   repository.docker_config DOCKER_CONFIG_FILE
-  images.node NODE_IMAGE                         images.python PYTHON_IMAGE
+  images.base BASE_IMAGE                         images.node NODE_IMAGE
+  images.python PYTHON_IMAGE
   images.mitmproxy MITMPROXY_IMAGE               images.jdk17 JDK17_IMAGE
   images.jdk21 JDK21_IMAGE                       images.jdk25 JDK25_IMAGE
   images.maven MAVEN_IMAGE                       images.gradle GRADLE_IMAGE
@@ -431,7 +432,7 @@ load_config() {                             # defaults, then config.yaml on top
   NPM_REGISTRY=https://registry.npmjs.org/
   MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
   MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE="" DOCKER_CONFIG_FILE=""
-  NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
+  BASE_IMAGE=ubuntu:24.04 NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
   JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
   MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
   DIND_IMAGE=docker:29-dind IMAGE_REGISTRY=""
@@ -751,7 +752,7 @@ ca_certs() {                                # your company's CA certificates, fo
   # which only your Mac trusts: its IT put it into the System keychain. The images and the VM's
   # Docker get the same certificates: generated/ca/*.crt (one each), and a copy in bridge/ca/.
   local dir="$SB/generated/ca" pem="" n=0
-  rm -rf "$dir" "$SB/bridge/ca"; mkdir -p "$dir" "$SB/bridge/ca"
+  rm -rf "$dir" "$SB/bridge/ca" "$SB/generated/ca-bundle.pem"; mkdir -p "$dir" "$SB/bridge/ca"
   if [[ "$CA_CERTS" == off ]]; then
     :
   elif [[ -n "$CA_CERTS" ]]; then
@@ -763,7 +764,7 @@ ca_certs() {                                # your company's CA certificates, fo
     print -r -- "$pem" | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/pibox-%03d.crt", d, n); inside = 1 }
                                          inside { print > f } /-----END CERTIFICATE-----/ { inside = 0; close(f) }'
     local -a files=("$dir"/*.crt(N)); n=$#files
-    (( ! n )) || cp $files "$SB/bridge/ca/"
+    (( ! n )) || { cp $files "$SB/bridge/ca/"; cat $files >"$SB/generated/ca-bundle.pem" }
   fi
   if (( n )); then
     print "CA certificates for the sandbox: $n from ${CA_CERTS:-the System keychain of this Mac}"
@@ -783,7 +784,7 @@ dns_hosts() {                               # names only your Mac can resolve, f
   local out="$SB/generated/dns-hosts" h ip; local -aU hosts; local -a lines unresolved
   hosts=(${(s:,:)EGRESS_TUNNEL}
          ${(f)"$(sed -nE 's#^URIs: [a-z]+://([^/:]+).*#\1#p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}
-         ${${NODE_IMAGE%%/*}%%:*}
+         ${${BASE_IMAGE%%/*}%%:*}
          ${${${NPM_REGISTRY#*://}#*@}%%[/:]*})
   local u=${${BRIDGE_ENV[(r)PI_TEXT_URL=*]:-}#PI_TEXT_URL=}; [[ -z "$u" ]] || hosts+=(${${${u#*://}#*@}%%[/:]*})
   print "names this Mac resolves, for the VM and its containers:"
@@ -871,7 +872,7 @@ image_names() {                             # every image from your registry, by
     warn "images come from Docker Hub (docker.io): set images.registry, or registry-mirrors in your daemon.json (repository.docker_daemon)"
     return 0
   }
-  for v in NODE_IMAGE PYTHON_IMAGE MITMPROXY_IMAGE JDK17_IMAGE JDK21_IMAGE JDK25_IMAGE MAVEN_IMAGE \
+  for v in BASE_IMAGE NODE_IMAGE PYTHON_IMAGE MITMPROXY_IMAGE JDK17_IMAGE JDK21_IMAGE JDK25_IMAGE MAVEN_IMAGE \
            GRADLE_IMAGE DOCKER_CLI_IMAGE DIND_IMAGE; do
     name=${(P)v}; first=${name%%/*}
     [[ "$name" == docker.io/* ]] && { name=${name#docker.io/}; first=${name%%/*} }
@@ -880,48 +881,97 @@ image_names() {                             # every image from your registry, by
     typeset -g "$v=$reg/$name"
   done
   local from="images.registry"; [[ -n "$IMAGE_REGISTRY" ]] || from="the first registry-mirrors entry of your daemon.json"
-  print "images from $reg ($from), e.g. $NODE_IMAGE"
+  print "images from $reg ($from), e.g. $BASE_IMAGE"
 }
 
-apt_sources() {                             # your Debian remotes: generated/apt/ for building the agent's image
+apt_sources() {                             # your Ubuntu remotes: generated/apt/ for building the agent's image
   # repository.apt_sources holds the lines Artifactory's "Set Me Up" gives, one per remote:
-  #   deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>
-  # ("deb" optional). <DISTRIBUTION> becomes the base image's Debian release when building
-  # (bookworm and bookworm-updates; bookworm-security for a URL with "security" in it),
-  # <COMPONENT> becomes main. The login goes into apt's auth.conf, not into the URL.
-  local dir="$SB/generated/apt" line url dist host user pass n=0 sec=0; local -a t
+  #   deb https://user:token@artifactory.corp/artifactory/ubuntu-remote <DISTRIBUTION> <COMPONENT>
+  # ("deb" optional; any <…> placeholder). Each remote is asked, from this Mac, which of the base
+  # image's release, -updates and -security it has with packages for this Mac's architecture
+  # (dists/<suite>/main/binary-<arch>/Release), and gets exactly those. <COMPONENT> becomes
+  # "main universe" (Ubuntu) or "main" (Debian). The login goes into apt's auth.conf.
+  local dir="$SB/generated/apt" line url dist host user pass n=0 code s comps; local -a t suites have_sec found
+  local cod arch; cod=$(base_codename) arch=$(vm_arch)
+  [[ "$cod" == (bookworm|bullseye|trixie|buster|forky) ]] && comps=main || comps="main universe"
   rm -rf "$dir"; mkdir -p "$dir"; : >"$dir/debian.sources"; (umask 077; : >"$dir/auth.conf")
+  print -r -- "$cod" >"$dir/codename"
   [[ -n "$APT_SOURCES_FILE" ]] || return 0
-  for line in ${(f)"$(<"$APT_SOURCES_FILE")"}; do
+  print "package remotes for the agent's image (${BASE_IMAGE##*/}: $cod, $arch):"
+  for line in ${(f)"$(tr -d '\r' <"$APT_SOURCES_FILE")"}; do
     line=${line%%\#*}; t=(${=line})
     [[ "${t[1]:-}" == deb ]] && t=(${t[2,-1]})
     [[ "${t[1]:-}" == \[* ]] && t=(${t[2,-1]})                      # [arch=…] options
     (( $#t )) || continue
-    url=${t[1]} dist=${t[2]:-"<DISTRIBUTION>"}
+    url=${${t[1]}%/} dist=${t[2]:-"<DISTRIBUTION>"} user="" pass=""
     [[ "$url" == http(|s)://* ]] || die "$APT_SOURCES_FILE: '$line' doesn't start with a http(s):// URL"
     if [[ "${url#*://}" == *@* ]]; then                            # https://user:token@host/path
       user=${${url#*://}%%@*} pass=${user#*:} user=${user%%:*}
       user=$(urldec "$user") pass=$(urldec "$pass")                 # user%40corp.com in a URL
       url="${url%%://*}://${url#*@}"
-      host=${${url#*://}%/}
+      host=${url#*://}
       print -r -- "machine $host login $user password $pass" >>"$dir/auth.conf"
     fi
-    if [[ "$dist" == '<'*'>' ]]; then                              # <DISTRIBUTION>, <DIST>, …
-      if [[ "$url" == *security* ]]; then dist='@CODENAME@-security'; sec=1; else dist='@CODENAME@ @CODENAME@-updates'; fi
+    if [[ "$dist" == '<'*'>' ]]; then                              # <DISTRIBUTION>, …: ask the remote
+      suites=() found=()
+      for s in $cod $cod-updates $cod-security; do
+        code=$(apt_probe "$url/dists/$s/InRelease" "$user" "$pass")
+        case $code in
+          200) found+=($s)
+               [[ "$(apt_probe "$url/dists/$s/main/binary-$arch/Release" "$user" "$pass")" == 200 ]] && suites+=($s) ;;
+          401|403) die "$url: the login of $APT_SOURCES_FILE is refused ($code)" ;;
+          000) die "$url can't be reached from this Mac (connection or certificate): check the URL" ;;
+        esac
+      done
+      (( $#found )) || die "$url has none of $cod, $cod-updates, $cod-security (dists/<suite>/InRelease): is it a remote of the Ubuntu archive?"
+      (( $#suites )) || die "$url has ${(j:, :)found}, but no packages for $arch. $( [[ $arch == arm64 ]] && print "Ubuntu for arm64 (Apple Silicon) is on ports.ubuntu.com/ubuntu-ports, not archive.ubuntu.com: use your remote of ports.ubuntu.com")"
+    else
+      suites=(${=dist})
     fi
     t=(${t[3,-1]}); t=(${t:#<*>})                                  # <COMPONENT>, <COMPONENTS>, …
-    (( $#t )) || t=(main)
+    (( $#t )) || t=(${=comps})
+    print "  $url: ${(j:, :)suites} (${t[*]})"
+    (( ${suites[(I)*-security]} )) && have_sec+=($url)
     print -r -- "Types: deb
 URIs: $url
-Suites: $dist
+Suites: ${suites[*]}
 Components: ${t[*]}
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Signed-By: @KEYRING@
 " >>"$dir/debian.sources"
     (( ++n ))
   done
-  (( n )) || die "$APT_SOURCES_FILE has no repository lines (expected e.g.: deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>)"
-  (( sec )) || warn "$APT_SOURCES_FILE has no remote of debian-security (a URL with \"security\" in it): the base image's newer libraries may conflict with packages from the release alone; add the line of your debian-security remote"
-  print "Debian packages for the agent's image: $n remote(s) from $APT_SOURCES_FILE"
+  (( n )) || die "$APT_SOURCES_FILE has no repository lines (expected e.g.: deb https://user:token@artifactory.corp/artifactory/ubuntu-remote <DISTRIBUTION> <COMPONENT>)"
+  (( $#have_sec )) || die "none of the remotes in $APT_SOURCES_FILE has $cod-security: the base image ${BASE_IMAGE##*/} already has security updates, so packages from the release alone may not fit it. Add the \"Set Me Up\" line of a remote that has it"
+  return 0
+}
+
+base_codename() {                           # the release of the agent's base image, from its tag
+  local img=${BASE_IMAGE##*/} tag=${BASE_IMAGE##*:} c
+  case "$tag" in
+    *26.04*) print resolute ;; *25.10*) print questing ;; *25.04*) print plucky ;;
+    *24.04*) print noble ;; *22.04*) print jammy ;; *20.04*) print focal ;;
+    *)       for c in noble jammy focal plucky questing resolute trixie bookworm bullseye; do
+               [[ "$img" == *$c* ]] && { print $c; return 0 }; done
+             [[ "$img" == debian* ]] && print bookworm || print noble ;;
+  esac
+}
+
+vm_arch() {                                 # the VM's architecture: this Mac's
+  [[ "$(uname -m)" == (arm64|aarch64) ]] && print arm64 || print amd64
+}
+
+apt_probe() {                               # apt_probe <url> <user> <password>: the HTTP status, 000 = unreachable
+  local -a auth=(); [[ -z "$2" ]] || auth=(-u "$2:$3")
+  local code bundle="$SB/generated/ca-bundle.pem"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 $auth "$1" 2>/dev/null) || true
+  if [[ "$code" == 000 && -s "$bundle" ]]; then           # your company's CA (network.ca_certs)
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 --cacert "$bundle" $auth "$1" 2>/dev/null) || true
+  fi
+  if [[ "$code" == 000 && -n "$MAC_PROXY_PORT" ]]; then   # only through the proxy on this Mac
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -x "http://127.0.0.1:$MAC_PROXY_PORT" \
+           ${${(M)bundle:#?*}:+--cacert} ${${(M)bundle:#?*}:+$bundle} $auth "$1" 2>/dev/null) || true
+  fi
+  print -r -- "${code:-000}"
 }
 
 vm_dns_check() {                            # does the VM resolve the names as this Mac does?
@@ -951,7 +1001,7 @@ vm_ca() {                                   # the CA certificates into the VM's 
 
 build_images() {                            # compose build, telling what happens and where things come from
   print "building the images (the first time takes a while; later only what changed). Sources:
-  base images  $NODE_IMAGE, $PYTHON_IMAGE, $JDK21_IMAGE, …
+  base images  $BASE_IMAGE, $NODE_IMAGE, $PYTHON_IMAGE, $JDK21_IMAGE, …
   Debian       ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-deb.debian.org (repository.apt_sources is empty)}
   npm (Pi)     ${${${(M)NPMRC_FILE:#?*}:+your .npmrc ($NPMRC_FILE)}:-registry.npmjs.org}
   pip (bridge) ${${${(M)PIP_CONF_FILE:#?*}:+your pip.conf ($PIP_CONF_FILE)}:-pypi.org}
@@ -966,16 +1016,15 @@ build_progress() {                          # build_progress <log>: BuildKit's p
   # Each step when it starts and how long it took, errors in full, and every 20 s what the running
   # step is doing (a download's progress, or its last line). Everything goes to <log>.
   setopt local_options extended_glob
-  local log=$1 line text step="" started=$SECONDS last=$SECONDS id
-  local -A begun
+  local log=$1 line text last=$SECONDS id
+  local -A begun label
   while IFS= read -r line; do
     print -r -- "$line" >>"$log"
     [[ "$line" == '#'[0-9]##' '* ]] || { [[ "$line" == *(error|ERROR|failed)* ]] && print -r -- "  $line"; continue }
     id=${line%% *} text=${line#* }
     case "$text" in
       ('['*)                                  # a step starts: [service n/m] INSTRUCTION, or [auth], [internal]
-        [[ -n "${begun[$id]:-}" ]] && continue; begun[$id]=$SECONDS
-        step=${text[1,100]} started=$SECONDS last=$SECONDS
+        [[ -n "${begun[$id]:-}" ]] && continue; begun[$id]=$SECONDS label[$id]=${text[1,50]} last=$SECONDS
         print -r -- "  ${text[1,110]}" ;;
       (DONE*)
         (( SECONDS - ${begun[$id]:-$SECONDS} >= 2 )) && print -r -- "      done in ${text#DONE }" ;;
@@ -983,8 +1032,8 @@ build_progress() {                          # build_progress <log>: BuildKit's p
       (ERROR*|*' ERROR '*|*'E: '*|*'error:'*|*'Error'*|*'failed'*|[0-9.]##' '(Err|Ign|W|N):*|*'pibox: '*)
         print -r -- "  ${text}" ;;
       (*)
-        if (( SECONDS - last >= 20 )); then
-          print -r -- "  … ${step[1,50]} ($(( SECONDS - started ))s): ${${text#[0-9.]## }[1,90]}"
+        if (( SECONDS - last >= 20 )); then                 # the step this line belongs to
+          print -r -- "  … ${label[$id]:-$id} ($(( SECONDS - ${begun[$id]:-$SECONDS} ))s): ${${text#[0-9.]## }[1,90]}"
           last=$SECONDS
         fi ;;
     esac

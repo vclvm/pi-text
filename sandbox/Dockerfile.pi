@@ -1,5 +1,6 @@
-# The agent's image: Pi plus a development toolchain. Every image name comes from config.yaml, so all of
-# them can be pulled through your registry mirror.
+# The agent's image: Ubuntu, Pi and a development toolchain. Every image name comes from config.yaml
+# (pibox setup puts your registry in front of them).
+ARG BASE_IMAGE=ubuntu:24.04
 ARG NODE_IMAGE=node:24-bookworm-slim
 ARG JDK17_IMAGE=eclipse-temurin:17-jdk
 ARG JDK21_IMAGE=eclipse-temurin:21-jdk
@@ -13,8 +14,9 @@ FROM ${JDK25_IMAGE} AS jdk25
 FROM ${MAVEN_IMAGE} AS maven
 FROM ${GRADLE_IMAGE} AS gradle
 FROM ${DOCKER_CLI_IMAGE} AS dockercli
+FROM ${NODE_IMAGE} AS node
 
-FROM ${NODE_IMAGE}
+FROM ${BASE_IMAGE}
 ARG UID=501
 ARG GID=20
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
@@ -27,14 +29,17 @@ COPY generated/ca/ /usr/local/share/ca-certificates/pibox/
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
-# System packages: from your repository's Debian remotes if repository.apt_sources is set (pibox
+# System packages: from your repository's Ubuntu remotes if repository.apt_sources is set (pibox
 # setup writes generated/apt/). Mounted for this step only: the login doesn't stay in the image.
 RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
     set -eu; \
     if [ -s /pibox-apt/debian.sources ]; then \
-      . /etc/os-release; rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
-      sed "s/@CODENAME@/$VERSION_CODENAME/g" /pibox-apt/debian.sources > /etc/apt/sources.list.d/pibox.sources; \
-      [ -f /usr/share/keyrings/debian-archive-keyring.gpg ] || sed -i '/^Signed-By:/d' /etc/apt/sources.list.d/pibox.sources; \
+      . /etc/os-release; \
+      if [ "$VERSION_CODENAME" != "$(cat /pibox-apt/codename)" ]; then \
+        echo "pibox: the base image is Debian $VERSION_CODENAME, pibox setup asked your remotes for $(cat /pibox-apt/codename)"; exit 1; fi; \
+      rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
+      key=/usr/share/keyrings/ubuntu-archive-keyring.gpg; [ -f "$key" ] || key=/usr/share/keyrings/debian-archive-keyring.gpg; \
+      sed "s#@KEYRING@#$key#" /pibox-apt/debian.sources > /etc/apt/sources.list.d/pibox.sources; \
       mkdir -p /etc/apt/auth.conf.d; install -m 600 /pibox-apt/auth.conf /etc/apt/auth.conf.d/pibox.conf; \
     fi; \
     # The base image may not have ca-certificates yet: apt trusts your CA for an https:// mirror.
@@ -74,6 +79,15 @@ ENV JAVA_HOME=/opt/jdk/${JAVA_DEFAULT} JAVA_HOME_17=/opt/jdk/17 JAVA_HOME_21=/op
     MAVEN_HOME=/opt/maven GRADLE_HOME=/opt/gradle \
     PATH=/opt/jdk/${JAVA_DEFAULT}/bin:/opt/maven/bin:/opt/gradle/bin:$PATH
 
+# Node.js (node, npm, corepack) from the official image: its binaries run on Ubuntu as they are.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=node /usr/local/include/node /usr/local/include/node
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+ && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
+ && node --version && npm --version
+
 # Pi itself, from your npm registry; corepack provides pnpm and yarn.
 # Your .npmrc (registries, tokens), if pibox setup put one into generated/build/: mounted for this
 # step only, so the token doesn't stay in the image.
@@ -83,7 +97,7 @@ RUN --mount=type=bind,source=generated/build,target=/pibox-build \
 
 # Same UID/GID as the Mac user, so files written to the bind mounts belong to you. The cache
 # folders exist in the image so that the volumes mounted on them belong to that user too.
-RUN userdel -r node 2>/dev/null; groupdel node 2>/dev/null; \
+RUN userdel -r ubuntu 2>/dev/null; userdel -r node 2>/dev/null; groupdel ubuntu 2>/dev/null; groupdel node 2>/dev/null; \
     (getent group "$GID" || groupadd -g "$GID" pi) \
  && useradd -m -o -u "$UID" -g "$GID" -s /bin/bash pi \
  && mkdir -p /home/pi/.pi/agent/sessions /home/pi/.m2 /home/pi/.gradle /home/pi/.npm /home/pi/.cache /home/pi/.docker \

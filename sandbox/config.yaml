@@ -180,13 +180,15 @@ repository:
   # login in the file ("auth", or username/password) are kept: credsStore/credHelpers keep it in
   # your Mac's keychain, which the sandbox doesn't have.
   docker_config: ""
-  # Debian packages for building the agent's image: a file with the line(s) your Artifactory's
-  # "Set Me Up" gives for its Debian remotes, as they are, e.g. ~/.config/pi-sandbox/apt-sources:
-  #   deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>
-  #   deb https://user:token@artifactory.corp/artifactory/debian-security-remote <DISTRIBUTION> <COMPONENT>
-  # One line per remote; "deb" may be left out. <DISTRIBUTION> becomes the image's Debian release
-  # (bookworm, bookworm-updates; bookworm-security for a URL with "security" in it), <COMPONENT>
-  # main. The login is used for the build only and doesn't stay in the image. "" = deb.debian.org
+  # Ubuntu packages for building the agent's image (images.base: Ubuntu 24.04 "noble"): a file
+  # with the line(s) your Artifactory's "Set Me Up" gives for its Ubuntu remote, as they are, e.g.
+  # ~/.config/pi-sandbox/apt-sources:
+  #   deb https://user:token@artifactory.corp/artifactory/ubuntu-remote <DISTRIBUTION> <COMPONENT>
+  # One line per remote; "deb" may be left out; any <…> placeholder. pibox setup asks each remote
+  # which of noble, noble-updates, noble-security it has with packages for this Mac's
+  # architecture, and uses exactly those; <COMPONENT> becomes "main universe". On Apple Silicon
+  # (arm64) the packages are on ports.ubuntu.com/ubuntu-ports, so it must be a remote of that.
+  # The login is used for the build only and doesn't stay in the image. "" = Ubuntu's own servers
   apt_sources: ""
 
 # ========================================================================================= images
@@ -199,7 +201,8 @@ images:
   # <registry>/library/node:24-…; a name that already starts with a registry stays as it is.
   # "" = the host of the first registry-mirrors entry of your daemon.json (repository.docker_daemon)
   registry: ""
-  node: node:24-bookworm-slim              # base of the agent's image
+  base: ubuntu:24.04                       # the agent's image: Ubuntu 24.04 (noble)
+  node: node:24-bookworm-slim              # Node.js (node, npm, corepack) is copied from this
   python: python:3.12-slim                 # base of the bridge's image
   mitmproxy: mitmproxy/mitmproxy:12.3.1    # the filtering proxy
   jdk17: eclipse-temurin:17-jdk            # JDKs copied into the agent's image
