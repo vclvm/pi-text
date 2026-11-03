@@ -49,13 +49,19 @@ cmd_init() {
     die "run init from the repository: <path-to-pi-text>/bin/pibox init"
   [[ "$SB/" != "$src"/* && "$src/" != "$SB"/* ]] || die "$SB and the repository $src must not contain each other"
   have yq || die "yq not found: brew install yq (pibox check lists everything that is needed)"
+  # Run the repository's pibox, not this (maybe older, installed) copy: the new template must be
+  # merged and checked by the rules that come with it.
+  if [[ "$SELF" != "${src:A}/bin/pibox" && -z "${PIBOX_INIT_FROM_SOURCE:-}" ]]; then
+    PIBOX_INIT_FROM_SOURCE=1 exec zsh "$src/bin/pibox" init
+  fi
 
   mkdir -p "$SB"/{bin,bridge,agent,generated}; chmod 700 "$SB"
   for f in $COMPONENTS; do
     rm -rf "$SB/$f"; mkdir -p "$SB/${f:h}"; cp -R "$src/sandbox/$f" "$SB/$f"
   done
   for f in $BRIDGE_FILES; do cp "$src/bridge/$f" "$SB/bridge/$f"; done
-  cp "$src/bin/pibox" "$SB/bin/pibox"; chmod 755 "$SB/bin/pibox"
+  cp "$src/bin/pibox" "$SB/bin/.pibox.new"; chmod 755 "$SB/bin/.pibox.new"
+  mv -f "$SB/bin/.pibox.new" "$SB/bin/pibox"       # a new file: a running pibox keeps reading the old one
   print -r -- "$src" > "$SB/.source"
   print "installed the components from $src into $SB"
 
