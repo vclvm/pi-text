@@ -35,7 +35,7 @@ services:
       args:
         <<: *build-proxy
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
-        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}   # your pip.conf's index-url, as written
     env_file: generated/bridge.env           # the bridge section of config.yaml, and BRIDGE_PORT
     environment:
       HTTP_PROXY: ${UPSTREAM_PROXY:-}        # empty = direct
@@ -68,6 +68,7 @@ services:
       EGRESS_DENY: ${EGRESS_DENY:-}
       EGRESS_ALLOW_PRIVATE: ${EGRESS_ALLOW_PRIVATE:-}
       EGRESS_NO_APPROVAL: ${EGRESS_NO_APPROVAL:-}
+      EGRESS_TUNNEL: ${EGRESS_TUNNEL:-}       # your repositories: HTTPS tunnels allowed to them alone
       EGRESS_PORTS: ${EGRESS_PORTS:-80,443}
       UPSTREAM_PROXY: ${UPSTREAM_PROXY:-}
       UPSTREAM_NO_PROXY: ${UPSTREAM_NO_PROXY:-}
@@ -116,7 +117,7 @@ services:
         DOCKER_CLI_IMAGE: ${DOCKER_CLI_IMAGE:-docker:29-cli}
         APT_DEBIAN: ${APT_DEBIAN:-}
         APT_SECURITY: ${APT_SECURITY:-}
-        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+        NPM_REGISTRY: ${BUILD_NPM_REGISTRY:-https://registry.npmjs.org/}   # your .npmrc's registry, as written
         PI_PACKAGE: ${PI_PACKAGE:-@earendil-works/pi-coding-agent}
         PI_APT_PACKAGES: ${PI_APT_PACKAGES:-bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip}
         UID: ${HOST_UID:-501}

@@ -419,7 +419,8 @@ load_config() {                             # defaults, then config.yaml on top
   APT_DEBIAN="" APT_SECURITY=""
   # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
   # Maven wrapper's repository and login.
-  NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple
+  EGRESS_TUNNEL=""
+  NPM_REGISTRY=https://registry.npmjs.org/ BUILD_NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple
   MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
   MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE="" DOCKER_CONFIG_FILE=""
   NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
@@ -701,7 +702,7 @@ cmd_setup() {
   check_config
   tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
   repo_hosts "$SB/generated/c"
-  for v in ${(ou)SETTING} NPM_REGISTRY PIP_INDEX_URL MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
+  for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY BUILD_NPM_REGISTRY PIP_INDEX_URL MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
     kv+=("$v=${(P)v}")
   done
   dotenv "$SB/.env" $kv                                         # docker compose
@@ -856,30 +857,28 @@ gradle_repos() {                            # gradle_repos <the adapted settings
 
 # ---- your own configuration files (repository.maven_settings, .npmrc, .docker_daemon)
 # They are copied, not mounted: the VM doesn't see your home folder. What would break inside the
-# sandbox is changed in the copy: every request must go through the filtering proxy as plain HTTP.
+# sandbox is changed in the copy: every request must go through the filtering proxy. URLs stay as
+# they are: https:// repositories are reached through tunnels the filter allows to them alone.
 
 own_maven_settings() {                      # own_maven_settings <yours> <copy> <proxy host> <port> <non-proxy hosts>
-  local n
   grep -qE '<password>[[:space:]]*\{' "$1" &&
     warn "$1 has encrypted passwords: Maven can't decrypt them in the sandbox (no settings-security.xml); give it a file with plain READ-ONLY tokens"
   grep -q '\${env\.' "$1" && warn "$1 uses \${env.…}: your Mac's environment variables don't exist in the sandbox"
-  perl -0ne 'exit(/<url>\s*https:\/\//s ? 0 : 1)' "$1" && n=1 || n=0
   # Comments out (they may hold <proxies> examples), your proxies and local repository path out
-  # (paths of the Mac), every https:// repository URL as http://, the filtering proxy in.
+  # (paths of the Mac), the filtering proxy in, for http:// and https:// repositories.
   (umask 077
    PROXIES="  <proxies>
     <proxy><id>pi-sandbox</id><active>true</active><protocol>http</protocol><host>$3</host><port>$4</port><nonProxyHosts>$5</nonProxyHosts></proxy>
+    <proxy><id>pi-sandbox-https</id><active>true</active><protocol>https</protocol><host>$3</host><port>$4</port><nonProxyHosts>$5</nonProxyHosts></proxy>
   </proxies>" SRC="$1" perl -0pe '
      s/<!--.*?-->//gs;
      s/\s*<proxies\s*\/>//s; s/\s*<proxies>.*?<\/proxies>//s;
      s/\s*<localRepository>.*?<\/localRepository>//s; s/\s*<localRepository\s*\/>//s;
      s/\s*<offline>.*?<\/offline>//s;
-     s/(<url>\s*)https:\/\//${1}http:\/\//g;
      s/\A(<\?xml[^>]*\?>\s*)?/($1 \/\/ "") . "<!-- Copied by pibox setup from $ENV{SRC}, adapted to the sandbox; edit the original. -->\n"/e;
      s/\s*<\/settings>\s*\z/\n$ENV{PROXIES}\n<\/settings>\n/s or die "no </settings> at the end\n";
    ' "$1" > "$2") || die "can't adapt $1"
   yq -p xml '.' "$2" >/dev/null 2>&1 || die "$1: the adapted copy $2 isn't valid XML"
-  (( n )) && print "$1: https:// repository URLs are http:// in the sandbox's copy (only plain HTTP passes the filter)"
   return 0
 }
 
@@ -888,9 +887,8 @@ own_npmrc() {                               # own_npmrc <yours> <copy> <proxy ho
   grep -q '\${' "$1" && warn "$1 uses \${…}: your Mac's environment variables don't exist in the sandbox"
   (umask 077
    { print -r -- "# Copied by pibox setup from $1, adapted to the sandbox; edit the original."
-     # Your proxy settings and Mac paths out, https:// registries as http://, the filtering proxy in.
-     grep -vE '^[[:space:]]*(proxy|https-proxy|http-proxy|noproxy|no-proxy|cafile|ca|strict-ssl|prefix|cache|globalconfig|userconfig|init-module)[[:space:]]*=' "$1" |
-       sed -E 's#^([[:space:]]*(@[^:=[:space:]]+:)?registry[[:space:]]*=[[:space:]]*)https://#\1http://#'
+     # Your proxy settings and Mac paths out, the filtering proxy in.
+     grep -vE '^[[:space:]]*(proxy|https-proxy|http-proxy|noproxy|no-proxy|cafile|ca|strict-ssl|prefix|cache|globalconfig|userconfig|init-module)[[:space:]]*=' "$1"
      print -r -- "proxy=http://$3:$4/
 https-proxy=http://$3:$4/
 noproxy=${5//|/,}
@@ -900,16 +898,15 @@ update-notifier=false"
    } > "$2") || die "can't adapt $1"
   # npm's own key: //host/path/:_authToken: the registry URL without scheme, https or http alike.
   reg=$(sed -nE 's#^[[:space:]]*registry[[:space:]]*=[[:space:]]*##p' "$2" | tail -1)
-  [[ -z "$reg" ]] || NPM_REGISTRY="$reg"      # also used for building the image and by corepack
-  grep -qE '^[[:space:]]*(@[^:=[:space:]]+:)?registry[[:space:]]*=[[:space:]]*https://' "$1" &&
-    print "$1: https:// registries are http:// in the sandbox's copy (only plain HTTP passes the filter)"
+  [[ -z "$reg" ]] || NPM_REGISTRY="$reg" BUILD_NPM_REGISTRY="$reg"   # corepack; installing Pi into the image
   return 0
 }
 
 own_pip_conf() {                            # own_pip_conf <yours> <copy> <proxy host> <port>
-  # E.g. the pip.conf of Artifactory's "Set Me Up". Your proxy, certificate and Mac paths out,
-  # https:// index URLs as http://, every index host trusted (pip refuses plain http otherwise),
-  # the filtering proxy in. Keys pibox sets are removed everywhere, or pip would see them twice.
+  # E.g. the pip.conf of Artifactory's "Set Me Up". Your proxy, certificate and Mac paths out, the
+  # filtering proxy in; http:// index hosts trusted (pip refuses plain http otherwise; for https://
+  # it would turn off the certificate check). Keys pibox sets are removed everywhere, or pip would
+  # see them twice.
   grep -q '\${\|%(' "$1" && warn "$1 uses \${…} or %(…)s: your Mac's environment variables don't exist in the sandbox"
   local -aU hosts; local u h
   (umask 077
@@ -923,17 +920,17 @@ own_pip_conf() {                            # own_pip_conf <yours> <copy> <proxy
      }
      /^[ \t]+[^ \t]/ && skip { next }                       # a continuation line of a removed key
      /^[ \t]*\[/ { skip = 0 }
-     { gsub(/https:\/\//, "http://"); print }
+     { print }
      /^[ \t]*\[global\][ \t]*$/ && !done { print ours; done = 1 }
      END { if (!done) { print "[global]"; print ours } }
    ' "$1" > "$2") || die "can't adapt $1"
-  for u in ${(f)"$(grep -v '^proxy = ' "$2" | grep -oE 'https?://[^[:space:]]+')"}; do   # the index URLs
+  for u in ${(f)"$(grep -v '^proxy = ' "$2" | grep -oE 'http://[^[:space:]]+')"}; do   # plain-HTTP indexes
     h=${${${u#*://}%%/*}##*@}; hosts+=("${h%%:*}")
   done
-  u=$(sed -nE 's#^[[:space:]]*index[-_]url[[:space:]]*[=:][[:space:]]*##p' "$2" | head -1)
+  u=$(sed -nE 's#^[[:space:]]*index[-_]url[[:space:]]*[=:][[:space:]]*##p' "$1" | head -1)
   [[ -z "$u" ]] || PIP_INDEX_URL=$u                     # also for building the bridge's image
-  H="trusted-host = ${(j: :)hosts}" perl -i -pe 's/^(proxy = .*)$/$1\n$ENV{H}/ if /^proxy = / && !$d++' "$2"
-  grep -q 'https://' "$1" && print "$1: https:// index URLs are http:// in the sandbox's copy (only plain HTTP passes the filter)"
+  (( ! $#hosts )) ||
+    H="trusted-host = ${(j: :)hosts}" perl -i -pe 's/^(proxy = .*)$/$1\n$ENV{H}/ if /^proxy = / && !$d++' "$2"
   return 0
 }
 
@@ -959,20 +956,17 @@ own_docker_config() {                       # own_docker_config <yours or ""> <c
                                     | .value = (.value | with_entries(select(.key == "auth" or .key == "username" or .key == "password" or .key == "identitytoken"))))),
        "proxies": {"default": {"httpProxy": strenv(P), "httpsProxy": strenv(P), "noProxy": "localhost,127.0.0.1"}}}
   ' > "$2") || die "can't adapt ${src:-the Docker CLI config}"
-  (( $#DOCKER_LOGIN_REGS )) && print "${src}: logins for ${(j:, :)DOCKER_LOGIN_REGS}; the agent's engine reaches them over plain HTTP"
+  (( $#DOCKER_LOGIN_REGS )) && print "${src}: logins for ${(j:, :)DOCKER_LOGIN_REGS}"
   return 0
 }
 
 own_daemon() {                              # own_daemon <yours> <copy> <proxy port>
-  # Settings that clash with how the engine runs here out; mirrors as plain HTTP (so also insecure
-  # registries); the filtering proxy, the address pool and the snapshotter of the sandbox in.
-  # Registries you have a login for (docker_config) are plain HTTP too.
-  (umask 077; P="http://proxy:$3" POOL="$DIND_ADDRESS_POOL" REGS="${(j:,:)DOCKER_LOGIN_REGS}" yq -p json -o json '
+  # Settings that clash with how the engine runs here out; http:// mirrors also as insecure
+  # registries; the filtering proxy, the address pool and the snapshotter of the sandbox in.
+  (umask 077; P="http://proxy:$3" POOL="$DIND_ADDRESS_POOL" yq -p json -o json '
     del(.hosts, .tls, .tlsverify, .tlscacert, .tlscert, .tlskey, .["data-root"], .["exec-root"], .pidfile)
-    | .["registry-mirrors"] = ((.["registry-mirrors"] // []) | map(sub("^https://"; "http://")))
     | .["insecure-registries"] = ((.["insecure-registries"] // [])
-        + (.["registry-mirrors"] | map(sub("^https?://"; "") | sub("/.*$"; "")))
-        + (strenv(REGS) | split(",") | map(select(. != ""))) | unique)
+        + ((.["registry-mirrors"] // []) | map(select(test("^http://")) | sub("^http://"; "") | sub("/.*$"; ""))) | unique)
     | .proxies = {"http-proxy": strenv(P), "https-proxy": strenv(P), "no-proxy": "localhost,127.0.0.1"}
     | .["default-address-pools"] = (.["default-address-pools"] // [{"base": strenv(POOL), "size": 24}])
     | .features["containerd-snapshotter"] |= (. // false)
@@ -981,12 +975,14 @@ own_daemon() {                              # own_daemon <yours> <copy> <proxy p
 
 repo_hosts() {                              # repo_hosts <dir>: the repositories' hosts into the egress lists
   # Every repository the generated files point to may be fetched from without asking you and even
-  # if it's in your network; its port is allowed. Public default registries are not added.
+  # if it's in your network, over HTTPS through a tunnel the filter allows to these hosts alone; its
+  # port is allowed. Public default registries are not added.
   local dir=$1 u h; local -a urls; local -aU hosts ports
   urls=(${(f)"$(sed -nE 's#.*<url>[[:space:]]*([^<[:space:]]*)[[:space:]]*</url>.*#\1#p' "$dir/settings.xml")"}
         ${(f)"$(sed -nE 's#^[[:space:]]*(@[^:=[:space:]]+:)?registry[[:space:]]*=[[:space:]]*##p' "$dir/npmrc")"}
         ${(f)"$(grep -v '^proxy[[:space:]]*=' "$dir/pip.conf" | grep -oE 'https?://[^[:space:]]+')"}
-        ${(f)"$(yq -p json -o yaml '(.["registry-mirrors"] // [])[], (.["insecure-registries"] // [])[]' "$dir/daemon.json")"})
+        ${(f)"$(yq -p json -o yaml '(.["registry-mirrors"] // [])[], (.["insecure-registries"] // [])[]' "$dir/daemon.json")"}
+        $DOCKER_LOGIN_REGS)
   for u in $urls; do
     [[ -n "$u" && "$u" != *'$'* ]] || continue
     h=${${${u#*://}%%/*}##*@}
@@ -999,7 +995,8 @@ repo_hosts() {                              # repo_hosts <dir>: the repositories
   l=(${(s:,:)EGRESS_NO_APPROVAL} $hosts);   EGRESS_NO_APPROVAL=${(j:,:)l}
   l=(${(s:,:)EGRESS_ALLOW_PRIVATE} $hosts); EGRESS_ALLOW_PRIVATE=${(j:,:)l}
   l=(${(s:,:)EGRESS_PORTS} $ports);         EGRESS_PORTS=${(j:,:)l}
-  print "repositories, reachable without asking you (egress): ${(j:, :)hosts}${ports:+; ports ${(j:, :)ports}}"
+  EGRESS_TUNNEL=${(j:,:)hosts}
+  print "repositories, reachable without asking you, also over HTTPS (egress): ${(j:, :)hosts}${ports:+; ports ${(j:, :)ports}}"
 }
 
 tooling() {                                 # tooling <dir> <proxy host> <proxy port> <jdk dir or "">
@@ -1017,6 +1014,7 @@ tooling() {                                 # tooling <dir> <proxy host> <proxy 
 <settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">
   <proxies>
     <proxy><id>pi-sandbox</id><active>true</active><protocol>http</protocol><host>$ph</host><port>$pp</port><nonProxyHosts>$nonproxy</nonProxyHosts></proxy>
+    <proxy><id>pi-sandbox-https</id><active>true</active><protocol>https</protocol><host>$ph</host><port>$pp</port><nonProxyHosts>$nonproxy</nonProxyHosts></proxy>
   </proxies>
 </settings>"
   } > "$dir/settings.xml"
@@ -1158,6 +1156,7 @@ config)                                     # the settings in effect (secrets ma
   yq '.models[] | "model: " + .id + "  contextWindow " + (.contextWindow | tostring)
       + ", maxTokens " + (.maxTokens | tostring) + ", reasoning " + (.reasoning // false | tostring)' "$CONFIG"
   print -r -- "proxy on the Mac, as the VM reaches it: ${UPSTREAM_PROXY:-none (direct)}"
+  [[ ! -f "$SB/.env" ]] || sed -nE "s/^EGRESS_TUNNEL='(.*)'$/HTTPS tunnels allowed to (your repositories): \1/p" "$SB/.env"
   print -r -- "docker context: $DOCKER_CONTEXT, VM config: $(COLIMA_FILE)"
   ;;
 

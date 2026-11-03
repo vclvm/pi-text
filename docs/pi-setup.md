@@ -238,11 +238,15 @@ An HTTP proxy is a server that makes web requests on behalf of clients. Tools fi
   everything inside it. The proxy sees only the host name, so it can't tell a harmless `GET` from a
   `POST` that uploads your keys.
 
-So the sandbox works with plain requests only. The agent's tools talk to our filtering proxy over
-plain HTTP, the proxy allows `GET`/`HEAD` and refuses every tunnel, and passes allowed requests on to
-the proxy on your Mac (`network.mac_proxy_port`), which takes care of the connection to the site. Nothing is decrypted
-and no certificates are involved. In practice that means: inside the sandbox use `http://` URLs, and
-`http://` addresses for package mirrors; the `web_fetch` tool converts URLs for you.
+So the sandbox works with plain requests for the web. The agent's tools talk to our filtering proxy
+over plain HTTP, the proxy allows `GET`/`HEAD` and refuses tunnels, and passes allowed requests on
+to the proxy on your Mac (`network.mac_proxy_port`), which takes care of the connection to the
+site. Nothing is decrypted and no certificates are involved. In practice that means: inside the
+sandbox use `http://` URLs; the `web_fetch` tool converts URLs for you.
+
+The one exception are **your artifact repositories** (§8.9): they often answer HTTPS only, so the
+proxy allows tunnels to their hosts, and to nothing else (`EGRESS_TUNNEL`, filled by `pibox setup`).
+It can't see what goes through those tunnels; that's why their tokens should be read-only.
 
 **mitmproxy** is the filtering proxy. It can run Python *addons* (our policy) and **intercept**
 requests: each request stops and waits until you press a key to let it through. That's our approval step.
@@ -331,7 +335,7 @@ cd ~/Projects/api && pibox run       # terminal 1: Pi
 | yq (mikefarah, v4) | `pibox` reads `config.yaml` with it | `brew install yq` |
 | git | To clone this repository | Part of the Xcode command line tools (`xcode-select --install`), or `brew install git` |
 | A model router | The bridge's upstream, an OpenAI-compatible API and its key | Yours; see [bridge/README.md](../bridge/README.md) |
-| An artifact repository (recommended) | The agent downloads dependencies and images only from it, over plain HTTP (§8.9) | Artifactory, Nexus or similar: Maven, npm, PyPI and Docker remotes. Without one, set the public registries; then only what the image already contains works offline |
+| An artifact repository (recommended) | The agent downloads dependencies and images only from it (§8.9) | Artifactory, Nexus or similar: Maven, npm, PyPI and Docker remotes. Without one, set the public registries; then only what the image already contains works offline |
 
 You don't need Pi, Node.js or Python on the Mac: Pi runs in the agent's container, built from
 `pi.package`, and the bridge in its own. `zsh`, which runs `pibox`, is macOS's default shell.
@@ -450,7 +454,7 @@ What the sections mean:
 | `network` | `bridge_port` and `proxy_port`: ports of the sandbox's own two services, the bridge and the filtering proxy. They exist only on the internal Docker network (`http://bridge:8789`, `http://proxy:8080`), are not opened on the Mac or the LAN, and normally stay as they are. `mac_proxy_port`: something else entirely, the port of the HTTP proxy **on your Mac** that everything leaves the sandbox through: the bridge, the filtering proxy, image downloads. Only the port: `pibox setup` fills in the Mac's address as the VM sees it (`192.168.5.2`, Colima's `host.lima.internal`, which leads to the Mac's `127.0.0.1`), and `pibox check` tests that the proxy is listening. Empty: connect directly. `upstream_no_proxy`: hosts reached without it. `sandbox_subnet`: the internal network's addresses |
 | `egress` | The agent's web policy (§8.6) |
 | `extensions` | Settings of the Pi extensions (§9) |
-| `repository` | Paths of your own `settings.xml`, `.npmrc`, `pip.conf` and `daemon.json`: `pibox setup` adapts copies to the sandbox (plain HTTP, the filtering proxy) and makes Gradle's settings from `settings.xml` (§8.9). Debian mirrors for the image builds |
+| `repository` | Paths of your own `settings.xml`, `.npmrc`, `pip.conf` and `daemon.json`: `pibox setup` adapts copies to the sandbox (the filtering proxy, no Mac paths) and makes Gradle's settings from `settings.xml` (§8.9). Debian mirrors for the image builds |
 | `images`, `pi` | The images the sandbox is built from (JDK 17/21/25, Maven, Gradle, Docker CLI, Docker engine), the Pi version, the system tools in the agent's image, the default JDK, the container's limits |
 | `agent_docker` | The agent's own Docker engine and its isolation (§8.10) |
 | `vm` | Name and size of the Colima VM |
@@ -954,7 +958,7 @@ from `config.yaml`, and `compose.yaml` mounts them read-only where each tool loo
 | `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your `repository.docker_daemon`, adapted; the proxy, the address pool (§8.10) |
 
 **Why:** the agent has no route to Maven Central, npmjs.com, PyPI or Docker Hub, and HTTPS tunnels
-are refused (§4.6). Every tool must therefore download from your repository, over plain HTTP,
+are refused (§4.6). Every tool must therefore download from your repository,
 through the proxy. Configuring each tool here means projects need no changes: a `pom.xml` that
 lists five repositories still resolves everything through your mirrors.
 
@@ -968,11 +972,11 @@ HTTPS only):
 
 | File | Changed in the copy |
 |---|---|
-| `settings.xml` | comments removed; `<proxies>` replaced by the filtering proxy; `<localRepository>` and `<offline>` dropped (Mac paths); `https://` in `<url>` becomes `http://` |
-| `.npmrc` | `proxy`, `https-proxy`, `noproxy`, `cafile`, `ca`, `strict-ssl`, `prefix`, `cache` and similar lines dropped; `https://` registries (scoped ones too) become `http://`; the filtering proxy added. Its `registry=` is also used to install Pi into the image |
-| `pip.conf` | `proxy`, `trusted-host`, `cert`, `client-cert`, `cache-dir`, `target`, `prefix`, `user` and similar keys dropped (in every section, with their continuation lines); `https://` becomes `http://`; the filtering proxy and a `trusted-host` with every index host added to `[global]` (pip refuses plain HTTP from untrusted hosts) |
-| `config.json` | only `auths` entries with the login in the file (`auth`, or `username`/`password`) are kept; `credsStore`, `credHelpers` and the rest dropped (they point to your Mac's keychain and settings; `setup` warns about registries whose login isn't in the file); the filtering proxy added. Registries with a login are added to the engine's `insecure-registries` and the egress lists |
-| `daemon.json` | `hosts`, `tls*`, `data-root`, `exec-root`, `pidfile` dropped; `proxies` set to the filtering proxy; `https://` mirrors become `http://` and are added to `insecure-registries`; the address pool and snapshotter set if missing |
+| `settings.xml` | comments removed; `<proxies>` replaced by the filtering proxy; `<localRepository>` and `<offline>` dropped (Mac paths); the filtering proxy for `http` and `https` |
+| `.npmrc` | `proxy`, `https-proxy`, `noproxy`, `cafile`, `ca`, `strict-ssl`, `prefix`, `cache` and similar lines dropped; the filtering proxy added. Its `registry=` is also used to install Pi into the image |
+| `pip.conf` | `proxy`, `trusted-host`, `cert`, `client-cert`, `cache-dir`, `target`, `prefix`, `user` and similar keys dropped (in every section, with their continuation lines); the filtering proxy added to `[global]`, and a `trusted-host` for `http://` indexes (pip refuses plain HTTP from untrusted hosts; for `https://` it would turn off the certificate check) |
+| `config.json` | only `auths` entries with the login in the file (`auth`, or `username`/`password`) are kept; `credsStore`, `credHelpers` and the rest dropped (they point to your Mac's keychain and settings; `setup` warns about registries whose login isn't in the file); the filtering proxy added. Registries with a login are added to the egress lists |
+| `daemon.json` | `hosts`, `tls*`, `data-root`, `exec-root`, `pidfile` dropped; `proxies` set to the filtering proxy; `http://` mirrors are added to `insecure-registries`; the mirrors also go into the VM's Docker (`colima.yaml`), which builds and pulls the sandbox's images; the address pool and snapshotter set if missing |
 
 Things that can't be fixed in a copy are reported: encrypted Maven passwords (`{…}`: the sandbox has
 no `settings-security.xml`) and references to environment variables of your Mac (`${env.…}`,
@@ -1005,7 +1009,7 @@ Public default registries (registry.npmjs.org, pypi.org) are not added.
 - **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from the registry of your `.npmrc`.
 - **pip**: `pip.conf`, inside virtual environments too.
 - **Credentials**: whatever your files contain ends up in the copies, so the agent can read them. Use tokens that can only read.
-- **Your repositories must answer plain HTTP**: only `http://` passes the filter (§4.6). Their hosts
+- **HTTPS repositories work**: the filter allows tunnels to your repository hosts alone (§4.6). Their hosts
   get into the egress lists by themselves (above); add a host to `network.upstream_no_proxy` if it
   is reached directly rather than through the proxy on your Mac.
 - **Deploy, publish, push** (POST/PUT) are refused by the proxy: the agent builds and tests, you publish.
@@ -1023,7 +1027,7 @@ could start a container with your folders, on any network, as root. Its own engi
 - its containers have no route out; `docker run`, `docker compose` and `docker build` give them the
   filtering proxy (`docker-config.json`), so they can GET from the web and your repository, nothing more;
 - images come from the registries of your `daemon.json` (`repository.docker_daemon`): Docker Hub
-  names like `postgres:16` through its `registry-mirrors`, over plain HTTP through the proxy. Pulls are GET requests; pushes are refused;
+  names like `postgres:16` through its `registry-mirrors`, through the proxy;
 - ports a container publishes (`-p 5432:5432`) are reachable from the `pi` container at
   `docker:5432`, not at `localhost`. Testcontainers knows this from `DOCKER_HOST` and returns
   `docker` as the host by itself.
@@ -1037,8 +1041,7 @@ could start a container with your folders, on any network, as root. Its own engi
 | `off` | No engine | The agent builds and tests, but can't start containers (no Testcontainers, no `docker compose`) |
 
 **Details:**
-- `daemon.json` declares your mirrors *insecure* (plain HTTP, which the proxy can check), the
-  proxy, and an address pool for the engine's networks (`agent_docker.address_pool`). It turns
+- `daemon.json` declares `http://` mirrors *insecure*, sets the proxy, and an address pool for the engine's networks (`agent_docker.address_pool`). It turns
   off the containerd image store: with it, Docker 29 tries HTTPS first for an HTTP registry and
   doesn't fall back when the proxy refuses the tunnel.
 - `DOCKER_MIN_API_VERSION=1.24` keeps older clients working: Testcontainers 1.x speaks API 1.32,
@@ -1206,7 +1209,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: config.yaml changed since the last setup` | Run `pibox setup`, then `pibox up` |
 | `pibox: the sandbox isn't running` | `pibox up` |
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
-| `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself |
+| `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected for the web: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself. Your repositories are the exception: if one is refused, it isn't in `repository` (check `EGRESS_TUNNEL` in `pibox config`) |
 | `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | Set `repository.npmrc` / `repository.pip_conf` to your files with your mirror; public registries answer only over HTTPS |
 | Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
 | `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |

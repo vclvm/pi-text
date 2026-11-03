@@ -138,11 +138,11 @@ extensions:
 # you already use on your Mac, with any number of repositories, mirrors and logins. `pibox setup`
 # copies them (the VM doesn't see your home folder) and changes only what can't work in the
 # sandbox (docs/pi-setup.md §8.9):
-#   - everything goes through the filtering proxy, which only sees plain HTTP: https:// becomes
-#     http://, so your repositories must answer over plain HTTP too;
+#   - everything goes through the filtering proxy; URLs stay as they are (https:// included);
 #   - your own proxy settings and paths of your Mac are dropped;
-#   - every repository host is added to egress.no_approval and egress.allow_private, its port to
-#     egress.ports (`pibox setup` lists them).
+#   - every repository host is added to the egress lists (`pibox setup` lists them): reachable
+#     without asking you, also if it's in your network, and over HTTPS: the filter allows encrypted
+#     tunnels to these hosts alone (it can't check what goes through them, so: read-only tokens).
 # Without a file, the tool gets only the filtering proxy and can't download anything: the public
 # servers answer HTTPS only. Paths are absolute or ~/…. The agent can read these copies,
 # credentials included: use READ-ONLY tokens.
@@ -159,19 +159,19 @@ repository:
   # and by corepack (pnpm, yarn).
   npmrc: ""
   # pip's pip.conf, e.g. the one Artifactory's "Set Me Up" generates: index-url, extra-index-url,
-  # credentials in the URL. Its proxy, cert and Mac paths are dropped; every index host is trusted
-  # (pip refuses plain http otherwise). Its index-url is also used to build the bridge's image.
+  # credentials in the URL. Its proxy, cert and Mac paths are dropped; http:// index hosts are
+  # trusted (pip refuses plain http otherwise). Its index-url is also used to build the bridge's image.
   pip_conf: ""
   # A daemon.json for the agent's own Docker engine (agent_docker), e.g. with your registry-mirrors
   # (where `docker pull postgres:16` and Testcontainers get Docker Hub images) and
   # insecure-registries. hosts, tls*, data-root are dropped, the proxy is the filtering proxy,
-  # mirrors become insecure registries (plain HTTP).
+  # http:// mirrors are added to insecure-registries. Its mirrors are used by the VM's Docker too
+  # (building and pulling the sandbox's images).
   docker_daemon: ""
   # The docker CLI's config.json, e.g. ~/.docker/config.json: the logins ("auths") for your
   # registries, so the agent can pull e.g. registry.corp:5000/team/app. Only entries with the
   # login in the file ("auth", or username/password) are kept: credsStore/credHelpers keep it in
-  # your Mac's keychain, which the sandbox doesn't have. Registries with a login are reached over
-  # plain HTTP (added to the engine's insecure-registries).
+  # your Mac's keychain, which the sandbox doesn't have.
   docker_config: ""
   # Debian package mirrors for building the images (http://…/debian, http://…/debian-security);
   # "" = deb.debian.org

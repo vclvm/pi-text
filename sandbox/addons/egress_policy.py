@@ -2,8 +2,9 @@
 
 Clients send plain HTTP proxy requests ("GET http://host/path"), so the method is visible without
 decrypting anything. Allowed: GET/HEAD to public hosts on the allowed ports, without a request body
-or protocol upgrade. Encrypted tunnels (CONNECT) are refused: the proxy couldn't see what goes
-through them. Everything refused is answered by the proxy itself and never leaves it. Allowed
+or protocol upgrade. Encrypted tunnels (CONNECT) are refused, the proxy couldn't see what goes
+through them, except to the hosts in EGRESS_TUNNEL: your artifact repositories, which answer HTTPS
+only. Those tunnels pass through untouched (no decryption, the client sees the real certificate). Everything refused is answered by the proxy itself and never leaves it. Allowed
 requests are paused for approval in the mitmproxy console, except for hosts in EGRESS_NO_APPROVAL,
 then forwarded: to the upstream proxy when mitmproxy runs with --mode upstream:URL, or directly for
 hosts in UPSTREAM_NO_PROXY (an internal artifact repository, for example).
@@ -14,6 +15,7 @@ Environment (all optional; lists are comma-separated domains, subdomains include
   EGRESS_ALLOW_PRIVATE  allowed although they resolve to private addresses (an internal package mirror)
   EGRESS_NO_APPROVAL    allowed without pausing (package registries)
   EGRESS_PORTS          allowed ports, default 80,443
+  EGRESS_TUNNEL         encrypted tunnels (CONNECT) allowed to these, without approval
   UPSTREAM_PROXY        the upstream proxy of --mode upstream (needed to know where the rest goes)
   UPSTREAM_NO_PROXY     domains reached directly, not through the upstream proxy
   EGRESS_LOG            journal of every decision, default ~/.mitmproxy/egress.log
@@ -21,10 +23,11 @@ Environment (all optional; lists are comma-separated domains, subdomains include
 import ipaddress
 import logging
 import os
+import re
 import socket
 import time
 
-from mitmproxy import http, tcp, udp
+from mitmproxy import ctx, http, tcp, udp
 from mitmproxy.net import server_spec
 
 
@@ -38,6 +41,7 @@ ALLOW_ONLY = _domains("EGRESS_ALLOW_ONLY")
 DENY = _domains("EGRESS_DENY")
 ALLOW_PRIVATE = _domains("EGRESS_ALLOW_PRIVATE")
 NO_APPROVAL = _domains("EGRESS_NO_APPROVAL")
+TUNNEL = _domains("EGRESS_TUNNEL")
 NO_PROXY = _domains("UPSTREAM_NO_PROXY")
 UPSTREAM = server_spec.parse(os.environ["UPSTREAM_PROXY"], "http") if os.environ.get("UPSTREAM_PROXY") else None
 LOG_FILE = os.environ.get("EGRESS_LOG") or os.path.expanduser("~/.mitmproxy/egress.log")
@@ -89,8 +93,28 @@ def _block(flow: http.HTTPFlow, status: int, reason: str) -> None:
                                        {"Content-Type": "text/plain"})
 
 
+def running() -> None:
+    # Tunnels to EGRESS_TUNNEL hosts pass through as they are: mitmproxy doesn't decrypt them.
+    if TUNNEL:
+        ctx.options.update(ignore_hosts=[rf"^(.+\.)?{re.escape(d)}:\d+$" for d in sorted(TUNNEL)])
+
+
+def _route(flow, host: str) -> None:
+    if UPSTREAM:                          # decided per request; nothing is connected yet (lazy)
+        flow.server_conn.via = None if _matches(host, NO_PROXY) else UPSTREAM
+
+
 def http_connect(flow: http.HTTPFlow) -> None:
-    _block(flow, 403, "encrypted tunnels (CONNECT) are not allowed; request http:// URLs through this proxy")
+    req = flow.request
+    if not _matches(req.host, TUNNEL):
+        return _block(flow, 403, "encrypted tunnels (CONNECT) are not allowed; request http:// URLs through this proxy")
+    if req.port not in ALLOWED_PORTS:
+        return _block(flow, 403, f"port {req.port} not allowed")
+    if _matches(req.host, DENY):
+        return _block(flow, 403, f"{req.host} is denied")
+    flow.metadata["egress"] = "tunnel"
+    _route(flow, req.host)
+    _audit(logging.INFO, f"TUNNEL {req.host}:{req.port}")
 
 
 def requestheaders(flow: http.HTTPFlow) -> None:
@@ -104,12 +128,9 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     reason = _violation(req.host, req.port)
     if reason:
         return _block(flow, 403, reason)
-    if UPSTREAM:                          # decided per request; nothing is connected yet (lazy)
-        if _matches(req.host, NO_PROXY):
-            flow.server_conn.via = None
-            req.authority = ""                # direct: send "GET /path", not the proxy form
-        else:
-            flow.server_conn.via = UPSTREAM
+    _route(flow, req.host)
+    if UPSTREAM and _matches(req.host, NO_PROXY):
+        req.authority = ""                    # direct: send "GET /path", not the proxy form
     if _matches(req.host, NO_APPROVAL):
         _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url}")
     else:
@@ -118,7 +139,7 @@ def requestheaders(flow: http.HTTPFlow) -> None:
 
 
 def response(flow: http.HTTPFlow) -> None:
-    if flow.metadata.get("egress") != "blocked":
+    if flow.metadata.get("egress") not in ("blocked", "tunnel"):
         _audit(logging.INFO, f"DONE {flow.response.status_code} {flow.request.method} {flow.request.pretty_url}")
 
 
@@ -127,6 +148,9 @@ def error(flow: http.HTTPFlow) -> None:
 
 
 def tcp_start(flow: tcp.TCPFlow) -> None:
+    host, port = flow.server_conn.address or ("", 0)
+    if _matches(host, TUNNEL) and port in ALLOWED_PORTS:   # the inside of an allowed tunnel
+        return
     _audit(logging.WARNING, f"BLOCKED raw TCP to {flow.server_conn.address}")
     flow.kill()
 
