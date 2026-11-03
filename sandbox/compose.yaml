@@ -141,10 +141,11 @@ services:
       NPM_CONFIG_USERCONFIG: /home/pi/.config/pi-sandbox/npmrc
       PIP_CONFIG_FILE: /home/pi/.config/pi-sandbox/pip.conf
       COREPACK_NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
-      MVNW_REPOURL: ${MAVEN_REPO_URL:-}      # the Maven wrapper downloads Maven from here
-      # The agent's Docker engine, and Testcontainers pulling images through your registry:
+      MVNW_REPOURL: ${MVNW_REPOURL:-}        # the Maven wrapper downloads Maven from Central's mirror
+      MVNW_USERNAME: ${MVNW_USERNAME:-}      # in your settings.xml, with the login of its <server>
+      MVNW_PASSWORD: ${MVNW_PASSWORD:-}
+      # The agent's Docker engine (Docker Hub images come through the registry-mirrors of your daemon.json):
       DOCKER_HOST: ${PI_DOCKER_HOST:-}
-      TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX: ${DOCKER_IMAGE_PREFIX:-}
       # Pi extensions (docs/pi-setup.md §9):
       PI_BASH_APPROVAL: ${PI_BASH_APPROVAL:-risky}
       PI_WEB_PLAIN_HTTP: ${PI_WEB_PLAIN_HTTP:-1}   # web.ts: send https:// pages as plain http:// requests

@@ -313,12 +313,6 @@ typeset -A SETTING=(
   egress.ports EGRESS_PORTS
   extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
   extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
-  repository.user ARTIFACTORY_USER               repository.token ARTIFACTORY_TOKEN
-  repository.maven MAVEN_REPO_URL                repository.gradle_plugins GRADLE_PLUGIN_REPO_URL
-  repository.npm NPM_REGISTRY
-  repository.pip PIP_INDEX_URL                   repository.pip_trusted_host PIP_TRUSTED_HOST
-  repository.docker_registry DOCKER_REGISTRY     repository.docker_mirror DOCKER_REGISTRY_MIRROR
-  repository.docker_image_prefix DOCKER_IMAGE_PREFIX
   repository.apt_debian APT_DEBIAN               repository.apt_security APT_SECURITY
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
   repository.docker_daemon DOCKER_DAEMON_FILE    repository.pip_conf PIP_CONF_FILE
@@ -354,9 +348,11 @@ load_config() {                             # defaults, then config.yaml on top
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
   PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
-  ARTIFACTORY_USER="" ARTIFACTORY_TOKEN="" MAVEN_REPO_URL="" GRADLE_PLUGIN_REPO_URL=""
-  NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple PIP_TRUSTED_HOST=""
-  DOCKER_REGISTRY="" DOCKER_REGISTRY_MIRROR="" DOCKER_IMAGE_PREFIX="" APT_DEBIAN="" APT_SECURITY=""
+  APT_DEBIAN="" APT_SECURITY=""
+  # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
+  # Maven wrapper's repository and login.
+  NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple
+  MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
   MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE=""
   NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
   JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
@@ -374,10 +370,11 @@ load_config() {                             # defaults, then config.yaml on top
   out=$(yq '.' "$CONFIG" 2>&1 >/dev/null) || die "$CONFIG is not valid YAML: ${out#Error: }"
   [[ "$(yq 'tag' "$CONFIG")" == '!!map' ]] || die "$CONFIG: expected sections (folders:, bridge:, models:, …), found something else"
 
-  # Where each setting is (for messages) and what YAML type it has
+  cfg_lines
+  # What YAML type each section and setting has
   for line in ${(f)"$(yq '.[] | (line | tostring) + "\t" + tag + "\t" + (key | tostring)' "$CONFIG")"}; do
     sec=${line##*$'\t'} tag=${${line#*$'\t'}%%$'\t'*}
-    CFG_LINE[$sec]=${line%%$'\t'*} CFG_TAG[$sec]=$tag
+    CFG_TAG[$sec]=$tag
     if [[ "$sec" != (bridge|models) ]] && ! (( ${keys[(I)$sec.*]} )); then
       bad $sec "unknown section; the sections are: bridge, models, ${(j:, :)secs}"
     elif [[ "$sec" == models && "$tag" != '!!seq' ]]; then
@@ -388,7 +385,7 @@ load_config() {                             # defaults, then config.yaml on top
   done
   for line in ${(f)"$(yq 'del(.bridge, .models) | .. | select((path | length) == 2)
                          | (line | tostring) + "\t" + tag + "\t" + (path | join("."))' "$CONFIG")"}; do
-    key=${line##*$'\t'}; CFG_LINE[$key]=${line%%$'\t'*}; CFG_TAG[$key]=${${line#*$'\t'}%%$'\t'*}
+    key=${line##*$'\t'}; CFG_TAG[$key]=${${line#*$'\t'}%%$'\t'*}
   done
 
   out=$(yq "$YQ_SETTINGS" "$CONFIG" 2>&1) || die "can't read $CONFIG: $out"
@@ -430,9 +427,6 @@ load_config() {                             # defaults, then config.yaml on top
 
   # The bridge's environment: not exported, only the bridge container gets it.
   typeset -ga BRIDGE_ENV=()
-  for line in ${(f)"$(yq '.bridge // {} | select(tag == "!!map") | .[] | (line | tostring) + "\t" + (key | tostring)' "$CONFIG")"}; do
-    CFG_LINE[bridge.${line#*$'\t'}]=${line%%$'\t'*}
-  done
   out=$(yq "$YQ_BRIDGE" "$CONFIG" 2>/dev/null) || out=""
   for line in ${(f)out}; do
     key=${line%%=*}
@@ -457,8 +451,37 @@ load_config() {                             # defaults, then config.yaml on top
   fi
 }
 
-bad() {                                     # bad <setting> <message>: one problem of config.yaml
-  local l=${CFG_LINE[$1]:-${CFG_LINE[${1%%.*}]:-}}
+cfg_lines() {                               # CFG_LINE: the line of each section, setting and model
+  setopt local_options extended_glob; local -a match
+  # From the text itself: yq's line numbers are off when comments precede a node. Sections are
+  # unindented "name:" lines; settings are "name:" lines at the indent of a section's first entry;
+  # models are its "- " lines. A setting written in flow style ({a: 1}) gets its section's line.
+  local -a lines=("${(@f)$(<"$CONFIG")}"); local i sec="" ind="" l k n=0
+  for (( i = 1; i <= $#lines; i++ )); do
+    l=$lines[i]
+    [[ "$l" =~ '^[[:space:]]*(#|$)' ]] && continue                    # comments, blank lines
+    if [[ "$l" =~ '^([^-[:space:]#][^:]*):' ]]; then                  # a section
+      sec=${match[1]//[\"\']/} ind="" n=0; CFG_LINE[$sec]=$i; continue
+    fi
+    [[ -n "$sec" ]] || continue
+    if [[ -z "$ind" ]]; then [[ "$l" =~ '^([[:space:]]*)' ]]; ind=$match[1]; fi
+    if [[ "$sec" == models ]]; then
+      if [[ "$l" =~ '^[[:space:]]{0,'${#ind}'}- *([A-Za-z_]+)?' ]]; then   # "- id: …" starts model n
+        CFG_LINE[models.$n]=$i; [[ -z "$match[1]" ]] || CFG_LINE[models.$n.$match[1]]=$i; (( ++n ))
+      elif (( n )) && [[ "$l" =~ '^[[:space:]]+([A-Za-z_]+):' ]]; then    # a field of model n-1
+        : ${CFG_LINE[models.$((n - 1)).$match[1]]:=$i}
+      fi
+    elif [[ "${l[1,${#ind}]}" == "$ind" && "$l" =~ '^[[:space:]]*([^[:space:]#:][^:]*):' && "${l[${#ind}+1]}" != [[:space:]] ]]; then
+      k=${${match[1]//[\"\']/}%%[[:space:]]#}; CFG_LINE[$sec.$k]=$i
+    fi
+  done
+}
+
+bad() {                                     # bad <setting> <message> [<where>]: one problem of config.yaml
+  local w=${3:-$1} l=""                     # the line of <where>, or of the nearest enclosing entry
+  while [[ -z "$l" && -n "$w" ]]; do
+    l=${CFG_LINE[$w]:-}; [[ "$w" == *.* ]] && w=${w%.*} || w=""
+  done
   CFG_ERRORS+=("${CONFIG:t}${l:+:$l}: $1: $2")
 }
 
@@ -471,9 +494,7 @@ typeset -A CHECK=(
   egress.deny hosts                     egress.ports ports
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
   extensions.searxng url                extensions.fetch_max_chars int
-  repository.maven httpurl              repository.gradle_plugins httpurl     repository.npm httpurl
-  repository.pip httpurl                repository.pip_trusted_host host      repository.docker_registry hostport
-  repository.docker_mirror httpurl      repository.docker_image_prefix text   repository.apt_debian url
+  repository.apt_debian url
   repository.apt_security url           repository.maven_settings file        repository.npmrc file
   repository.docker_daemon file         repository.pip_conf file
   pi.apt_packages list                  pi.java_default 'one of:17 21 25'     pi.memory size
@@ -497,12 +518,6 @@ check_value() {                             # check_value <setting> <kind> <valu
     size)    [[ "$v" =~ '^[0-9]+[kmgKMG]?$' ]] || { bad $key "must be a size like 8g or 512m, not '$v'"; return 1 } ;;
     apiversion) [[ "$v" =~ '^[0-9]+\.[0-9]+$' ]] || { bad $key "must be an API version like \"1.24\" (quoted), not '$v'"; return 1 } ;;
     url)     [[ "$v" =~ '^https?://[^/[:space:]]+' ]] || { bad $key "must be a URL starting with http:// or https://, not '$v'"; return 1 } ;;
-    httpurl) if [[ "$v" == https://* ]]; then
-               bad $key "must be an http:// URL: the agent's downloads pass the filter only as plain HTTP (https:// is refused); got '$v'"; return 1
-             fi
-             [[ "$v" =~ '^http://[^/[:space:]]+' ]] || { bad $key "must be a URL starting with http://, not '$v'"; return 1 } ;;
-    host)    [[ "$v" =~ '^[A-Za-z0-9.-]+(:[0-9]+)?$' ]] || { bad $key "must be a host name (repo.example.com), not '$v'"; return 1 } ;;
-    hostport) [[ "$v" =~ '^[A-Za-z0-9.-]+(:[0-9]+)?$' ]] || { bad $key "must be host or host:port without http:// (repo.example.com:8082), not '$v'"; return 1 } ;;
     cidr|subnet24)
              if [[ ! "$v" =~ '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]{1,2})$' ]]; then
                bad $key "must be an address range like 172.30.0.0/24, not '$v'"; return 1
@@ -525,25 +540,25 @@ check_value() {                             # check_value <setting> <kind> <valu
 
 check_models() {                            # every model needs id, contextWindow, maxTokens
   local line idx etag id cw mt ids="" n=0
-  [[ "${CFG_TAG[models]:-}" == '!!seq' || -z "${CFG_LINE[models]:-}" ]] || return 0   # reported above
-  [[ -n "${CFG_LINE[models]:-}" ]] || { bad models "is missing: the list of models Pi offers (see the template)"; return 0 }
+  [[ "${CFG_TAG[models]:-}" == '!!seq' || -z "${CFG_TAG[models]:-}" ]] || return 0   # reported above
+  [[ -n "${CFG_TAG[models]:-}" ]] || { bad models "is missing: the list of models Pi offers (see the template)"; return 0 }
   for line in ${(f)"$(yq '.models[] | (line | tostring) + "\t" + (path | .[1] | tostring) + "\t" + tag + "\t"
         + ((.id // "") | tostring) + "\t" + ((.id // "") | tag) + "\t" + ((.contextWindow // "") | tostring) + "\t"
         + ((.contextWindow // "") | tag) + "\t" + ((.maxTokens // "") | tostring) + "\t" + ((.maxTokens // "") | tag)' "$CONFIG" 2>/dev/null)"}; do
     local -a f=("${(@ps:\t:)line}")
     (( ++n ))
-    CFG_LINE[models.$f[2]]=$f[1]; idx="models.$f[2]"
+    idx="models.$f[2]"
     [[ "$f[3]" == '!!map' ]] || { bad $idx "must be a model: id, contextWindow, maxTokens indented below \"- \""; continue }
     id=$f[4] cw=$f[6] mt=$f[8]
     [[ -n "$id" ]] || bad $idx "id is missing: the model name exactly as your router expects it"
-    [[ -z "$id" || "$f[5]" == '!!str' ]] || bad $idx "id must be text; quote it: id: \"$id\""
-    [[ -z "$id" || "$ids" != *$'\n'"$id"$'\n'* ]] || bad $idx "id $id is listed twice"; ids+=$'\n'"$id"$'\n'
+    [[ -z "$id" || "$f[5]" == '!!str' ]] || bad $idx "id must be text; quote it: id: \"$id\"" $idx.id
+    [[ -z "$id" || "$ids" != *$'\n'"$id"$'\n'* ]] || bad $idx "id $id is listed twice" $idx.id; ids+=$'\n'"$id"$'\n'
     local w=${id:+ ($id)}
     if [[ -z "$cw" ]]; then bad $idx "contextWindow is missing$w: the model's context window in tokens"
-    elif [[ "$f[7]" != '!!int' || "$cw" == 0 ]]; then bad $idx "contextWindow$w must be a whole number of tokens, not '$cw'"; fi
+    elif [[ "$f[7]" != '!!int' || "$cw" == 0 ]]; then bad $idx "contextWindow$w must be a whole number of tokens, not '$cw'" $idx.contextWindow; fi
     if [[ -z "$mt" ]]; then bad $idx "maxTokens is missing$w: the most tokens of one reply"
-    elif [[ "$f[9]" != '!!int' || "$mt" == 0 ]]; then bad $idx "maxTokens$w must be a whole number of tokens, not '$mt'"
-    elif [[ "$f[7]" == '!!int' ]] && (( mt >= cw )); then bad $idx "maxTokens$w ($mt) must be smaller than contextWindow ($cw)"; fi
+    elif [[ "$f[9]" != '!!int' || "$mt" == 0 ]]; then bad $idx "maxTokens$w must be a whole number of tokens, not '$mt'" $idx.maxTokens
+    elif [[ "$f[7]" == '!!int' ]] && (( mt >= cw )); then bad $idx "maxTokens$w ($mt) must be smaller than contextWindow ($cw)" $idx.maxTokens; fi
   done
   (( n )) || bad models "is empty: list at least one model"
 }
@@ -599,7 +614,7 @@ cmd_setup() {
   check_config
   tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
   repo_hosts "$SB/generated/c"
-  for v in ${(ou)SETTING} UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
+  for v in ${(ou)SETTING} NPM_REGISTRY PIP_INDEX_URL MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
     kv+=("$v=${(P)v}")
   done
   dotenv "$SB/.env" $kv                                         # docker compose
@@ -666,20 +681,15 @@ grepo() {                                   # grepo <name> <url> <user> <passwor
 }
 
 # Gradle's repositories, sets GRADLE_REPOS and GRADLE_PLUGIN_REPOS (Groovy map lines):
-#   repository.maven_settings: what Maven itself would use: the repositories of the active profiles
-#     (activeProfiles, activeByDefault) and Maven Central, each replaced by the mirror whose
-#     mirrorOf matches it, with the login of the <server> of the same id;
-#   otherwise repository.maven with repository.user/token.
-# Plugins: repository.gradle_plugins if set, else the pluginRepositories, then the same list.
+# what Maven itself would use with repository.maven_settings: the repositories of the active
+# profiles (activeProfiles, activeByDefault) and Maven Central, each replaced by the mirror whose
+# mirrorOf matches it, with the login of the <server> of the same id. Plugins: the
+# pluginRepositories, then the same list. Also sets MVNW_*: the Maven wrapper downloads Maven from
+# Central's mirror.
 gradle_repos() {                            # gradle_repos <the adapted settings.xml>
   typeset -ga GRADLE_REPOS=() GRADLE_PLUGIN_REPOS=()
   local line kind id a b u m pick; local -a mirrors repos plugins fields; local -A user pass seen
-  if [[ -z "$MAVEN_SETTINGS_FILE" ]]; then
-    [[ -n "$MAVEN_REPO_URL" ]] || return 0
-    GRADLE_REPOS=("$(grepo mirror "$MAVEN_REPO_URL" "$ARTIFACTORY_USER" "$ARTIFACTORY_TOKEN")")
-    GRADLE_PLUGIN_REPOS=("$(grepo plugins "${GRADLE_PLUGIN_REPO_URL:-$MAVEN_REPO_URL}" "$ARTIFACTORY_USER" "$ARTIFACTORY_TOKEN")")
-    return 0
-  fi
+  [[ -n "$MAVEN_SETTINGS_FILE" ]] || return 0
   for line in ${(f)"$(yq -p xml -o yaml '.settings as $s
       | ([$s.activeProfiles.activeProfile] | flatten | map(select(. != null))) as $act
       | ([$s.mirrors.mirror] | flatten | map(select(. != null) | "M\t" + (.id // "") + "\t" + (.mirrorOf // "") + "\t" + (.url // "")))
@@ -728,25 +738,14 @@ gradle_repos() {                            # gradle_repos <the adapted settings
     eval "$1+=(\"\$(grepo \"\$id\" \"\$u\" \"\${user[\$id]:-}\" \"\${pass[\$id]:-}\")\")"
   }
   for m in $repos; do add GRADLE_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done
-  if [[ -n "$GRADLE_PLUGIN_REPO_URL" ]]; then
-    GRADLE_PLUGIN_REPOS=("$(grepo plugins "$GRADLE_PLUGIN_REPO_URL" "$ARTIFACTORY_USER" "$ARTIFACTORY_TOKEN")")
-  else
-    for m in $plugins $repos; do add GRADLE_PLUGIN_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done 2>/dev/null
+  for m in $plugins $repos; do add GRADLE_PLUGIN_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done 2>/dev/null
+  resolve central http://repo.maven.apache.org/maven2
+  if [[ "${REPLY#*$'\t'}" != http://repo.maven.apache.org/* ]]; then
+    id=${REPLY%%$'\t'*}; MVNW_REPOURL=${REPLY#*$'\t'} MVNW_USERNAME=${user[$id]:-} MVNW_PASSWORD=${pass[$id]:-}
   fi
   print "Gradle uses the repositories of $MAVEN_SETTINGS_FILE: ${#GRADLE_REPOS} for dependencies, ${#GRADLE_PLUGIN_REPOS} for plugins"
 }
 
-xml() { local s="$1"; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; print -rn -- "$s" }
-b64() { print -rn -- "$1" | base64 | tr -d '\n' }
-hostpart() { local u="${1#*://}"; print -rn -- "${u%%/*}" }      # host[:port] of a URL
-urlenc() {                                  # percent-encode for the user:password part of a URL
-  local s="$1" out="" c i
-  for (( i = 1; i <= ${#s}; i++ )); do
-    c="${s[i]}"
-    if [[ "$c" == [A-Za-z0-9._~-] ]]; then out+="$c"; else out+=$(printf '%%%02X' "'$c"); fi
-  done
-  print -rn -- "$out"
-}
 
 # ---- your own configuration files (repository.maven_settings, .npmrc, .docker_daemon)
 # They are copied, not mounted: the VM doesn't see your home folder. What would break inside the
@@ -824,6 +823,8 @@ own_pip_conf() {                            # own_pip_conf <yours> <copy> <proxy
   for u in ${(f)"$(grep -v '^proxy = ' "$2" | grep -oE 'https?://[^[:space:]]+')"}; do   # the index URLs
     h=${${${u#*://}%%/*}##*@}; hosts+=("${h%%:*}")
   done
+  u=$(sed -nE 's#^[[:space:]]*index[-_]url[[:space:]]*[=:][[:space:]]*##p' "$2" | head -1)
+  [[ -z "$u" ]] || PIP_INDEX_URL=$u                     # also for building the bridge's image
   H="trusted-host = ${(j: :)hosts}" perl -i -pe 's/^(proxy = .*)$/$1\n$ENV{H}/ if /^proxy = / && !$d++' "$2"
   grep -q 'https://' "$1" && print "$1: https:// index URLs are http:// in the sandbox's copy (only plain HTTP passes the filter)"
   return 0
@@ -850,7 +851,6 @@ repo_hosts() {                              # repo_hosts <dir>: the repositories
   urls=(${(f)"$(sed -nE 's#.*<url>[[:space:]]*([^<[:space:]]*)[[:space:]]*</url>.*#\1#p' "$dir/settings.xml")"}
         ${(f)"$(sed -nE 's#^[[:space:]]*(@[^:=[:space:]]+:)?registry[[:space:]]*=[[:space:]]*##p' "$dir/npmrc")"}
         ${(f)"$(grep -v '^proxy[[:space:]]*=' "$dir/pip.conf" | grep -oE 'https?://[^[:space:]]+')"}
-        "$PIP_INDEX_URL" "$GRADLE_PLUGIN_REPO_URL" "$MAVEN_REPO_URL" "$DOCKER_REGISTRY"
         ${(f)"$(yq -p json -o yaml '(.["registry-mirrors"] // [])[], (.["insecure-registries"] // [])[]' "$dir/daemon.json")"})
   for u in $urls; do
     [[ -n "$u" && "$u" != *'$'* ]] || continue
@@ -868,24 +868,19 @@ repo_hosts() {                              # repo_hosts <dir>: the repositories
 }
 
 tooling() {                                 # tooling <dir> <proxy host> <proxy port> <jdk dir or "">
-  local dir=$1 ph=$2 pp=$3 jdks=$4 nonproxy="localhost|127.0.0.1|bridge|docker" v auth=""
+  local dir=$1 ph=$2 pp=$3 jdks=$4 nonproxy="localhost|127.0.0.1|bridge|docker" v
   mkdir -p "$dir"; chmod 700 "$dir"
-  [[ -n "$ARTIFACTORY_USER" ]] && auth=$(b64 "$ARTIFACTORY_USER:$ARTIFACTORY_TOKEN")
+  # Each tool: your own file (repository section) adapted to the sandbox, or, without one, only the
+  # filtering proxy (the public servers then can't be reached: they answer HTTPS only).
 
-  # Maven: your settings.xml, or one mirror for every repository with your credentials; the filtering proxy.
+  # Maven
   if [[ -n "$MAVEN_SETTINGS_FILE" ]]; then
     own_maven_settings "$MAVEN_SETTINGS_FILE" "$dir/settings.xml" "$ph" "$pp" "$nonproxy"
   else {
     print -r -- "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!-- Generated by pibox setup from config.yaml; edit config.yaml instead. -->
-<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">"
-    [[ -n "$MAVEN_REPO_URL" ]] && print -r -- "  <mirrors>
-    <mirror><id>pi-sandbox-mirror</id><mirrorOf>*</mirrorOf><url>$(xml "$MAVEN_REPO_URL")</url></mirror>
-  </mirrors>"
-    [[ -n "$ARTIFACTORY_USER" ]] && print -r -- "  <servers>
-    <server><id>pi-sandbox-mirror</id><username>$(xml "$ARTIFACTORY_USER")</username><password>$(xml "$ARTIFACTORY_TOKEN")</password></server>
-  </servers>"
-    print -r -- "  <proxies>
+<!-- Generated by pibox setup: no repository.maven_settings in config.yaml. -->
+<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">
+  <proxies>
     <proxy><id>pi-sandbox</id><active>true</active><protocol>http</protocol><host>$ph</host><port>$pp</port><nonProxyHosts>$nonproxy</nonProxyHosts></proxy>
   </proxies>
 </settings>"
@@ -915,8 +910,8 @@ org.gradle.java.installations.auto-download=false"
     [[ -n "$jdks" ]] && print -r -- "org.gradle.java.installations.paths=$jdks/17,$jdks/21,$jdks/25"
   } > "$dir/gradle.properties"
 
-  # Gradle: replace every remote repository (projects, buildscripts, plugins) by your repositories:
-  # those of your settings.xml (repository.maven_settings), or the one mirror repository.maven.
+  # Gradle: replace every remote repository (projects, buildscripts, plugins) by the repositories
+  # of your settings.xml (repository.maven_settings).
   gradle_repos "$dir/settings.xml"
   {
     print -r -- "// Generated by pibox setup from config.yaml${MAVEN_SETTINGS_FILE:+ and $MAVEN_SETTINGS_FILE}:
@@ -965,11 +960,11 @@ allprojects { p ->
 }'
   } > "$dir/init.gradle"
 
-  # npm: your .npmrc, or the registry with your credentials; the filtering proxy. Then pip.
+  # npm, pip
   if [[ -n "$NPMRC_FILE" ]]; then
     own_npmrc "$NPMRC_FILE" "$dir/npmrc" "$ph" "$pp" "$nonproxy"
   else {
-    print -r -- "# Generated by pibox setup from config.yaml
+    print -r -- "# Generated by pibox setup: no repository.npmrc in config.yaml
 registry=$NPM_REGISTRY
 proxy=http://$ph:$pp/
 https-proxy=http://$ph:$pp/
@@ -977,43 +972,27 @@ noproxy=${nonproxy//|/,}
 audit=false
 fund=false
 update-notifier=false"
-    if [[ -n "$auth" ]]; then
-      print -r -- "//${NPM_REGISTRY#*://}:_auth=$auth"
-      print -r -- "always-auth=true"
-    fi
   } > "$dir/npmrc"
   fi
   if [[ -n "$PIP_CONF_FILE" ]]; then
     own_pip_conf "$PIP_CONF_FILE" "$dir/pip.conf" "$ph" "$pp"
   else
-  local index="$PIP_INDEX_URL"
-  [[ -n "$ARTIFACTORY_USER" ]] && index="${PIP_INDEX_URL%%://*}://$(urlenc "$ARTIFACTORY_USER"):$(urlenc "$ARTIFACTORY_TOKEN")@${PIP_INDEX_URL#*://}"
-  print -r -- "# Generated by pibox setup from config.yaml
+    print -r -- "# Generated by pibox setup: no repository.pip_conf in config.yaml
 [global]
-index-url = $index
-trusted-host = ${PIP_TRUSTED_HOST:-$(hostpart "$PIP_INDEX_URL")}
 proxy = http://$ph:$pp" > "$dir/pip.conf"
   fi
 
-  # Docker CLI: registry login, and the proxy for containers and builds it starts.
-  local auths=""
-  [[ -n "$DOCKER_REGISTRY" && -n "$auth" ]] && auths="\"$DOCKER_REGISTRY\": { \"auth\": \"$auth\" }"
+  # Docker CLI: the proxy for the containers and builds it starts.
   print -r -- "{
-  \"auths\": { $auths },
   \"proxies\": { \"default\": { \"httpProxy\": \"http://$SANDBOX_PROXY_IP:$pp\", \"httpsProxy\": \"http://$SANDBOX_PROXY_IP:$pp\",
                              \"noProxy\": \"localhost,127.0.0.1\" } }
 }" > "$dir/docker-config.json"
 
-  # The agent's Docker engine: your registry over plain HTTP, through the filtering proxy.
+  # The agent's Docker engine: your daemon.json, or only the filtering proxy.
   if [[ -n "$DOCKER_DAEMON_FILE" ]]; then
     own_daemon "$DOCKER_DAEMON_FILE" "$dir/daemon.json" "$pp"; return
   fi
-  local -aU regs=()
-  [[ -n "$DOCKER_REGISTRY" ]] && regs+=("\"$DOCKER_REGISTRY\"")
-  [[ -n "$DOCKER_REGISTRY_MIRROR" ]] && regs+=("\"$(hostpart "$DOCKER_REGISTRY_MIRROR")\"")
   print -r -- "{
-  \"insecure-registries\": [${(j:, :)regs}],
-  \"registry-mirrors\": [${DOCKER_REGISTRY_MIRROR:+\"$DOCKER_REGISTRY_MIRROR\"}],
   \"proxies\": { \"http-proxy\": \"http://proxy:$pp\", \"https-proxy\": \"http://proxy:$pp\", \"no-proxy\": \"localhost,127.0.0.1\" },
   \"default-address-pools\": [{ \"base\": \"$DIND_ADDRESS_POOL\", \"size\": 24 }],
   \"features\": { \"containerd-snapshotter\": false }
@@ -1040,7 +1019,6 @@ config)                                     # the settings in effect (secrets ma
   local k v kv
   for k in ${(ok)SETTING}; do
     v="${(P)SETTING[$k]}"
-    [[ "$k" == repository.token ]] && v="${v:+set (${#v} chars)}"
     print -r -- "$k: $v"
   done
   for kv in $BRIDGE_ENV; do
