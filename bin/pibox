@@ -683,10 +683,13 @@ mounts:
     writable: true
   - location: \"$SB\"
     writable: false"
-  if [[ -s "$SB/generated/dns-hosts" ]]; then   # names only your Mac resolves (dns_hosts)
-    print -r -- "dnsHosts:"
+  # Names only your Mac resolves (dns_hosts): network.dnsHosts, the VM's own DNS answers them.
+  print -r -- "network:
+  dnsHosts:
+    host.docker.internal: host.lima.internal"
+  if [[ -s "$SB/generated/dns-hosts" ]]; then
     local h ip
-    while read -r h ip; do [[ -n "$h" ]] && print -r -- "  $h: $ip"; done <"$SB/generated/dns-hosts"
+    while read -r h ip; do [[ -n "$h" ]] && print -r -- "    $h: $ip"; done <"$SB/generated/dns-hosts"
   fi
   # The VM's Docker (it builds the images and pulls them) uses the registry mirrors of your
   # daemon.json too, so Docker Hub names (node:…, python:…) come from your repository.
@@ -730,13 +733,14 @@ cmd_setup() {
   dotenv "$SB/generated/bridge.env" BRIDGE_PORT="$BRIDGE_PORT" $BRIDGE_ENV   # the bridge container only
   models "http://bridge:$BRIDGE_PORT/v1" "$SB/agent/models.json"
   vmfile=$(COLIMA_FILE); mkdir -p "${vmfile:h}"
-  [[ -f "$vmfile" ]] && old=$(<"$vmfile")
-  colima_config > "$vmfile"
+  [[ -f "$SB/generated/colima.yaml" ]] && old=$(<"$SB/generated/colima.yaml")
+  colima_config > "$SB/generated/colima.yaml"          # pibox's copy: Colima rewrites its file at start
+  cp "$SB/generated/colima.yaml" "$vmfile"
   print "generated from $CONFIG:
   $SB/.env, $SB/generated/bridge.env, $SB/agent/models.json
   $SB/generated/c/ (settings.xml, toolchains.xml, gradle.properties, init.gradle, npmrc, pip.conf, docker-config.json, daemon.json)
   $vmfile"
-  if [[ -n "$old" && "$old" != "$(<"$vmfile")" ]] && vm_running; then
+  if [[ -n "$old" && "$old" != "$(<"$SB/generated/colima.yaml")" ]] && vm_running; then
     print "the VM settings changed: the next pibox up restarts the VM to apply them"
   fi
   print "next: pibox up"
@@ -1458,15 +1462,16 @@ config)                                     # the settings in effect (secrets ma
 
 up)                                         # VM, images, bridge, proxy, the agent's Docker engine
   fresh
-  local applied="$SB/generated/colima.applied.yaml"   # the colima.yaml the running VM was started with
-  if vm_running && ! cmp -s "$(COLIMA_FILE)" "$applied"; then
+  local applied="$SB/generated/colima.applied.yaml"   # pibox's colima.yaml the running VM was started with
+  if vm_running && ! cmp -s "$SB/generated/colima.yaml" "$applied"; then
     print "the VM settings changed since it was started (pibox setup): restarting the Colima VM $VM_PROFILE"
     colima stop "$VM_PROFILE"
   fi
   if ! vm_running; then
     print "starting the Colima VM $VM_PROFILE"
+    cp "$SB/generated/colima.yaml" "$(COLIMA_FILE)"   # Colima may have rewritten it
     colima start "$VM_PROFILE" ${VM_DISK_IMAGE:+--disk-image "$VM_DISK_IMAGE"}
-    cp "$(COLIMA_FILE)" "$applied"
+    cp "$SB/generated/colima.yaml" "$applied"
   fi
   colima ssh -p "$VM_PROFILE" -- sh -c 'mount | grep -E "virtiofs|9p|sshfs"' | sed 's/^/shared with the VM: /'
   vm_ca
