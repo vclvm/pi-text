@@ -427,7 +427,7 @@ load_config() {                             # defaults, then config.yaml on top
   # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
   # Maven wrapper's repository and login.
   EGRESS_TUNNEL=""
-  NPM_REGISTRY=https://registry.npmjs.org/ BUILD_NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple
+  NPM_REGISTRY=https://registry.npmjs.org/
   MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
   MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE="" DOCKER_CONFIG_FILE=""
   NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
@@ -722,7 +722,7 @@ cmd_setup() {
   image_names
   client_docker_config
   dns_hosts
-  for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY BUILD_NPM_REGISTRY PIP_INDEX_URL MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
+  for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
     kv+=("$v=${(P)v}")
   done
   dotenv "$SB/.env" $kv                                         # docker compose
@@ -778,7 +778,7 @@ dns_hosts() {                               # names only your Mac can resolve, f
   hosts=(${(s:,:)EGRESS_TUNNEL}
          ${(f)"$(sed -nE 's#^URIs: [a-z]+://([^/:]+).*#\1#p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}
          ${${NODE_IMAGE%%/*}%%:*}
-         ${${${BUILD_NPM_REGISTRY#*://}#*@}%%[/:]*} ${${${PIP_INDEX_URL#*://}#*@}%%[/:]*})
+         ${${${NPM_REGISTRY#*://}#*@}%%[/:]*})
   local u=${${BRIDGE_ENV[(r)PI_TEXT_URL=*]:-}#PI_TEXT_URL=}; [[ -z "$u" ]] || hosts+=(${${${u#*://}#*@}%%[/:]*})
   for h in $hosts; do
     [[ "$h" == *.* && "$h" != (registry.npmjs.org|pypi.org|deb.debian.org) && "$h" != <->.<->.<->.<-> ]] || continue
@@ -908,8 +908,8 @@ build_images() {                            # compose build, telling what happen
   print "building the images (the first time takes a while; later only what changed). Sources:
   base images  $NODE_IMAGE, $PYTHON_IMAGE, $JDK21_IMAGE, …
   Debian       ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-deb.debian.org (repository.apt_sources is empty)}
-  npm (Pi)     ${${BUILD_NPM_REGISTRY#*://}#*@}
-  pip (bridge) ${${PIP_INDEX_URL#*://}#*@}
+  npm (Pi)     ${${${(M)NPMRC_FILE:#?*}:+your .npmrc ($NPMRC_FILE)}:-registry.npmjs.org}
+  pip (bridge) ${${${(M)PIP_CONF_FILE:#?*}:+your pip.conf ($PIP_CONF_FILE)}:-pypi.org}
   through      ${UPSTREAM_PROXY:-a direct connection} (network.mac_proxy_port)"
   local log="$SB/generated/build.log"
   : >"$log"
@@ -1123,7 +1123,7 @@ own_npmrc() {                               # own_npmrc <yours> <copy> <proxy ho
   (umask 077
    { print -r -- "# Copied by pibox setup from $1, adapted to the sandbox; edit the original."
      # Your proxy settings and Mac paths out, the filtering proxy in.
-     grep -vE '^[[:space:]]*(proxy|https-proxy|http-proxy|noproxy|no-proxy|cafile|ca|strict-ssl|prefix|cache|globalconfig|userconfig|init-module)[[:space:]]*=' "$1"
+     npmrc_body "$1"
      print -r -- "proxy=http://$3:$4/
 https-proxy=http://$3:$4/
 noproxy=${5//|/,}
@@ -1133,20 +1133,38 @@ update-notifier=false"
    } > "$2") || die "can't adapt $1"
   # npm's own key: //host/path/:_authToken: the registry URL without scheme, https or http alike.
   reg=$(sed -nE 's#^[[:space:]]*registry[[:space:]]*=[[:space:]]*##p' "$2" | tail -1)
-  [[ -z "$reg" ]] || NPM_REGISTRY="$reg" BUILD_NPM_REGISTRY="$reg"   # corepack; installing Pi into the image
+  [[ -z "$reg" ]] || NPM_REGISTRY="$reg"      # corepack
+  # For installing Pi into the image: your .npmrc as it is (registries, tokens), mounted for that
+  # step only; the build reaches it through the proxy on your Mac.
+  (umask 077; mkdir -p "$SB/generated/build"; { print -r -- "# For building the agent's image; from $1"; npmrc_body "$1"; } > "$SB/generated/build/npmrc")
   return 0
+}
+
+npmrc_body() {                              # your .npmrc without proxy settings and paths of your Mac
+  grep -vE '^[[:space:]]*(proxy|https-proxy|http-proxy|noproxy|no-proxy|cafile|ca|strict-ssl|prefix|cache|globalconfig|userconfig|init-module)[[:space:]]*=' "$1" || true
 }
 
 own_pip_conf() {                            # own_pip_conf <yours> <copy> <proxy host> <port>
   # E.g. the pip.conf of Artifactory's "Set Me Up". Your proxy, certificate and Mac paths out, the
   # filtering proxy in; http:// index hosts trusted (pip refuses plain http otherwise; for https://
   # it would turn off the certificate check). Keys pibox sets are removed everywhere, or pip would
-  # see them twice.
+  # see them twice. The URLs themselves are left exactly as they are: pip reads them, not pibox.
   grep -q '\${\|%(' "$1" && warn "$1 uses \${…} or %(…)s: your Mac's environment variables don't exist in the sandbox"
-  local -aU hosts; local u h
+  pip_conf_body "$1" "proxy = http://$3:$4" > "$2" || die "can't adapt $1"
+  # For building the bridge's image: the same without the filtering proxy (the build reaches your
+  # index through the proxy on your Mac); mounted for that step only.
+  mkdir -p "$SB/bridge/build"; pip_conf_body "$1" "" > "$SB/bridge/build/pip.conf"
+  return 0
+}
+
+pip_conf_body() {                           # pip_conf_body <yours> <proxy line or "">
+  local -aU hosts; local u h ours=$2
+  for u in ${(f)"$(grep -oE 'http://[^[:space:]]+' "$1" | grep -v '^http://[^/]*$' || true)"}; do   # plain-HTTP indexes
+    h=${${${u#*://}%%/*}##*@}; hosts+=("${h%%:*}")
+  done
+  (( ! $#hosts )) || ours+="${ours:+$'\n'}trusted-host = ${(j: :)hosts}"
   (umask 077
-   awk -v head="# Copied by pibox setup from $1, adapted to the sandbox; edit the original." \
-       -v ours="proxy = http://$3:$4" '
+   awk -v head="# Copied by pibox setup from $1, adapted to the sandbox; edit the original." -v ours="$ours" '
      BEGIN { print head }
      /^[ \t]*[A-Za-z_-]+[ \t]*[=:]/ {
        key = $0; sub(/^[ \t]*/, "", key); sub(/[ \t]*[=:].*/, "", key); key = tolower(key); gsub(/_/, "-", key)
@@ -1156,17 +1174,9 @@ own_pip_conf() {                            # own_pip_conf <yours> <copy> <proxy
      /^[ \t]+[^ \t]/ && skip { next }                       # a continuation line of a removed key
      /^[ \t]*\[/ { skip = 0 }
      { print }
-     /^[ \t]*\[global\][ \t]*$/ && !done { print ours; done = 1 }
-     END { if (!done) { print "[global]"; print ours } }
-   ' "$1" > "$2") || die "can't adapt $1"
-  for u in ${(f)"$(grep -v '^proxy = ' "$2" | grep -oE 'http://[^[:space:]]+')"}; do   # plain-HTTP indexes
-    h=${${${u#*://}%%/*}##*@}; hosts+=("${h%%:*}")
-  done
-  u=$(sed -nE 's#^[[:space:]]*index[-_]url[[:space:]]*[=:][[:space:]]*##p' "$1" | head -1)
-  [[ -z "$u" ]] || PIP_INDEX_URL=$u                     # also for building the bridge's image
-  (( ! $#hosts )) ||
-    H="trusted-host = ${(j: :)hosts}" perl -i -pe 's/^(proxy = .*)$/$1\n$ENV{H}/ if /^proxy = / && !$d++' "$2"
-  return 0
+     /^[ \t]*\[global\][ \t]*$/ && !done { if (ours != "") print ours; done = 1 }
+     END { if (!done && ours != "") { print "[global]"; print ours } }
+   ' "$1")
 }
 
 own_docker_config() {                       # own_docker_config <yours or ""> <copy>
@@ -1237,6 +1247,7 @@ repo_hosts() {                              # repo_hosts <dir>: the repositories
 tooling() {                                 # tooling <dir> <proxy host> <proxy port> <jdk dir or "">
   local dir=$1 ph=$2 pp=$3 jdks=$4 nonproxy="localhost|127.0.0.1|bridge|docker" v
   mkdir -p "$dir"; chmod 700 "$dir"
+  rm -rf "$SB/generated/build" "$SB/bridge/build"; mkdir -p "$SB/generated/build" "$SB/bridge/build"   # for the image builds
   # Each tool: your own file (repository section) adapted to the sandbox, or, without one, only the
   # filtering proxy (the public servers then can't be reached: they answer HTTPS only).
 

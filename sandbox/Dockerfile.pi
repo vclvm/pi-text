@@ -17,7 +17,6 @@ FROM ${DOCKER_CLI_IMAGE} AS dockercli
 FROM ${NODE_IMAGE}
 ARG UID=501
 ARG GID=20
-ARG NPM_REGISTRY=https://registry.npmjs.org/
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
 ARG PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
 ARG JAVA_DEFAULT=21
@@ -69,7 +68,11 @@ ENV JAVA_HOME=/opt/jdk/${JAVA_DEFAULT} JAVA_HOME_17=/opt/jdk/17 JAVA_HOME_21=/op
     PATH=/opt/jdk/${JAVA_DEFAULT}/bin:/opt/maven/bin:/opt/gradle/bin:$PATH
 
 # Pi itself, from your npm registry; corepack provides pnpm and yarn.
-RUN npm install -g --ignore-scripts --registry "$NPM_REGISTRY" "$PI_PACKAGE" && corepack enable
+# Your .npmrc (registries, tokens), if pibox setup put one into generated/build/: mounted for this
+# step only, so the token doesn't stay in the image.
+RUN --mount=type=bind,source=generated/build,target=/pibox-build \
+    if [ -f /pibox-build/npmrc ]; then export NPM_CONFIG_USERCONFIG=/pibox-build/npmrc; fi; \
+    npm install -g --ignore-scripts "$PI_PACKAGE" && corepack enable
 
 # Same UID/GID as the Mac user, so files written to the bind mounts belong to you. The cache
 # folders exist in the image so that the volumes mounted on them belong to that user too.

@@ -161,12 +161,13 @@ repository:
   # Maven from Central's mirror.
   maven_settings: ""
   # npm's .npmrc, e.g. ~/.npmrc: registries, scopes, tokens. Its proxy settings and Mac paths
-  # (cafile, prefix, cache) are dropped. Its registry= is also used to install Pi into the image
-  # and by corepack (pnpm, yarn).
+  # (cafile, prefix, cache) are dropped. Installing Pi into the image uses it too (mounted for
+  # that step only: the token doesn't stay in the image); corepack (pnpm, yarn) its registry=.
   npmrc: ""
   # pip's pip.conf, e.g. the one Artifactory's "Set Me Up" generates: index-url, extra-index-url,
   # credentials in the URL. Its proxy, cert and Mac paths are dropped; http:// index hosts are
-  # trusted (pip refuses plain http otherwise). Its index-url is also used to build the bridge's image.
+  # trusted (pip refuses plain http otherwise). Building the bridge's image uses it too (mounted
+  # for that step only). pip reads the URLs itself: they are never taken apart or rewritten.
   pip_conf: ""
   # A daemon.json for the agent's own Docker engine (agent_docker), e.g. with your registry-mirrors
   # (where `docker pull postgres:16` and Testcontainers get Docker Hub images) and
