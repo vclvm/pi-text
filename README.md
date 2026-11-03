@@ -288,8 +288,9 @@ with the existing keys):
 [pi-setup.md](pi-setup.md) is a guide for developers new to Pi and to macOS isolation. It explains
 how Pi works and which isolation tools exist, then shows how to confine Pi on macOS 26 so it sees
 only the projects folder and an Obsidian vault, and reads the web (GET only) with per-request
-approval. Everything (folders, ports, model, package mirrors, upstream proxy, VM size) is set in one
-`.env` file and run by one `pi-sandbox` command, so it also works with registry mirrors. The
+approval. Everything (folders, ports, models with their own limits, package mirrors, upstream proxy,
+VM size) is set in one `config.yaml` file and run by one `pibox` command, so it also works with
+registry mirrors. The
 recommended option gives the agent a full development toolchain (Java 17/21/25, Maven, Gradle,
 Node.js, Python, its own Docker engine with Compose and Testcontainers), with Maven, Gradle, npm, pip
 and Docker settings generated for your artifact repository. Options: a Seatbelt sandbox, a Colima VM, Colima + Docker

