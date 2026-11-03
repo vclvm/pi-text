@@ -1621,7 +1621,14 @@ verify)                                     # try everything the agent must not 
     java -version 2>&1 | head -1; jdk 17 java -version 2>&1 | head -1; mvn -v | head -1; gradle -v | grep ^Gradle
     node -v; python3 -V; docker compose version
     if [ -n \"\$DOCKER_HOST\" ]; then docker info --format 'agent docker: {{.ServerVersion}}'; fi
-    curl -sS -m 30 http://example.com | head -c 200; echo        # waits for your approval (pibox approve)
+    set +x
+    echo '== the last check: a web request must wait for your approval. Approve it in another terminal'
+    echo '   with pibox approve (a) within 30 s, or let it time out: both are the expected result.'
+    code=\$(curl -s -o /dev/null -w '%{http_code}' -m 30 http://example.com); rc=\$?
+    if [ \"\$rc\" = 28 ]; then echo 'ok: the request waited for your approval and timed out (not approved)'
+    elif [ \"\$rc\" = 0 ] && [ \"\$code\" = 200 ]; then echo 'ok: you approved the request, it got through'
+    elif [ \"\$rc\" = 0 ]; then echo \"the proxy answered \$code: see pibox log\"
+    else echo \"FAILED: curl couldn't reach the filtering proxy (curl exit code \$rc)\"; fi
   " </dev/null
   ;;
 

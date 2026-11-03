@@ -506,7 +506,7 @@ in [bin/pibox](../bin/pibox): your projects listed, no `~/.pi-sandbox` or `.ssh`
 `403` for an `https://` tunnel and for a private address, `405` for a POST, the bridge answering,
 projects and vault writable, `.obsidian` and the extensions read-only, the versions of Java (the
 default and 17), Maven, Gradle, Node, Python, Docker Compose, and of the agent's Docker engine. The
-last request waits for your approval in `pibox approve`. Then check the journal with `pibox log`.
+last request waits for your approval in `pibox approve`: approve it there within 30 s, or let it time out; `verify` says which happened (`ok: … timed out (not approved)` is a pass too). Then check the journal with `pibox log`.
 
 ## 7. Daily use
 
