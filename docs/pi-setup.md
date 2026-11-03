@@ -332,7 +332,6 @@ cd ~/Projects/api && pibox run       # terminal 1: Pi
 | git | To clone this repository | Part of the Xcode command line tools (`xcode-select --install`), or `brew install git` |
 | A model router | The bridge's upstream, an OpenAI-compatible API and its key | Yours; see [bridge/README.md](../bridge/README.md) |
 | An artifact repository (recommended) | The agent downloads dependencies and images only from it, over plain HTTP (§8.9) | Artifactory, Nexus or similar: Maven, npm, PyPI and Docker remotes. Without one, set the public registries; then only what the image already contains works offline |
-| For sysbox (`agent_docker.mode: sysbox`): `git clone` from github.com on the Mac, Go modules from your Artifactory's Go remote (`repository.goproxy`), the `golang` image through your Docker mirror | The agent's Docker engine without a privileged container (§8.10) | Nothing to install: the first `pibox up` builds sysbox from its sources (§8.10). Alternatively a ready `sysbox-ce` `.deb` in `agent_docker.sysbox_deb_url` |
 
 You don't need Pi, Node.js or Python on the Mac: Pi runs in the agent's container, built from
 `pi.package`, and the bridge in its own. `zsh`, which runs `pibox`, is macOS's default shell.
@@ -484,8 +483,8 @@ pibox verify
 ```
 
 `pibox up` starts the Colima VM if it isn't running and lists its shared folders (there must be
-exactly three: the projects, the vault, `~/.pi-sandbox`). With `agent_docker.mode: sysbox` it builds
-the sysbox runtime from its sources and installs it into the VM on the first run (§8.10). Then it builds the images (once; afterwards only
+exactly three: the projects, the vault, `~/.pi-sandbox`). With `agent_docker.mode: sysbox` it installs
+the sysbox runtime from `agent_docker.sysbox_deb_url` into the VM on the first run (§8.10). Then it builds the images (once; afterwards only
 what changed) and starts the bridge, the proxy and the agent's Docker engine, and waits until the
 bridge answers. Run it again after `pibox setup` or `pibox init`.
 
@@ -1033,28 +1032,9 @@ could start a container with your folders, on any network, as root. Its own engi
 
 | Value | How the engine runs | What it means |
 |---|---|---|
-| `sysbox` (default) | Under the [sysbox](https://github.com/nestybox/sysbox) runtime, not privileged | Containers inside are isolated with user namespaces; a container started by the agent can't take over the VM. The first `pibox up` builds it from its sources and installs it into the VM (below) |
-| `privileged` | As a privileged container, the usual way to run Docker in Docker | Works everywhere. But the agent controls a privileged engine: it can start a privileged container and become **root in the VM**, then read the bridge's key, reach the network directly and read `~/.pi-sandbox`. The VM still protects the Mac, so this is roughly Option B with the build tools |
+| `privileged` (default) | As a privileged container, the usual way to run Docker in Docker | Works everywhere. But the agent controls a privileged engine: it can start a privileged container and become **root in the VM**, then read the bridge's key, reach the network directly and read `~/.pi-sandbox`. The VM still protects the Mac, so this is roughly Option B with the build tools |
+| `sysbox` | Under the [sysbox](https://github.com/nestybox/sysbox) runtime, not privileged | Containers inside are isolated with user namespaces; a container started by the agent can't take over the VM. Needs a `sysbox-ce` `.deb` in `agent_docker.sysbox_deb_url` (URL or file on the Mac); the first `pibox up` installs it into the VM |
 | `off` | No engine | The agent builds and tests, but can't start containers (no Testcontainers, no `docker compose`) |
-
-**sysbox, built from its sources.** sysbox has no package source other than its GitHub releases,
-so `pibox up` builds it the first time it's needed:
-
-1. on the Mac, `git clone --recurse-submodules` of `github.com/nestybox/sysbox` at the version
-   pibox pins (0.7.1) into `~/.pi-sandbox/build/` (sources only);
-2. in the VM's Docker, [sandbox/sysbox/Dockerfile](../sandbox/sysbox/Dockerfile) builds
-   `sysbox-runc`, `sysbox-mgr` and `sysbox-fs` (`images.golang` through the VM's registry mirrors;
-   protoc and libseccomp from Debian; Go modules, sources only, from `repository.goproxy`, your
-   Artifactory's Go remote) and writes them with sysbox's own
-   systemd units to `~/.pi-sandbox/generated/sysbox` (about a minute or two);
-3. [sandbox/sysbox/install.sh](../sandbox/sysbox/install.sh) installs them into the VM the way
-   sysbox's package does: binaries in `/usr/bin`, the `sysbox` services, its sysctl and module
-   settings, the `sysbox` user, `fuse3`, `rsync`, `iptables` from Ubuntu if missing, and the
-   `sysbox-runc` runtime in Docker's `daemon.json` (also in `colima.yaml`, which Colima turns into
-   `daemon.json` at every start).
-
-The VM keeps it across restarts; later `pibox up` runs only check that the `sysbox` service runs.
-A ready `sysbox-ce` `.deb` in `agent_docker.sysbox_deb_url` (URL or file) skips the build.
 
 **Details:**
 - `daemon.json` declares your mirrors *insecure* (plain HTTP, which the proxy can check), the
@@ -1143,7 +1123,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `check` | Prerequisites, `config.yaml`, placeholders, folders (§6.1) |
 | `setup` | Generate every configuration from `config.yaml` (§6.6) |
 | `config` | Print the settings in effect, secrets masked |
-| `up` | Start the VM, install sysbox if needed, build the images, start bridge, proxy and the agent's Docker engine (§6.7) |
+| `up` | Start the VM, install sysbox if needed (mode `sysbox`), build the images, start bridge, proxy and the agent's Docker engine (§6.7) |
 | `run [args]` | Pi in a fresh container, in the current folder; `args` go to Pi (§7.1) |
 | `approve` | The approval console of the proxy; detach with Ctrl-P Ctrl-Q (§7.1) |
 | `log` | Follow the web journal |
@@ -1257,7 +1237,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | Testcontainers or `docker pull`: `manifest unknown` | The mirror of your `daemon.json` doesn't have the image: check the mirror's Docker Hub remote in your registry |
 | `docker pull <registry>/…`: `Head "https://…": Forbidden` | The engine tried HTTPS: the registry must be in `insecure-registries` of your `daemon.json` (mirrors are added by themselves), and `daemon.json` must have the containerd image store off; `pibox up` writes both |
 | The service works, but the agent gets `Connection refused` on `localhost:5432` | The dependency runs in the agent's engine: use `docker:5432` (§8.10) |
-| `docker` service doesn't start with `agent_docker.mode: sysbox`: `unknown or invalid runtime name: sysbox-runc` | Building or installing sysbox in `pibox up` failed: check its output (clone: git on the Mac must reach github.com; build: Go modules and Debian packages through the proxy). `pibox up` retries what's missing. Or use `privileged` knowing what it means (§8.10) |
+| `docker` service doesn't start with `agent_docker.mode: sysbox`: `unknown or invalid runtime name: sysbox-runc` | The sysbox install in `pibox up` failed: check its output and `agent_docker.sysbox_deb_url`, or use the default `privileged` (§8.10) |
 | Build or tests run out of memory, or `fork: Resource temporarily unavailable` | Raise `pi.memory`, `pi.pids`, `vm.memory` in `config.yaml` (then `pibox setup`; for the VM also `pibox down --vm && pibox up`) |
 
 ## 14. Glossary

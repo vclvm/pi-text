@@ -173,13 +173,6 @@ repository:
   # your Mac's keychain, which the sandbox doesn't have. Registries with a login are reached over
   # plain HTTP (added to the engine's insecure-registries).
   docker_config: ""
-  # Go modules for building sysbox (agent_docker.mode: sysbox): your Artifactory's Go remote, the
-  # GOPROXY of its "Set Me Up", e.g. http://user:token@repo.example.com/artifactory/api/go/go-remote
-  # "" = proxy.golang.org
-  goproxy: ""
-  # Go's checksum database (GOSUMDB). "" = sum.golang.org, which Go asks through goproxy first;
-  # "off" if your Go remote doesn't proxy it (go.sum of the sources still checks the modules)
-  gosumdb: ""
   # Debian package mirrors for building the images (http://…/debian, http://…/debian-security);
   # "" = deb.debian.org
   apt_debian: ""
@@ -200,7 +193,6 @@ images:
   gradle: gradle:jdk21
   docker_cli: docker:29-cli                # docker CLI and compose for the agent
   dind: docker:29-dind                     # the agent's own Docker engine
-  golang: golang:1.25-bookworm             # builds sysbox from its sources (agent_docker.mode: sysbox)
 
 # ============================================================================================= pi
 # The agent's image and container
@@ -221,17 +213,16 @@ pi:
 # The agent's own Docker engine, so it can use docker, Docker Compose and Testcontainers
 # (docs/pi-setup.md §8.10). It runs in its own container, on the internal network only.
 agent_docker:
-  # sysbox      the engine runs under sysbox, a container runtime that makes Docker inside a
-  #             container work without giving it root over the VM: safest. Colima's VM doesn't
-  #             have sysbox: the first `pibox up` builds it from its sources and installs it
-  # privileged  the engine runs as a privileged container: works without sysbox, but the agent
-  #             can then become root in the VM (not on your Mac) and read the bridge's key
+  # privileged  the engine runs as a privileged container in the VM. Works everywhere. The agent can
+  #             then become root in the VM (not on your Mac): it could read the bridge's key and
+  #             reach the network without the filtering proxy (through the proxy on your Mac)
+  # sysbox      the engine runs under the sysbox runtime, without a privileged container: the agent
+  #             can't take over the VM. Needs the sysbox-ce .deb (sysbox_deb_url); `pibox up`
+  #             installs it into the VM once
   # off         no Docker for the agent (no Testcontainers, no docker compose)
-  mode: sysbox
-  # The first `pibox up` clones sysbox 0.7.1 from github.com with git on this Mac (sources, no
-  # binaries), builds it in the VM's Docker (images.golang, Debian packages and Go modules through
-  # the proxy on your Mac) and installs it into the VM; a few minutes, once. Instead, a ready
-  # sysbox-ce .deb: its URL, or the path of the file on this Mac. "" = build from the sources.
+  mode: privileged
+  # For mode sysbox: the sysbox-ce .deb for the VM (arm64 on Apple Silicon), its URL or the path
+  # of the file on this Mac
   sysbox_deb_url: ""
   # The addresses of the networks the agent's containers get. Change it only if it overlaps with
   # a network you need (LAN, VPN).
