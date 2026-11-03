@@ -75,7 +75,8 @@ cmd_init() {
   mkdir -p "$HOME/.local/bin"; ln -sfn "$SB/bin/pibox" "$HOME/.local/bin/pibox"
   [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] ||
     print "add ~/.local/bin to PATH, e.g. in ~/.zprofile: export PATH=\"\$HOME/.local/bin:\$PATH\""
-  docker_plugins
+  ok() { : }; miss() { warn "$*" }            # init only reports problems; pibox check lists everything
+  docker_tools
 }
 
 # config.yaml is rebuilt from the newest template on every init, so new settings and their explanations
@@ -237,14 +238,45 @@ del_value() {                               # del_value <section> <key>: remove 
   T[i,END]=()
 }
 
-docker_plugins() {                          # Homebrew's compose/buildx are CLI plugins in its own folder
-  local dir=/opt/homebrew/lib/docker/cli-plugins cfg="$HOME/.docker/config.json"
-  have docker && [[ -d "$dir" ]] || return 0
-  docker compose version >/dev/null 2>&1 && return 0
+# The docker CLI and its plugins compose and buildx. Homebrew installs the plugins into its own
+# folder, which docker only searches if ~/.docker/config.json lists it in cliPluginsExtraDirs: that
+# is added here (once, with a backup). Reports through ok/miss (defined by the caller).
+docker_tools() {
+  local prefix="" dir="" cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json" p out link
+  have brew && prefix=$(brew --prefix 2>/dev/null) && dir="$prefix/lib/docker/cli-plugins"
+  if ! have docker; then
+    if [[ -n "$prefix" && -x "$prefix/opt/docker/bin/docker" ]]; then
+      miss "docker: installed by Homebrew but not linked: brew link docker (if brew names files of another Docker, e.g. Docker Desktop: brew link --overwrite docker)"
+    else
+      miss "docker: brew install docker"
+    fi
+    return 0
+  fi
+  ok "docker $(docker version --format '{{.Client.Version}}' 2>/dev/null) ($(whence -p docker))"
+  for link in "${cfg:h}"/cli-plugins/docker-*(N-@); do     # links to a removed Docker Desktop shadow Homebrew's
+    miss "$link points to a file that no longer exists (a removed Docker Desktop?): rm '$link'"
+  done
+  for p in compose buildx; do
+    docker $p version >/dev/null 2>&1 && { ok "docker $p"; continue }
+    if [[ -n "$dir" && -x "$dir/docker-$p" ]]; then
+      plugin_dir "$dir" "$cfg"
+      if docker $p version >/dev/null 2>&1; then ok "docker $p"; continue; fi
+      out=$(docker $p version 2>&1 | head -2)
+      miss "docker $p: $dir/docker-$p is installed and listed in $cfg, but docker can't run it: ${out//$'\n'/ }"
+    else
+      miss "docker $p: brew install docker-$p"
+    fi
+  done
+}
+
+plugin_dir() {                              # plugin_dir <dir> <config.json>: add dir to cliPluginsExtraDirs
+  local dir=$1 cfg=$2
+  [[ -s "$cfg" ]] && DIR="$dir" yq -p json -e '(.cliPluginsExtraDirs // []) | any_c(. == strenv(DIR))' "$cfg" >/dev/null 2>&1 && return 0
   mkdir -p "${cfg:h}"; [[ -s "$cfg" ]] || print '{}' > "$cfg"
-  cp "$cfg" "$cfg.bak"
-  DIR="$dir" yq -i -o=json '.cliPluginsExtraDirs = ((.cliPluginsExtraDirs // []) + [strenv(DIR)] | unique)' "$cfg"
-  print "added $dir to cliPluginsExtraDirs in $cfg (backup: $cfg.bak)"
+  yq -p json '.' "$cfg" >/dev/null 2>&1 || { miss "$cfg is not valid JSON: fix it, then pibox check"; return 0 }
+  [[ -e "$cfg.pibox-backup" ]] || cp -p "$cfg" "$cfg.pibox-backup"
+  DIR="$dir" yq -i -p json -o json '.cliPluginsExtraDirs = ((.cliPluginsExtraDirs // []) + [strenv(DIR)] | unique)' "$cfg"
+  print "  fixed    added $dir to cliPluginsExtraDirs in $cfg (backup: $cfg.pibox-backup)"
 }
 
 # ---------------------------------------------------------------- check
@@ -256,13 +288,10 @@ cmd_check() {
   [[ "$(uname -s)" == Darwin ]] && ok "macOS $(sw_vers -productVersion 2>/dev/null)" || print "  note     not macOS: the Colima commands won't work here"
   [[ "$(uname -m)" == arm64 ]] && ok "Apple Silicon" || print "  note     $(uname -m): Colima's vz needs Apple Silicon or a recent Intel Mac"
   have brew && ok "Homebrew" || miss "Homebrew: https://brew.sh (or your company's installation)"
-  for t in colima docker yq git; do
+  for t in colima yq git; do
     have $t && ok "$t" || miss "$t: brew install $t"
   done
-  if have docker; then
-    docker compose version >/dev/null 2>&1 && ok "docker compose" || miss "docker compose: brew install docker-compose, then pibox init"
-    docker buildx version >/dev/null 2>&1 && ok "docker buildx" || miss "docker buildx: brew install docker-buildx, then pibox init"
-  fi
+  docker_tools
   [[ -x "$SB/bin/pibox" && -f "$SB/compose.yaml" ]] && ok "components in $SB" || miss "components: <path-to-pi-text>/bin/pibox init"
   print "Configuration:"
   if [[ ! -r "$CONFIG" ]]; then

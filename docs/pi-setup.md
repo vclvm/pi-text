@@ -327,7 +327,7 @@ cd ~/Projects/api && pibox run       # terminal 1: Pi
 | macOS 26 on Apple Silicon | Colima's `vz` VMs and virtiofs shared folders | — |
 | [Homebrew](https://brew.sh) | Installs everything below | The installer from brew.sh, or your company's installation. With a mirror: Homebrew's variables in `~/.zprofile` (`HOMEBREW_API_DOMAIN`, `HOMEBREW_BOTTLE_DOMAIN` or `HOMEBREW_ARTIFACT_DOMAIN`; `man brew`, section ENVIRONMENT) |
 | Colima | The Linux VM that runs Docker (§4.4) | `brew install colima` |
-| Docker CLI, Compose, Buildx | `pibox` drives the VM's Docker with them | `brew install docker docker-compose docker-buildx`. Homebrew puts Compose and Buildx in its own plugin folder; `pibox init` adds it to `cliPluginsExtraDirs` in `~/.docker/config.json` if `docker compose` doesn't work yet |
+| Docker CLI, Compose, Buildx | `pibox` drives the VM's Docker with them | `brew install docker docker-compose docker-buildx`. Homebrew puts Compose and Buildx in its own plugin folder (`$(brew --prefix)/lib/docker/cli-plugins`); `pibox check` and `pibox init` add it to `cliPluginsExtraDirs` in `~/.docker/config.json` (or `$DOCKER_CONFIG`) when either plugin doesn't work, once, with a backup |
 | yq (mikefarah, v4) | `pibox` reads `config.yaml` with it | `brew install yq` |
 | git | To clone this repository | Part of the Xcode command line tools (`xcode-select --install`), or `brew install git` |
 | A model router | The bridge's upstream, an OpenAI-compatible API and its key | Yours; see [bridge/README.md](../bridge/README.md) |
@@ -1211,7 +1211,8 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | Set `repository.npmrc` / `repository.pip_conf` to your files with your mirror; public registries answer only over HTTPS |
 | Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
 | `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
-| `docker compose` / `docker buildx`: unknown command | The CLI doesn't find Homebrew's plugins: `pibox init` adds `cliPluginsExtraDirs` to `~/.docker/config.json` (§6.1) |
+| `docker compose` / `docker buildx`: unknown command | Run `pibox check`: it adds Homebrew's plugin folder to `cliPluginsExtraDirs` itself, and names what it can't fix: a plugin that isn't installed (`brew install docker-buildx`), a broken link in `~/.docker/cli-plugins` left by Docker Desktop (`rm` it), or the error docker gives when it can't run the plugin |
+| `docker` not found although `brew install docker` says it's installed | It isn't linked: `brew link docker`; if brew names files of another Docker (Docker Desktop), `brew link --overwrite docker` |
 | Requests hang | They're waiting for approval: `pibox approve`. The journal (`pibox log`) shows `ASK` for them |
 | A package mirror or internal host gets `403 … private/internal address` | A repository from the `repository` section is added by itself (check `pibox setup`'s list). Any other host: add it to `egress.allow_private`, then `pibox setup` and `pibox up` |
 | The bridge or an image build should reach a host directly, not through the proxy on your Mac | Add it to `network.upstream_no_proxy`. The agent's own web traffic always goes through the filtering proxy |
