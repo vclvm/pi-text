@@ -58,7 +58,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export PI_TEXT_URL='https://YOUR-ROUTER/v1'
 export PI_TEXT_KEY='YOUR_KEY'
-.venv/bin/uvicorn proxy:app --host 127.0.0.1 --port 8787
+.venv/bin/uvicorn proxy:app --host 127.0.0.1 --port 8789
 ```
 
 ### Upstream API
@@ -119,7 +119,7 @@ The last `data:` chunk before `[DONE]` carries `usage.completion_tokens_details.
 ### Continue / ProxyAI
 
 Use the bridge as a generic OpenAI-compatible provider: base URL
-`http://127.0.0.1:8787/v1`, any API key, the model id of the router. `GET /v1/models`
+`http://127.0.0.1:8789/v1`, any API key, the model id of the router. `GET /v1/models`
 is proxied to the upstream `…/models`, so model pickers work.
 
 ## Configuring Pi
@@ -127,7 +127,7 @@ is proxied to the upstream `…/models`, so model pickers work.
 Pi talks to the bridge, never to the router directly:
 
 ```
-pi ──(Chat Completions, tools)──▶ bridge 127.0.0.1:8787 ──(text only)──▶ router / OpenRouter
+pi ──(Chat Completions, tools)──▶ bridge 127.0.0.1:8789 ──(text only)──▶ router / OpenRouter
 ```
 
 Checked against Pi 1.5.0.
@@ -146,7 +146,7 @@ Two ready-made variants:
 
 | File | Provider | Bridge port | Upstream |
 |---|---|---|---|
-| `models.openai.json.example` | `text-tools` | 8787 | target OpenAI-compatible router, no `provider` routing |
+| `models.openai.json.example` | `text-tools` | 8789 | target OpenAI-compatible router, no `provider` routing |
 | `models.openrouter.json.example` | `openrouter-text` | 8788 | OpenRouter, `qwen/qwen3.8-27b` pinned to `wafer/fp8` |
 
 The ports differ so both bridges can run at the same time:
@@ -154,7 +154,7 @@ The ports differ so both bridges can run at the same time:
 ```bash
 # OpenAI-compatible router (no UPSTREAM_EXTRA_BODY)
 PI_TEXT_URL='https://YOUR-ROUTER/v1' PI_TEXT_KEY='YOUR_KEY' \
-  .venv/bin/uvicorn proxy:app --host 127.0.0.1 --port 8787
+  .venv/bin/uvicorn proxy:app --host 127.0.0.1 --port 8789
 
 # OpenRouter: the provider pin lives in the bridge, Pi cannot send it
 PI_TEXT_URL='https://openrouter.ai/api/v1' PI_TEXT_KEY='sk-or-...' \
@@ -174,7 +174,7 @@ Then edit the entry:
   "$schema": "https://pi.dev/schemas/models.schema.json",
   "providers": {
     "text-tools": {
-      "baseUrl": "http://127.0.0.1:8787/v1",
+      "baseUrl": "http://127.0.0.1:8789/v1",
       "api": "openai-completions",
       "apiKey": "unused",
       "compat": {
@@ -288,10 +288,13 @@ with the existing keys):
 [pi-setup.md](pi-setup.md) is a guide for developers new to Pi and to macOS isolation. It explains
 how Pi works and which isolation tools exist, then shows how to confine Pi on macOS 26 so it sees
 only the projects folder and an Obsidian vault, and reads the web (GET only) with per-request
-approval. Package sources, extra root certificates and an upstream proxy are set in one `.env` file,
-so it also works with registry mirrors. Options: a Seatbelt sandbox, a Colima VM, Colima + Docker
+approval. Everything (folders, ports, model, package mirrors, upstream proxy, VM size) is set in one
+`.env` file and run by one `pi-sandbox` command, so it also works with registry mirrors. The
+recommended option gives the agent a full development toolchain (Java 17/21/25, Maven, Gradle,
+Node.js, Python, its own Docker engine with Compose and Testcontainers), with Maven, Gradle, npm, pip
+and Docker settings generated for your artifact repository. Options: a Seatbelt sandbox, a Colima VM, Colima + Docker
 Compose with a GET-only egress proxy (recommended), Apple `container`, and tools-only VMs. It includes
-Pi extensions for approvals, a path guard and web search/fetch, launchers, and a post-session check
+Pi extensions for approvals, a path guard and web search/fetch, and a post-session check
 for git hooks and Obsidian plugins.
 
 ## Full visibility: requests, model replies, executed commands
