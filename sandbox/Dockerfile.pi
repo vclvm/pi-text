@@ -40,9 +40,16 @@ RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
     # The base image may not have ca-certificates yet: apt trusts your CA for an https:// mirror.
     opt=""; if ls /usr/local/share/ca-certificates/pibox/*.crt >/dev/null 2>&1; then \
       cat /usr/local/share/ca-certificates/pibox/*.crt > /tmp/pibox-ca.pem; opt="-o Acquire::https::CaInfo=/tmp/pibox-ca.pem"; fi; \
-    apt-get $opt update --error-on=any; \
+    { apt-get $opt update --error-on=any 2>&1; echo $? > /tmp/apt-update.rc; } | tee /tmp/apt-update.log; \
+    [ "$(cat /tmp/apt-update.rc)" = 0 ] || exit 1; \
+    # update succeeds although a source has nothing for this architecture or component: say so
+    if ! ls /var/lib/apt/lists/*Packages* >/dev/null 2>&1; then \
+      echo "pibox: apt-get update got no package lists for architecture $(dpkg --print-architecture) from:"; \
+      grep -hE '^(URIs|Suites|Components):' /etc/apt/sources.list.d/*.sources 2>/dev/null || cat /etc/apt/sources.list; \
+      echo "apt said:"; grep -E '^(Err|Ign|W|N|E):' /tmp/apt-update.log || true; exit 1; \
+    fi; \
     apt-get $opt install -y --no-install-recommends $PI_APT_PACKAGES; \
-    rm -f /tmp/pibox-ca.pem /etc/apt/auth.conf.d/pibox.conf; \
+    rm -f /tmp/pibox-ca.pem /tmp/apt-update.log /tmp/apt-update.rc /etc/apt/auth.conf.d/pibox.conf; \
     rm -rf /var/lib/apt/lists/*; \
     update-ca-certificates
 

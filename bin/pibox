@@ -979,7 +979,7 @@ build_progress() {                          # build_progress <log>: BuildKit's p
       (DONE*)
         (( SECONDS - ${begun[$id]:-$SECONDS} >= 2 )) && print -r -- "      done in ${text#DONE }" ;;
       (CACHED) ;;
-      (ERROR*|*' ERROR '*|*'E: '*|*'error:'*|*'Error'*|*'failed'*)
+      (ERROR*|*' ERROR '*|*'E: '*|*'error:'*|*'Error'*|*'failed'*|[0-9.]##' '(Err|Ign|W|N):*|*'pibox: '*)
         print -r -- "  ${text}" ;;
       (*)
         if (( SECONDS - last >= 20 )); then
