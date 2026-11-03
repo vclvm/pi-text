@@ -101,7 +101,7 @@ repository:
   pip_conf: ~/.config/pip/pip.conf            # e.g. from Artifactory's "Set Me Up"
   docker_daemon: ~/.config/pi-sandbox/daemon.json
   docker_config: ~/.docker/config.json             # registry logins ("auths")
-  apt_sources: ~/.config/pi-sandbox/apt-sources    # Ubuntu: the "Set Me Up" line(s), as they are
+  apt_sources: ~/.config/pi-sandbox/apt-sources    # Debian: the "Set Me Up" lines (debian, debian-security)
 ```
 
 The sections are explained in [docs/pi-setup.md §6.5](docs/pi-setup.md#65-configyaml).

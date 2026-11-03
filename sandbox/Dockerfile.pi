@@ -1,6 +1,6 @@
-# The agent's image: Ubuntu, Pi and a development toolchain. Every image name comes from config.yaml
+# The agent's image: Debian, Pi and a development toolchain. Every image name comes from config.yaml
 # (pibox setup puts your registry in front of them).
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=debian:bookworm-slim
 ARG NODE_IMAGE=node:24-bookworm-slim
 ARG JDK17_IMAGE=eclipse-temurin:17-jdk
 ARG JDK21_IMAGE=eclipse-temurin:21-jdk
@@ -29,7 +29,7 @@ COPY generated/ca/ /usr/local/share/ca-certificates/pibox/
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
-# System packages: from your repository's Ubuntu remotes if repository.apt_sources is set (pibox
+# System packages: from your repository's Debian (or Ubuntu) remotes if repository.apt_sources is set (pibox
 # setup writes generated/apt/). Mounted for this step only: the login doesn't stay in the image.
 RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
     set -eu; \
@@ -79,7 +79,7 @@ ENV JAVA_HOME=/opt/jdk/${JAVA_DEFAULT} JAVA_HOME_17=/opt/jdk/17 JAVA_HOME_21=/op
     MAVEN_HOME=/opt/maven GRADLE_HOME=/opt/gradle \
     PATH=/opt/jdk/${JAVA_DEFAULT}/bin:/opt/maven/bin:/opt/gradle/bin:$PATH
 
-# Node.js (node, npm, corepack) from the official image: its binaries run on Ubuntu as they are.
+# Node.js (node, npm, corepack) from the official image: its binaries run on the base as they are.
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=node /usr/local/include/node /usr/local/include/node

@@ -432,7 +432,7 @@ load_config() {                             # defaults, then config.yaml on top
   NPM_REGISTRY=https://registry.npmjs.org/
   MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
   MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE="" DOCKER_CONFIG_FILE=""
-  BASE_IMAGE=ubuntu:24.04 NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
+  BASE_IMAGE=debian:bookworm-slim NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
   JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
   MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
   DIND_IMAGE=docker:29-dind IMAGE_REGISTRY=""
@@ -884,9 +884,10 @@ image_names() {                             # every image from your registry, by
   print "images from $reg ($from), e.g. $BASE_IMAGE"
 }
 
-apt_sources() {                             # your Ubuntu remotes: generated/apt/ for building the agent's image
+apt_sources() {                             # your Debian remotes: generated/apt/ for building the agent's image
   # repository.apt_sources holds the lines Artifactory's "Set Me Up" gives, one per remote:
-  #   deb https://user:token@artifactory.corp/artifactory/ubuntu-remote <DISTRIBUTION> <COMPONENT>
+  #   deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>
+  #   deb https://user:token@artifactory.corp/artifactory/debian-security-remote <DISTRIBUTION> <COMPONENT>
   # ("deb" optional; any <…> placeholder). Each remote is asked, from this Mac, which of the base
   # image's release, -updates and -security it has with packages for this Mac's architecture
   # (dists/<suite>/main/binary-<arch>/Release), and gets exactly those. <COMPONENT> becomes
@@ -923,8 +924,11 @@ apt_sources() {                             # your Ubuntu remotes: generated/apt
           000) die "$url can't be reached from this Mac (connection or certificate): check the URL" ;;
         esac
       done
-      (( $#found )) || die "$url has none of $cod, $cod-updates, $cod-security (dists/<suite>/InRelease): is it a remote of the Ubuntu archive?"
-      (( $#suites )) || die "$url has ${(j:, :)found}, but no packages for $arch. $( [[ $arch == arm64 ]] && print "Ubuntu for arm64 (Apple Silicon) is on ports.ubuntu.com/ubuntu-ports, not archive.ubuntu.com: use your remote of ports.ubuntu.com")"
+      (( $#found )) || die "$url has none of $cod, $cod-updates, $cod-security (dists/<suite>/InRelease): is it a remote of the Debian (or Ubuntu) archive?"
+      if (( ! $#suites )); then
+        [[ "$comps" == main ]] && die "$url has ${(j:, :)found}, but no packages for $arch: the remote must mirror all architectures of the Debian archive (or at least $arch)"
+        die "$url has ${(j:, :)found}, but no packages for $arch.$( [[ $arch == arm64 ]] && print " Ubuntu for arm64 (Apple Silicon) is on ports.ubuntu.com/ubuntu-ports, not archive.ubuntu.com: use your remote of ports.ubuntu.com")"
+      fi
     else
       suites=(${=dist})
     fi
@@ -940,8 +944,8 @@ Signed-By: @KEYRING@
 " >>"$dir/debian.sources"
     (( ++n ))
   done
-  (( n )) || die "$APT_SOURCES_FILE has no repository lines (expected e.g.: deb https://user:token@artifactory.corp/artifactory/ubuntu-remote <DISTRIBUTION> <COMPONENT>)"
-  (( $#have_sec )) || die "none of the remotes in $APT_SOURCES_FILE has $cod-security: the base image ${BASE_IMAGE##*/} already has security updates, so packages from the release alone may not fit it. Add the \"Set Me Up\" line of a remote that has it"
+  (( n )) || die "$APT_SOURCES_FILE has no repository lines (expected e.g.: deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>)"
+  (( $#have_sec )) || die "none of the remotes in $APT_SOURCES_FILE has $cod-security: the base image ${BASE_IMAGE##*/} already has security updates, so packages from the release alone may not fit it. Add the \"Set Me Up\" line of your remote of deb.debian.org/debian-security"
   return 0
 }
 
@@ -952,7 +956,7 @@ base_codename() {                           # the release of the agent's base im
     *24.04*) print noble ;; *22.04*) print jammy ;; *20.04*) print focal ;;
     *)       for c in noble jammy focal plucky questing resolute trixie bookworm bullseye; do
                [[ "$img" == *$c* ]] && { print $c; return 0 }; done
-             [[ "$img" == debian* ]] && print bookworm || print noble ;;
+             [[ "$img" == ubuntu* ]] && print noble || print bookworm ;;
   esac
 }
 
@@ -1004,7 +1008,7 @@ build_images() {                            # compose build, telling what happen
   for kv in ${(f)"$(grep -E "^[A-Z_][A-Z0-9_]*='" "$SB/.env")"}; do e[${kv%%=*}]=${${kv#*=\'}%\'}; done
   print "building the images (the first time takes a while; later only what changed). Sources:
   base images  ${e[BASE_IMAGE]-}, ${e[NODE_IMAGE]-}, ${e[PYTHON_IMAGE]-}, ${e[JDK21_IMAGE]-}, …
-  apt          ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-Ubuntu's own servers (repository.apt_sources is empty)}
+  apt          ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-the distribution's own servers (repository.apt_sources is empty)}
   npm (Pi)     ${${${(M)NPMRC_FILE:#?*}:+your .npmrc ($NPMRC_FILE)}:-registry.npmjs.org}
   pip (bridge) ${${${(M)PIP_CONF_FILE:#?*}:+your pip.conf ($PIP_CONF_FILE)}:-pypi.org}
   through      ${UPSTREAM_PROXY:-a direct connection} (network.mac_proxy_port)"
