@@ -332,7 +332,7 @@ cd ~/Projects/api && pibox run       # terminal 1: Pi
 | git | To clone this repository | Part of the Xcode command line tools (`xcode-select --install`), or `brew install git` |
 | A model router | The bridge's upstream, an OpenAI-compatible API and its key | Yours; see [bridge/README.md](../bridge/README.md) |
 | An artifact repository (recommended) | The agent downloads dependencies and images only from it, over plain HTTP (§8.9) | Artifactory, Nexus or similar: Maven, npm, PyPI and Docker remotes. Without one, set the public registries; then only what the image already contains works offline |
-| For sysbox (`agent_docker.mode: sysbox`): `git clone` from github.com on the Mac, Go modules (proxy.golang.org) and the `golang` image through the proxy | The agent's Docker engine without a privileged container (§8.10) | Nothing to install: the first `pibox up` builds sysbox from its sources (§8.10). Alternatively a ready `sysbox-ce` `.deb` in `agent_docker.sysbox_deb_url` |
+| For sysbox (`agent_docker.mode: sysbox`): `git clone` from github.com on the Mac, Go modules from your Artifactory's Go remote (`repository.goproxy`), the `golang` image through your Docker mirror | The agent's Docker engine without a privileged container (§8.10) | Nothing to install: the first `pibox up` builds sysbox from its sources (§8.10). Alternatively a ready `sysbox-ce` `.deb` in `agent_docker.sysbox_deb_url` |
 
 You don't need Pi, Node.js or Python on the Mac: Pi runs in the agent's container, built from
 `pi.package`, and the bridge in its own. `zsh`, which runs `pibox`, is macOS's default shell.
@@ -1043,8 +1043,9 @@ so `pibox up` builds it the first time it's needed:
 1. on the Mac, `git clone --recurse-submodules` of `github.com/nestybox/sysbox` at the version
    pibox pins (0.7.1) into `~/.pi-sandbox/build/` (sources only);
 2. in the VM's Docker, [sandbox/sysbox/Dockerfile](../sandbox/sysbox/Dockerfile) builds
-   `sysbox-runc`, `sysbox-mgr` and `sysbox-fs` (`images.golang`; protoc and libseccomp from Debian, Go
-   modules from proxy.golang.org, through the proxy on your Mac) and writes them with sysbox's own
+   `sysbox-runc`, `sysbox-mgr` and `sysbox-fs` (`images.golang` through the VM's registry mirrors;
+   protoc and libseccomp from Debian; Go modules, sources only, from `repository.goproxy`, your
+   Artifactory's Go remote) and writes them with sysbox's own
    systemd units to `~/.pi-sandbox/generated/sysbox` (about a minute or two);
 3. [sandbox/sysbox/install.sh](../sandbox/sysbox/install.sh) installs them into the VM the way
    sysbox's package does: binaries in `/usr/bin`, the `sysbox` services, its sysctl and module

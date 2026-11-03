@@ -173,6 +173,13 @@ repository:
   # your Mac's keychain, which the sandbox doesn't have. Registries with a login are reached over
   # plain HTTP (added to the engine's insecure-registries).
   docker_config: ""
+  # Go modules for building sysbox (agent_docker.mode: sysbox): your Artifactory's Go remote, the
+  # GOPROXY of its "Set Me Up", e.g. http://user:token@repo.example.com/artifactory/api/go/go-remote
+  # "" = proxy.golang.org
+  goproxy: ""
+  # Go's checksum database (GOSUMDB). "" = sum.golang.org, which Go asks through goproxy first;
+  # "off" if your Go remote doesn't proxy it (go.sum of the sources still checks the modules)
+  gosumdb: ""
   # Debian package mirrors for building the images (http://…/debian, http://…/debian-security);
   # "" = deb.debian.org
   apt_debian: ""

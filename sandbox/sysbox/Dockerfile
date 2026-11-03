@@ -3,8 +3,9 @@
 # sources (github.com/nestybox/sysbox and its submodules, cloned on the Mac) as the build context,
 # and writes the result to ~/.pi-sandbox/generated/sysbox: bin/ and the systemd/sysctl files of
 # sysbox's own package. install.sh then installs them into the VM.
-# Downloads: Debian packages (repository.apt_debian), Go modules (proxy.golang.org), all through
-# the proxy on your Mac like the other image builds. Nothing is downloaded from GitHub here.
+# Downloads: Debian packages (repository.apt_debian), Go modules (repository.goproxy, your
+# Artifactory's Go remote), through the proxy on your Mac like the other image builds. Nothing is
+# downloaded from GitHub here.
 ARG GOLANG_IMAGE=golang:1.25-bookworm
 FROM ${GOLANG_IMAGE} AS build
 ARG APT_DEBIAN=
@@ -15,6 +16,10 @@ RUN set -eux; src=/etc/apt/sources.list.d/debian.sources; \
     apt-get update; \
     apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev libseccomp-dev pkg-config make git; \
     rm -rf /var/lib/apt/lists/*
+# Go modules (sources) from your repository: repository.goproxy, repository.gosumdb
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
+ENV GOPROXY=${GOPROXY} GOSUMDB=${GOSUMDB} GOTOOLCHAIN=local
 # protoc's Go plugin that still understands the "plugins=grpc" option sysbox-ipc uses
 RUN go install github.com/golang/protobuf/protoc-gen-go@v1.5.4
 COPY . /src

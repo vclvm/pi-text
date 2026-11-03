@@ -338,6 +338,8 @@ check_config() {                            # values that are certainly wrong; w
   done
   [[ "$SB/" != "$PROJECTS"/* ]] || bad folders.projects "must not contain $SB (the agent could change its own sandbox)"
   [[ "$SB/" != "$VAULT"/* ]] || bad folders.vault "must not contain $SB (the agent could change its own sandbox)"
+  [[ "$AGENT_DOCKER" != sysbox || -n "$SYSBOX_DEB_URL" || -n "$GOPROXY_URL" ]] ||
+    warn "repository.goproxy is empty: building sysbox gets its Go modules from proxy.golang.org; set it to your Artifactory's Go remote if that isn't reachable"
   if [[ "$AGENT_DOCKER" == sysbox && "$SYSBOX_DEB_URL" == /* && ! -r "$SYSBOX_DEB_URL" ]]; then
     bad agent_docker.sysbox_deb_url "the file $SYSBOX_DEB_URL doesn't exist"
   elif [[ "$AGENT_DOCKER" == sysbox && "$SYSBOX_DEB_URL" == http* ]] && have curl && ! sysbox_installed; then
@@ -381,7 +383,8 @@ typeset -A SETTING=(
   repository.apt_debian APT_DEBIAN               repository.apt_security APT_SECURITY
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
   repository.docker_daemon DOCKER_DAEMON_FILE    repository.pip_conf PIP_CONF_FILE
-  repository.docker_config DOCKER_CONFIG_FILE
+  repository.docker_config DOCKER_CONFIG_FILE    repository.goproxy GOPROXY_URL
+  repository.gosumdb GOSUMDB_VALUE
   images.node NODE_IMAGE                         images.python PYTHON_IMAGE
   images.mitmproxy MITMPROXY_IMAGE               images.jdk17 JDK17_IMAGE
   images.jdk21 JDK21_IMAGE                       images.jdk25 JDK25_IMAGE
@@ -421,6 +424,7 @@ load_config() {                             # defaults, then config.yaml on top
   NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple
   MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
   MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE="" DOCKER_CONFIG_FILE=""
+  GOPROXY_URL="" GOSUMDB_VALUE=""
   NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
   JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
   MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
@@ -562,7 +566,7 @@ typeset -A CHECK=(
   egress.deny hosts                     egress.ports ports
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
   extensions.searxng url                extensions.fetch_max_chars int
-  repository.apt_debian url
+  repository.apt_debian url             repository.goproxy url
   repository.apt_security url           repository.maven_settings file        repository.npmrc file
   repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
   pi.apt_packages list                  pi.java_default 'one of:17 21 25'     pi.memory size
@@ -778,9 +782,11 @@ sysbox_build() {                            # sysbox from its sources: clone on 
     rm -rf "$out"
     long "building sysbox" docker buildx build --progress=plain -f "$SB/sysbox/Dockerfile" \
       --build-arg GOLANG_IMAGE="$GOLANG_IMAGE" --build-arg APT_DEBIAN="$APT_DEBIAN" --build-arg APT_SECURITY="$APT_SECURITY" \
+      --build-arg GOPROXY="${GOPROXY_URL:-https://proxy.golang.org,direct}" --build-arg GOSUMDB="${GOSUMDB_VALUE:-sum.golang.org}" \
       --build-arg HTTP_PROXY="$UPSTREAM_PROXY" --build-arg HTTPS_PROXY="$UPSTREAM_PROXY" --build-arg NO_PROXY="$UPSTREAM_NO_PROXY" \
       --build-arg http_proxy="$UPSTREAM_PROXY" --build-arg https_proxy="$UPSTREAM_PROXY" --build-arg no_proxy="$UPSTREAM_NO_PROXY" \
-      --output "type=local,dest=$out" "$src" || die "building sysbox failed (output above)"
+      --output "type=local,dest=$out" "$src" ||
+      die "building sysbox failed (output above)${GOPROXY_URL:+}${GOPROXY_URL:-; Go modules came from proxy.golang.org: set repository.goproxy to your Artifactory's Go remote}"
     [[ "$(cat "$out/VERSION" 2>/dev/null)" == "$SYSBOX_VERSION" ]] || die "building sysbox failed: no binaries in $out"
   fi
   print "installing sysbox $SYSBOX_VERSION in the VM"
@@ -1176,6 +1182,7 @@ config)                                     # the settings in effect (secrets ma
   local k v kv
   for k in ${(ok)SETTING}; do
     v="${(P)SETTING[$k]}"
+    [[ "$v" == *://*:*@* ]] && v="${v%%://*}://${${v#*://}%%:*}:***@${v#*@}"     # a password in a URL
     print -r -- "$k: $v"
   done
   for kv in $BRIDGE_ENV; do
