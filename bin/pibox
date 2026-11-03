@@ -684,10 +684,9 @@ mounts:
   - location: \"$SB\"
     writable: false"
   # Names only your Mac resolves (dns_hosts): network.dnsHosts, the VM's own DNS answers them.
-  print -r -- "network:
-  dnsHosts:
-    host.docker.internal: host.lima.internal"
   if [[ -s "$SB/generated/dns-hosts" ]]; then
+    print -r -- "network:
+  dnsHosts:"
     local h ip
     while read -r h ip; do [[ -n "$h" ]] && print -r -- "    $h: $ip"; done <"$SB/generated/dns-hosts"
   fi
@@ -780,7 +779,7 @@ dns_hosts() {                               # names only your Mac can resolve, f
   # of the corporate DNS or the VPN) may not resolve there. Every host pibox uses is resolved on
   # this Mac and given, with that address, to the VM (colima.yaml: dnsHosts) and to every container
   # and every image build (/etc/hosts: generated/compose.hosts.yaml).
-  local out="$SB/generated/dns-hosts" h ip; local -aU hosts; local -a lines
+  local out="$SB/generated/dns-hosts" h ip; local -aU hosts; local -a lines unresolved
   hosts=(${(s:,:)EGRESS_TUNNEL}
          ${(f)"$(sed -nE 's#^URIs: [a-z]+://([^/:]+).*#\1#p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}
          ${${NODE_IMAGE%%/*}%%:*}
@@ -790,11 +789,13 @@ dns_hosts() {                               # names only your Mac can resolve, f
   for h in $hosts; do
     [[ "$h" == *.* && "$h" != (registry.npmjs.org|pypi.org|deb.debian.org) && "$h" != <->.<->.<->.<-> ]] || continue
     ip=$(resolve "$h") || ip=""
-    if [[ -z "$ip" ]]; then print "  $h: NOT RESOLVED on this Mac either (check the name in your files)"; continue; fi
+    if [[ -z "$ip" ]]; then print "  $h: NOT RESOLVED on this Mac"; unresolved+=("$h"); continue; fi
     print "  $h -> $ip"
     lines+=("$h $ip")
   done
   (( $#hosts )) || print "  none: no repository, registry or router host in config.yaml and your files"
+  (( ! $#unresolved )) ||
+    die "this Mac doesn't resolve ${(j:, :)unresolved}: check the names in your files (or connect the VPN), then pibox setup again"
   : >"$out"; (( ! $#lines )) || print -rl -- $lines >"$out"
   local yml="$SB/generated/compose.hosts.yaml" l svc; local -a eh=()
   rm -f "$yml"
@@ -814,11 +815,18 @@ dns_hosts() {                               # names only your Mac can resolve, f
 }
 
 resolve() {                                 # resolve <host>: its IPv4 address, as this Mac resolves it
+  # The system resolver, as ping and every program use it (corporate DNS, the VPN's, .local);
+  # then dscacheutil (macOS), getent (Linux), ping.
+  local ip
+  ip=$(perl -MSocket -e '$a = inet_aton($ARGV[0]) or exit 1; print inet_ntoa($a)' "$1" 2>/dev/null) && [[ -n "$ip" ]] &&
+    { print -r -- "$ip"; return 0 }
   if have dscacheutil; then
-    dscacheutil -q host -a name "$1" 2>/dev/null | sed -n 's/^ip_address: //p' | grep -m1 -E '^[0-9.]+$' || true
-  else
-    getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' || true
+    ip=$(dscacheutil -q host -a name "$1" 2>/dev/null | sed -n 's/^ip_address: //p' | grep -m1 -E '^[0-9.]+$' || true)
+  elif have getent; then
+    ip=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
   fi
+  [[ -n "$ip" ]] || ip=$(ping -c 1 "$1" 2>/dev/null | sed -nE '1s/^PING [^(]*\(([0-9.]+)\).*/\1/p' || true)
+  print -r -- "$ip"
 }
 
 client_docker_config() {                    # the logins pibox's own docker commands use
