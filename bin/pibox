@@ -347,6 +347,8 @@ check_config() {                            # values that are certainly wrong; w
         -o /dev/null "$SYSBOX_DEB_URL" 2>/dev/null ||
       bad agent_docker.sysbox_deb_url "$SYSBOX_DEB_URL can't be downloaded${MAC_PROXY_PORT:+ through the proxy on this Mac (port $MAC_PROXY_PORT)}"
   fi
+  [[ -n "$APT_DEBIAN" && -n "$APT_SECURITY" ]] ||
+    warn "repository.apt_debian/apt_security are empty: building the agent's image gets Debian packages from deb.debian.org; set them to your repository's Debian remotes"
   [[ "$CA_CERTS" == (|off) || -r "$CA_CERTS" ]] || bad network.ca_certs "the file $CA_CERTS doesn't exist"
   for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config; do
     f=${(P)SETTING[$k]}; [[ -z "$f" || -r "$f" ]] || bad $k "the file $f doesn't exist or isn't readable"
@@ -764,6 +766,50 @@ vm_ca() {                                   # the CA certificates into the VM's 
       echo "the VM trusts the CA certificates now ($(ls "$dst" | wc -l)); restarting its Docker"
       systemctl restart docker
     fi' sh "$SB/generated/ca"
+}
+
+build_images() {                            # compose build, telling what happens and where things come from
+  local mirrors; mirrors=$(yq -p json -o json -I0 '.["registry-mirrors"] // [] | join(", ")' "$SB/generated/c/daemon.json" 2>/dev/null || true)
+  print "building the images (the first time takes a while; later only what changed). Sources:
+  base images  ${NODE_IMAGE%%:*}, ${PYTHON_IMAGE%%:*}, JDK 17/21/25, Maven, Gradle, docker CLI: ${mirrors:-Docker Hub (no registry-mirrors in repository.docker_daemon)}
+  Debian       ${APT_DEBIAN:-deb.debian.org (repository.apt_debian is empty)}, ${APT_SECURITY:-deb.debian.org/debian-security (repository.apt_security is empty)}
+  npm (Pi)     ${${BUILD_NPM_REGISTRY#*://}#*@}
+  pip (bridge) ${${PIP_INDEX_URL#*://}#*@}
+  through      ${UPSTREAM_PROXY:-a direct connection} (network.mac_proxy_port)"
+  local log="$SB/generated/build.log"
+  : >"$log"
+  compose --progress plain build 2>&1 | build_progress "$log" ||
+    die "building the images failed (the error is above; the whole output: $log)"
+}
+
+build_progress() {                          # build_progress <log>: BuildKit's plain output, readable
+  # Each step when it starts and how long it took, errors in full, and every 20 s what the running
+  # step is doing (a download's progress, or its last line). Everything goes to <log>.
+  setopt local_options extended_glob
+  local log=$1 line text step="" started=$SECONDS last=$SECONDS id
+  local -A begun
+  while IFS= read -r line; do
+    print -r -- "$line" >>"$log"
+    [[ "$line" == '#'[0-9]##' '* ]] || { [[ "$line" == *(error|ERROR|failed)* ]] && print -r -- "  $line"; continue }
+    id=${line%% *} text=${line#* }
+    case "$text" in
+      ('['*)                                  # a step starts: [service n/m] INSTRUCTION, or [auth], [internal]
+        [[ -n "${begun[$id]:-}" ]] && continue; begun[$id]=$SECONDS
+        step=${text[1,100]} started=$SECONDS last=$SECONDS
+        print -r -- "  ${text[1,110]}" ;;
+      (DONE*)
+        (( SECONDS - ${begun[$id]:-$SECONDS} >= 2 )) && print -r -- "      done in ${text#DONE }" ;;
+      (CACHED) ;;
+      (ERROR*|*' ERROR '*|*'E: '*|*'error:'*|*'Error'*|*'failed'*)
+        print -r -- "  ${text}" ;;
+      (*)
+        if (( SECONDS - last >= 20 )); then
+          print -r -- "  … ${step[1,50]} ($(( SECONDS - started ))s): ${${text#[0-9.]## }[1,90]}"
+          last=$SECONDS
+        fi ;;
+    esac
+  done
+  return 0                                  # the build's own status comes through pipe_fail
 }
 
 fresh() {                                   # the generated files must be newer than config.yaml
@@ -1220,7 +1266,8 @@ up)                                         # VM, images, bridge, proxy, the age
   colima ssh -p "$VM_PROFILE" -- sh -c 'mount | grep -E "virtiofs|9p|sshfs"' | sed 's/^/shared with the VM: /'
   vm_ca
   [[ "$AGENT_DOCKER" != sysbox ]] || sysbox
-  compose build
+  build_images
+  print "starting the containers: bridge, proxy${PI_DOCKER_HOST:+, the agent's Docker engine}"
   compose up -d --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
   for i in {1..30}; do                      # wait until the bridge accepts connections
     compose exec -T bridge python3 -c "import socket; socket.create_connection(('127.0.0.1', $BRIDGE_PORT), 1)" \

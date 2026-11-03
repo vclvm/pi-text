@@ -34,8 +34,12 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-
 RUN set -eu; src=/etc/apt/sources.list.d/debian.sources; \
     if [ -n "$APT_DEBIAN" ]; then sed -i "s#^URIs: http://deb.debian.org/debian\$#URIs: $APT_DEBIAN#" "$src"; fi; \
     if [ -n "$APT_SECURITY" ]; then sed -i "s#^URIs: http://deb.debian.org/debian-security\$#URIs: $APT_SECURITY#" "$src"; fi; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends $PI_APT_PACKAGES; \
+    # The base image may not have ca-certificates yet: apt trusts your CA for an https:// mirror.
+    opt=""; if ls /usr/local/share/ca-certificates/pibox/*.crt >/dev/null 2>&1; then \
+      cat /usr/local/share/ca-certificates/pibox/*.crt > /tmp/pibox-ca.pem; opt="-o Acquire::https::CaInfo=/tmp/pibox-ca.pem"; fi; \
+    apt-get $opt update; \
+    apt-get $opt install -y --no-install-recommends $PI_APT_PACKAGES; \
+    rm -f /tmp/pibox-ca.pem; \
     rm -rf /var/lib/apt/lists/*; \
     update-ca-certificates
 
