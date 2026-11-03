@@ -347,10 +347,10 @@ check_config() {                            # values that are certainly wrong; w
         -o /dev/null "$SYSBOX_DEB_URL" 2>/dev/null ||
       bad agent_docker.sysbox_deb_url "$SYSBOX_DEB_URL can't be downloaded${MAC_PROXY_PORT:+ through the proxy on this Mac (port $MAC_PROXY_PORT)}"
   fi
-  [[ -n "$APT_DEBIAN" && -n "$APT_SECURITY" ]] ||
-    warn "repository.apt_debian/apt_security are empty: building the agent's image gets Debian packages from deb.debian.org; set them to your repository's Debian remotes"
+  [[ -n "$APT_SOURCES_FILE" ]] ||
+    warn "repository.apt_sources is empty: building the agent's image gets Debian packages from deb.debian.org; set it to a file with your repository's Debian lines (Set Me Up)"
   [[ "$CA_CERTS" == (|off) || -r "$CA_CERTS" ]] || bad network.ca_certs "the file $CA_CERTS doesn't exist"
-  for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config; do
+  for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config repository.apt_sources; do
     f=${(P)SETTING[$k]}; [[ -z "$f" || -r "$f" ]] || bad $k "the file $f doesn't exist or isn't readable"
   done
   if (( $#CFG_ERRORS )); then
@@ -383,7 +383,7 @@ typeset -A SETTING=(
   egress.ports EGRESS_PORTS
   extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
   extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
-  repository.apt_debian APT_DEBIAN               repository.apt_security APT_SECURITY
+  repository.apt_sources APT_SOURCES_FILE
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
   repository.docker_daemon DOCKER_DAEMON_FILE    repository.pip_conf PIP_CONF_FILE
   repository.docker_config DOCKER_CONFIG_FILE
@@ -420,7 +420,7 @@ load_config() {                             # defaults, then config.yaml on top
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
   PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
-  APT_DEBIAN="" APT_SECURITY=""
+  APT_SOURCES_FILE=""
   # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
   # Maven wrapper's repository and login.
   EGRESS_TUNNEL=""
@@ -568,8 +568,7 @@ typeset -A CHECK=(
   egress.deny hosts                     egress.ports ports
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
   extensions.searxng url                extensions.fetch_max_chars int
-  repository.apt_debian url
-  repository.apt_security url           repository.maven_settings file        repository.npmrc file
+  repository.apt_sources file           repository.maven_settings file        repository.npmrc file
   repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
   pi.apt_packages list                  pi.java_default 'one of:17 21 25'     pi.memory size
   pi.cpus number                        pi.pids int
@@ -709,6 +708,7 @@ cmd_setup() {
   [[ -f "$SB/compose.yaml" ]] || die "components missing in $SB: run <path-to-pi-text>/bin/pibox init"
   check_config
   ca_certs
+  apt_sources
   tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
   repo_hosts "$SB/generated/c"
   for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY BUILD_NPM_REGISTRY PIP_INDEX_URL MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
@@ -744,8 +744,8 @@ ca_certs() {                                # your company's CA certificates, fo
     pem=$(security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null || true)
   fi
   if [[ -n "$pem" ]]; then
-    print -r -- "$pem" | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/pibox-%03d.crt", d, n) }
-                                         n { print > f } /-----END CERTIFICATE-----/ { close(f) }'
+    print -r -- "$pem" | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/pibox-%03d.crt", d, n); inside = 1 }
+                                         inside { print > f } /-----END CERTIFICATE-----/ { inside = 0; close(f) }'
     local -a files=("$dir"/*.crt(N)); n=$#files
     (( ! n )) || cp $files "$SB/bridge/ca/"
   fi
@@ -755,6 +755,48 @@ ca_certs() {                                # your company's CA certificates, fo
     print "CA certificates for the sandbox: none found${CA_CERTS:+ in $CA_CERTS}; only the public ones are trusted"
   fi
   return 0
+}
+
+urldec() { print -rn -- "$1" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge' }   # %40 -> @
+
+apt_sources() {                             # your Debian remotes: generated/apt/ for building the agent's image
+  # repository.apt_sources holds the lines Artifactory's "Set Me Up" gives, one per remote:
+  #   deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>
+  # ("deb" optional). <DISTRIBUTION> becomes the base image's Debian release when building
+  # (bookworm and bookworm-updates; bookworm-security for a URL with "security" in it),
+  # <COMPONENT> becomes main. The login goes into apt's auth.conf, not into the URL.
+  local dir="$SB/generated/apt" line url dist host user pass n=0 sec=0; local -a t
+  rm -rf "$dir"; mkdir -p "$dir"; : >"$dir/debian.sources"; (umask 077; : >"$dir/auth.conf")
+  [[ -n "$APT_SOURCES_FILE" ]] || return 0
+  for line in ${(f)"$(<"$APT_SOURCES_FILE")"}; do
+    line=${line%%\#*}; t=(${=line})
+    [[ "${t[1]:-}" == deb ]] && t=(${t[2,-1]})
+    [[ "${t[1]:-}" == \[* ]] && t=(${t[2,-1]})                      # [arch=…] options
+    (( $#t )) || continue
+    url=${t[1]} dist=${t[2]:-"<DISTRIBUTION>"}
+    [[ "$url" == http(|s)://* ]] || die "$APT_SOURCES_FILE: '$line' doesn't start with a http(s):// URL"
+    if [[ "${url#*://}" == *@* ]]; then                            # https://user:token@host/path
+      user=${${url#*://}%%@*} pass=${user#*:} user=${user%%:*}
+      user=$(urldec "$user") pass=$(urldec "$pass")                 # user%40corp.com in a URL
+      url="${url%%://*}://${url#*@}"
+      host=${${url#*://}%/}
+      print -r -- "machine $host login $user password $pass" >>"$dir/auth.conf"
+    fi
+    if [[ "$dist" == '<DISTRIBUTION>' ]]; then
+      if [[ "$url" == *security* ]]; then dist='@CODENAME@-security'; sec=1; else dist='@CODENAME@ @CODENAME@-updates'; fi
+    fi
+    t=(${t[3,-1]}); [[ $#t -eq 0 || "${t[*]}" == '<COMPONENT>' ]] && t=(main)
+    print -r -- "Types: deb
+URIs: $url
+Suites: $dist
+Components: ${t[*]}
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+" >>"$dir/debian.sources"
+    (( ++n ))
+  done
+  (( n )) || die "$APT_SOURCES_FILE has no repository lines (expected e.g.: deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>)"
+  (( sec )) || warn "$APT_SOURCES_FILE has no remote of debian-security (a URL with \"security\" in it): the base image's newer libraries may conflict with packages from the release alone; add the line of your debian-security remote"
+  print "Debian packages for the agent's image: $n remote(s) from $APT_SOURCES_FILE"
 }
 
 vm_ca() {                                   # the CA certificates into the VM's system store and Docker
@@ -772,7 +814,7 @@ build_images() {                            # compose build, telling what happen
   local mirrors; mirrors=$(yq -p json -o json -I0 '.["registry-mirrors"] // [] | join(", ")' "$SB/generated/c/daemon.json" 2>/dev/null || true)
   print "building the images (the first time takes a while; later only what changed). Sources:
   base images  ${NODE_IMAGE%%:*}, ${PYTHON_IMAGE%%:*}, JDK 17/21/25, Maven, Gradle, docker CLI: ${mirrors:-Docker Hub (no registry-mirrors in repository.docker_daemon)}
-  Debian       ${APT_DEBIAN:-deb.debian.org (repository.apt_debian is empty)}, ${APT_SECURITY:-deb.debian.org/debian-security (repository.apt_security is empty)}
+  Debian       ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-deb.debian.org (repository.apt_sources is empty)}
   npm (Pi)     ${${BUILD_NPM_REGISTRY#*://}#*@}
   pip (bridge) ${${PIP_INDEX_URL#*://}#*@}
   through      ${UPSTREAM_PROXY:-a direct connection} (network.mac_proxy_port)"
@@ -816,7 +858,7 @@ fresh() {                                   # the generated files must be newer 
   [[ -f "$SB/.env" && -f "$SB/agent/models.json" ]] || die "nothing generated yet: run pibox setup"
   [[ ! "$CONFIG" -nt "$SB/.env" ]] || die "config.yaml changed since the last setup: run pibox setup"
   local f
-  for f in "$MAVEN_SETTINGS_FILE" "$NPMRC_FILE" "$DOCKER_DAEMON_FILE" "$PIP_CONF_FILE" "$DOCKER_CONFIG_FILE"; do
+  for f in "$MAVEN_SETTINGS_FILE" "$NPMRC_FILE" "$DOCKER_DAEMON_FILE" "$PIP_CONF_FILE" "$DOCKER_CONFIG_FILE" "$APT_SOURCES_FILE"; do
     [[ -z "$f" || ! "$f" -nt "$SB/.env" ]] || die "$f changed since the last setup: run pibox setup"
   done
 }

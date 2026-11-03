@@ -742,8 +742,13 @@ Step by step:
   names come from `config.yaml`, so they are pulled through your registry like any other image, and no
   separate download source is needed. The `COPY --from=…` lines later take just the tool folders out of them.
 - **`FROM ${NODE_IMAGE}`**: the base is Node.js 24 on Debian (Pi needs Node).
-- **`repository.apt_debian`/`repository.apt_security`:** if set, `sed` replaces the two official server addresses in
-  Debian's source list with your mirrors. The patterns match whole lines, so nothing else changes.
+- **`repository.apt_sources`:** a file with the Debian line(s) of your Artifactory's "Set Me Up"
+  (`deb https://user:token@…/debian-remote <DISTRIBUTION> <COMPONENT>`). `pibox setup` turns it into
+  `generated/apt/`: a deb822 `sources` file (`<DISTRIBUTION>` becomes the base image's release,
+  `bookworm` and `bookworm-updates`, or `bookworm-security` for a URL with "security" in it;
+  `<COMPONENT>` becomes `main`) and an apt `auth.conf` with the login. The build mounts them for
+  the `apt-get` step only (`RUN --mount`), so the login isn't stored in the image. Without the file,
+  packages come from `deb.debian.org`.
 - **`apt-get install $PI_APT_PACKAGES`**: the system tools the agent may use: git, ripgrep, curl,
   `jq` and HTTPie for API calls, a C compiler (`build-essential`, for native npm and pip packages),
   Python 3 with venv and pip. **Bake everything it needs into the image** by adding packages to
@@ -1214,7 +1219,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `certificate verify failed`, `self-signed certificate`, `PKIX path building failed`, `unable to get local issuer certificate` | Your company's CA isn't in the sandbox: check what `pibox setup` prints about CA certificates. If it finds none in the System keychain, export your company's root CA from Keychain Access as a `.pem` and set `network.ca_certs` to it; then `pibox setup && pibox up` (the images are rebuilt with it) |
 | `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | Set `repository.npmrc` / `repository.pip_conf` to your files with your mirror; public registries answer only over HTTPS |
 | Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
-| `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
+| `apt-get update` fails during the build | Check the file in `repository.apt_sources` (one "Set Me Up" line per Debian remote) and what `pibox setup` made of it: `~/.pi-sandbox/generated/apt/debian.sources`. A `401` is the login; `Certificate verification failed` is `network.ca_certs` |
 | `docker compose` / `docker buildx`: unknown command | Run `pibox check`: it adds Homebrew's plugin folder to `cliPluginsExtraDirs` itself, and names what it can't fix: a plugin that isn't installed (`brew install docker-buildx`), a broken link in `~/.docker/cli-plugins` left by Docker Desktop (`rm` it), or the error docker gives when it can't run the plugin |
 | `docker` not found although `brew install docker` says it's installed | It isn't linked: `brew link docker`; if brew names files of another Docker (Docker Desktop), `brew link --overwrite docker` |
 | Requests hang | They're waiting for approval: `pibox approve`. The journal (`pibox log`) shows `ASK` for them |

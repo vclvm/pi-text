@@ -179,12 +179,14 @@ repository:
   # login in the file ("auth", or username/password) are kept: credsStore/credHelpers keep it in
   # your Mac's keychain, which the sandbox doesn't have.
   docker_config: ""
-  # Debian package mirrors for building the agent's image: your repository's remotes of
-  # deb.debian.org/debian and deb.debian.org/debian-security (Debian 12 "bookworm"), http:// or
-  # https://, e.g. https://repo.example.com/artifactory/debian-remote. They can't be read from a
-  # file of your Mac, so they are set here. "" = deb.debian.org
-  apt_debian: ""
-  apt_security: ""
+  # Debian packages for building the agent's image: a file with the line(s) your Artifactory's
+  # "Set Me Up" gives for its Debian remotes, as they are, e.g. ~/.config/pi-sandbox/apt-sources:
+  #   deb https://user:token@artifactory.corp/artifactory/debian-remote <DISTRIBUTION> <COMPONENT>
+  #   deb https://user:token@artifactory.corp/artifactory/debian-security-remote <DISTRIBUTION> <COMPONENT>
+  # One line per remote; "deb" may be left out. <DISTRIBUTION> becomes the image's Debian release
+  # (bookworm, bookworm-updates; bookworm-security for a URL with "security" in it), <COMPONENT>
+  # main. The login is used for the build only and doesn't stay in the image. "" = deb.debian.org
+  apt_sources: ""
 
 # ========================================================================================= images
 # The images the sandbox is built from. They are pulled by the VM's Docker, so they can be Docker
