@@ -27,7 +27,6 @@ generates every other configuration from it and runs the sandbox.
 | git | `xcode-select --install`, or `brew install git` |
 | An OpenAI-compatible model router and its key | see [bridge/README.md](bridge/README.md) |
 | An artifact repository (recommended) | Artifactory, Nexus…: Maven, npm, PyPI and Docker remotes, reachable over plain HTTP |
-| The sysbox `.deb` for the VM (default `agent_docker.mode: sysbox`) | `sysbox-ce_…_arm64.deb` from the [sysbox releases](https://github.com/nestybox/sysbox/releases), on your mirror |
 
 Pi, Node.js and Python are **not** needed on the Mac: Pi runs inside the agent's container.
 `pibox check` lists whatever is missing. Details: [docs/pi-setup.md §6.1](docs/pi-setup.md#61-prerequisites).

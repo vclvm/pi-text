@@ -7,6 +7,7 @@ setopt err_exit no_unset pipe_fail
 SELF="${0:A}"                               # this script; $0 means the function name inside functions
 SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
 CONFIG="$SB/config.yaml"
+SYSBOX_VERSION=0.7.1                        # the default of agent_docker.sysbox_deb_url
 MAC_FROM_VM=192.168.5.2                     # the Mac, seen from Colima's VM (host.lima.internal)
 die()  { print -u2 "pibox: $*"; exit 1 }
 warn() { print -u2 "pibox: warning: $*" }
@@ -299,7 +300,6 @@ cmd_check() {
   else
     ( load_config && check_config ) && ok "$CONFIG" || bad=1
   fi
-  print "Not checkable from here: your terminal must not have Full Disk Access (docs/pi-setup.md §6.2)."
   return $bad
 }
 
@@ -316,8 +316,6 @@ check_config() {                            # values that are certainly wrong; w
   for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config; do
     f=${(P)SETTING[$k]}; [[ -z "$f" || -r "$f" ]] || bad $k "the file $f doesn't exist or isn't readable"
   done
-  [[ "$AGENT_DOCKER" != sysbox || -n "$SYSBOX_DEB_URL" ]] ||
-    bad agent_docker.mode "is sysbox, so agent_docker.sysbox_deb_url must be set (or use mode: privileged / off)"
   if (( $#CFG_ERRORS )); then
     print -rl -- "${CFG_ERRORS[@]}" | sort -t: -k2,2n >&2
     die "${#CFG_ERRORS} problem(s) in $CONFIG"
@@ -397,7 +395,10 @@ load_config() {                             # defaults, then config.yaml on top
   PI_PACKAGE=@earendil-works/pi-coding-agent JAVA_DEFAULT=21
   PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
   PI_MEMORY=8g PI_CPUS=4 PI_PIDS=4096
-  AGENT_DOCKER=sysbox SYSBOX_DEB_URL="" DIND_ADDRESS_POOL=172.31.0.0/16 DIND_MIN_API_VERSION=1.24
+  # sysbox from its GitHub releases, for the VM's architecture (the Mac's); the VM downloads it once
+  local arch=amd64; [[ "$(uname -m)" == (arm64|aarch64) ]] && arch=arm64
+  SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v$SYSBOX_VERSION/sysbox-ce_$SYSBOX_VERSION.linux_$arch.deb"
+  AGENT_DOCKER=sysbox DIND_ADDRESS_POOL=172.31.0.0/16 DIND_MIN_API_VERSION=1.24
   VM_PROFILE=pi VM_CPUS=6 VM_MEMORY=12 VM_DISK=100 VM_DISK_IMAGE=""
   HOST_UID=$(id -u) HOST_GID=$(id -g)
 
@@ -699,12 +700,13 @@ here() {                                    # the current folder, if the agent m
 
 sysbox() {                                  # install the sysbox runtime in the VM, once
   docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc && return 0
-  [[ -n "$SYSBOX_DEB_URL" ]] || die "set agent_docker.sysbox_deb_url in $CONFIG (the sysbox-ce .deb for the VM's architecture)"
   print "installing the sysbox runtime in the VM"
   colima ssh -p "$VM_PROFILE" -- env URL="$SYSBOX_DEB_URL" UPSTREAM_PROXY="$UPSTREAM_PROXY" bash -s <<'EOF'
 set -euo pipefail
 [ -n "$UPSTREAM_PROXY" ] && export http_proxy="$UPSTREAM_PROXY" https_proxy="$UPSTREAM_PROXY"
-cd "$(mktemp -d)" && curl -fsSL -o sysbox.deb "$URL"
+cd "$(mktemp -d)"
+curl -fsSL -o sysbox.deb "$URL" ||
+  { echo "pibox: the VM can't download $URL: set agent_docker.sysbox_deb_url to a copy it can reach" >&2; exit 1; }
 docker ps -q | xargs -r docker stop                   # the installer restarts Docker
 sudo apt-get install -y ./sysbox.deb
 docker info --format '{{json .Runtimes}}' | grep -q sysbox-runc && echo "sysbox-runc is available"

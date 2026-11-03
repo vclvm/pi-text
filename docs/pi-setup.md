@@ -332,7 +332,7 @@ cd ~/Projects/api && pibox run       # terminal 1: Pi
 | git | To clone this repository | Part of the Xcode command line tools (`xcode-select --install`), or `brew install git` |
 | A model router | The bridge's upstream, an OpenAI-compatible API and its key | Yours; see [bridge/README.md](../bridge/README.md) |
 | An artifact repository (recommended) | The agent downloads dependencies and images only from it, over plain HTTP (§8.9) | Artifactory, Nexus or similar: Maven, npm, PyPI and Docker remotes. Without one, set the public registries; then only what the image already contains works offline |
-| The sysbox `.deb` (for `agent_docker.mode: sysbox`) | The agent's Docker engine without a privileged container (§8.10) | The `sysbox-ce_…_arm64.deb` of a [sysbox release](https://github.com/nestybox/sysbox/releases), on your mirror; `pibox up` installs it into the VM |
+| Nothing for sysbox (`agent_docker.mode: sysbox`) | The agent's Docker engine without a privileged container (§8.10) | The first `pibox up` downloads the [sysbox release](https://github.com/nestybox/sysbox/releases) from GitHub through the proxy on your Mac and installs it into the VM. Only if GitHub isn't reachable: put the `.deb` on your mirror and set `agent_docker.sysbox_deb_url` |
 
 You don't need Pi, Node.js or Python on the Mac: Pi runs in the agent's container, built from
 `pi.package`, and the bridge in its own. `zsh`, which runs `pibox`, is macOS's default shell.
@@ -1033,7 +1033,7 @@ could start a container with your folders, on any network, as root. Its own engi
 
 | Value | How the engine runs | What it means |
 |---|---|---|
-| `sysbox` (default) | Under the [sysbox](https://github.com/nestybox/sysbox) runtime, not privileged | Containers inside are isolated with user namespaces; a container started by the agent can't take over the VM. Needs `agent_docker.sysbox_deb_url`; `pibox up` installs the runtime into the VM once |
+| `sysbox` (default) | Under the [sysbox](https://github.com/nestybox/sysbox) runtime, not privileged | Containers inside are isolated with user namespaces; a container started by the agent can't take over the VM. The first `pibox up` downloads it (the GitHub release, or `agent_docker.sysbox_deb_url`) and installs it into the VM |
 | `privileged` | As a privileged container, the usual way to run Docker in Docker | Works everywhere. But the agent controls a privileged engine: it can start a privileged container and become **root in the VM**, then read the bridge's key, reach the network directly and read `~/.pi-sandbox`. The VM still protects the Mac, so this is roughly Option B with the build tools |
 | `off` | No engine | The agent builds and tests, but can't start containers (no Testcontainers, no `docker compose`) |
 
@@ -1238,7 +1238,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | Testcontainers or `docker pull`: `manifest unknown` | The mirror of your `daemon.json` doesn't have the image: check the mirror's Docker Hub remote in your registry |
 | `docker pull <registry>/…`: `Head "https://…": Forbidden` | The engine tried HTTPS: the registry must be in `insecure-registries` of your `daemon.json` (mirrors are added by themselves), and `daemon.json` must have the containerd image store off; `pibox up` writes both |
 | The service works, but the agent gets `Connection refused` on `localhost:5432` | The dependency runs in the agent's engine: use `docker:5432` (§8.10) |
-| `docker` service doesn't start with `agent_docker.mode: sysbox`: `unknown or invalid runtime name: sysbox-runc` | Set `agent_docker.sysbox_deb_url` and run `pibox setup && pibox up`, or use `privileged` knowing what it means (§8.10) |
+| `docker` service doesn't start with `agent_docker.mode: sysbox`: `unknown or invalid runtime name: sysbox-runc` | The sysbox install in `pibox up` failed: check its output; if GitHub isn't reachable, set `agent_docker.sysbox_deb_url` to your mirror's copy and run `pibox setup && pibox up`, or use `privileged` knowing what it means (§8.10) |
 | Build or tests run out of memory, or `fork: Resource temporarily unavailable` | Raise `pi.memory`, `pi.pids`, `vm.memory` in `config.yaml` (then `pibox setup`; for the VM also `pibox down --vm && pibox up`) |
 
 ## 14. Glossary

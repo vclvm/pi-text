@@ -213,13 +213,16 @@ pi:
 # The agent's own Docker engine, so it can use docker, Docker Compose and Testcontainers
 # (docs/pi-setup.md §8.10). It runs in its own container, on the internal network only.
 agent_docker:
-  # sysbox      the engine runs without a privileged container: safest; needs sysbox_deb_url
-  # privileged  works without sysbox, but the agent can then become root in the VM (not on your Mac)
-  # off         no Docker for the agent
+  # sysbox      the engine runs under sysbox, a container runtime that makes Docker inside a
+  #             container work without giving it root over the VM: safest. Colima's VM doesn't
+  #             have sysbox: the first `pibox up` downloads it (sysbox_deb_url) and installs it
+  # privileged  the engine runs as a privileged container: works without sysbox, but the agent
+  #             can then become root in the VM (not on your Mac) and read the bridge's key
+  # off         no Docker for the agent (no Testcontainers, no docker compose)
   mode: sysbox
-  # Download URL of the sysbox-ce .deb for the VM (Apple Silicon: arm64), e.g. your mirror of
-  # https://github.com/nestybox/sysbox/releases/download/v0.6.7/sysbox-ce_0.6.7-0.linux_arm64.deb
-  # `pibox up` installs it into the VM once.
+  # Where the VM downloads the sysbox package (.deb) from; "" = the official release from GitHub
+  # (sysbox-ce 0.7.1, for your Mac's architecture), through the proxy on your Mac. Set it to your
+  # mirror's copy if GitHub isn't reachable.
   sysbox_deb_url: ""
   # The addresses of the networks the agent's containers get. Change it only if it overlaps with
   # a network you need (LAN, VPN).
