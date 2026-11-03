@@ -93,6 +93,12 @@ network:
   # and *.localcorp all mean localcorp and everything under it. No other patterns, ports or URLs.
   upstream_no_proxy: []
 
+  # Your company's CA certificates, for HTTPS signed by your company (Artifactory, a proxy that
+  # inspects TLS): the images (pip, npm, Maven, Gradle, git, curl), the VM's Docker and the agent's
+  # Docker engine trust them besides the public ones. "" = the certificates in this Mac's System
+  # keychain, where your IT installs them; or the path of a PEM file; off = only the public CAs.
+  ca_certs: ""
+
   # The address range of the sandbox's internal Docker network. Change it only if it overlaps with
   # a network you need (your LAN, VPN): its addresses would be unreachable from the sandbox.
   sandbox_subnet: 172.30.0.0/24

@@ -347,6 +347,7 @@ check_config() {                            # values that are certainly wrong; w
         -o /dev/null "$SYSBOX_DEB_URL" 2>/dev/null ||
       bad agent_docker.sysbox_deb_url "$SYSBOX_DEB_URL can't be downloaded${MAC_PROXY_PORT:+ through the proxy on this Mac (port $MAC_PROXY_PORT)}"
   fi
+  [[ "$CA_CERTS" == (|off) || -r "$CA_CERTS" ]] || bad network.ca_certs "the file $CA_CERTS doesn't exist"
   for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config; do
     f=${(P)SETTING[$k]}; [[ -z "$f" || -r "$f" ]] || bad $k "the file $f doesn't exist or isn't readable"
   done
@@ -374,7 +375,7 @@ typeset -A SETTING=(
   folders.projects PROJECTS_DIR                  folders.vault VAULT_DIR
   network.bridge_port BRIDGE_PORT                network.proxy_port PROXY_PORT
   network.mac_proxy_port MAC_PROXY_PORT          network.upstream_no_proxy UPSTREAM_NO_PROXY
-  network.sandbox_subnet SANDBOX_SUBNET
+  network.sandbox_subnet SANDBOX_SUBNET          network.ca_certs CA_CERTS
   egress.allow_private EGRESS_ALLOW_PRIVATE      egress.no_approval EGRESS_NO_APPROVAL
   egress.allow_only EGRESS_ALLOW_ONLY            egress.deny EGRESS_DENY
   egress.ports EGRESS_PORTS
@@ -413,6 +414,7 @@ load_config() {                             # defaults, then config.yaml on top
   # set -a exports them, so docker compose sees the same values. The agent gets a clean environment.
   set -a
   PROJECTS_DIR="" VAULT_DIR=""
+  CA_CERTS=""
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
   PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
@@ -559,7 +561,7 @@ bad() {                                     # bad <setting> <message> [<where>]:
 typeset -A CHECK=(
   folders.projects dir                  folders.vault dir
   network.bridge_port port              network.proxy_port port               network.mac_proxy_port port
-  network.upstream_no_proxy hosts       network.sandbox_subnet subnet24
+  network.upstream_no_proxy hosts       network.sandbox_subnet subnet24       network.ca_certs cacerts
   egress.allow_private hosts            egress.no_approval hosts              egress.allow_only hosts
   egress.deny hosts                     egress.ports ports
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
@@ -604,6 +606,10 @@ check_value() {                             # check_value <setting> <kind> <valu
     urlorfile) if [[ "$v" != http(|s)://* ]]; then
                [[ "$v" == "~/"* ]] && val="$HOME/${v#\~/}"
                [[ "$val" == /* ]] || { bad $key "must be an http(s):// URL or the path of a file on this Mac (/… or ~/…), not '$v'"; return 1 }
+             fi ;;
+    cacerts) if [[ "$v" != off ]]; then
+               [[ "$v" == "~/"* ]] && val="$HOME/${v#\~/}"
+               [[ "$val" == /* ]] || { bad $key "must be \"\" (your Mac's System keychain), off, or the path of a PEM file, not '$v'"; return 1 }
              fi ;;
     dir)     [[ "$v" == /* ]] || { bad $key "must be an absolute path (/Users/…), not '$v'"; return 1 } ;;
     file)    [[ "$v" == "~/"* ]] && val="$HOME/${v#\~/}"
@@ -700,6 +706,7 @@ cmd_setup() {
   local v vmfile old="" ; local -a kv
   [[ -f "$SB/compose.yaml" ]] || die "components missing in $SB: run <path-to-pi-text>/bin/pibox init"
   check_config
+  ca_certs
   tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
   repo_hosts "$SB/generated/c"
   for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY BUILD_NPM_REGISTRY PIP_INDEX_URL MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
@@ -719,6 +726,44 @@ cmd_setup() {
     print "the VM settings changed: the next pibox up restarts the VM to apply them"
   fi
   print "next: pibox up"
+}
+
+ca_certs() {                                # your company's CA certificates, for every image and engine
+  # Corporate HTTPS (Artifactory, a proxy that inspects TLS) is signed by your company's own CA,
+  # which only your Mac trusts: its IT put it into the System keychain. The images and the VM's
+  # Docker get the same certificates: generated/ca/*.crt (one each), and a copy in bridge/ca/.
+  local dir="$SB/generated/ca" pem="" n=0
+  rm -rf "$dir" "$SB/bridge/ca"; mkdir -p "$dir" "$SB/bridge/ca"
+  if [[ "$CA_CERTS" == off ]]; then
+    :
+  elif [[ -n "$CA_CERTS" ]]; then
+    pem=$(<"$CA_CERTS")
+  elif have security; then
+    pem=$(security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null || true)
+  fi
+  if [[ -n "$pem" ]]; then
+    print -r -- "$pem" | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/pibox-%03d.crt", d, n) }
+                                         n { print > f } /-----END CERTIFICATE-----/ { close(f) }'
+    local -a files=("$dir"/*.crt(N)); n=$#files
+    (( ! n )) || cp $files "$SB/bridge/ca/"
+  fi
+  if (( n )); then
+    print "CA certificates for the sandbox: $n from ${CA_CERTS:-the System keychain of this Mac}"
+  elif [[ "$CA_CERTS" != off ]]; then
+    print "CA certificates for the sandbox: none found${CA_CERTS:+ in $CA_CERTS}; only the public ones are trusted"
+  fi
+  return 0
+}
+
+vm_ca() {                                   # the CA certificates into the VM's system store and Docker
+  colima ssh -p "$VM_PROFILE" -- sudo sh -c '
+    src=$1 dst=/usr/local/share/ca-certificates/pibox
+    if ! diff -rq "$src" "$dst" >/dev/null 2>&1; then
+      rm -rf "$dst"; mkdir -p "$dst"; cp "$src"/*.crt "$dst"/ 2>/dev/null || true
+      update-ca-certificates >/dev/null 2>&1
+      echo "the VM trusts the CA certificates now ($(ls "$dst" | wc -l)); restarting its Docker"
+      systemctl restart docker
+    fi' sh "$SB/generated/ca"
 }
 
 fresh() {                                   # the generated files must be newer than config.yaml
@@ -1173,6 +1218,7 @@ up)                                         # VM, images, bridge, proxy, the age
     cp "$(COLIMA_FILE)" "$applied"
   fi
   colima ssh -p "$VM_PROFILE" -- sh -c 'mount | grep -E "virtiofs|9p|sshfs"' | sed 's/^/shared with the VM: /'
+  vm_ca
   [[ "$AGENT_DOCKER" != sysbox ]] || sysbox
   compose build
   compose up -d --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}

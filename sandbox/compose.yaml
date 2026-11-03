@@ -94,8 +94,10 @@ services:
     environment:
       DOCKER_TLS_CERTDIR: ""                 # plain tcp://docker:2375, reachable only on the internal network
       DOCKER_MIN_API_VERSION: ${DIND_MIN_API_VERSION:-1.24}   # older clients, e.g. Testcontainers 1.x, still work
+      SSL_CERT_DIR: /etc/ssl/certs:/pibox-ca  # your company's CA certificates too (network.ca_certs)
     volumes:
       - docker-data:/var/lib/docker
+      - ./generated/ca:/pibox-ca:ro
       - ./generated/c/daemon.json:/etc/docker/daemon.json:ro   # registry mirror, proxy, address pools
     networks: [sandbox]                      # ONLY the internal network: its containers can't get out either
     depends_on: [proxy]
