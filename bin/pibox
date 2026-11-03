@@ -13,6 +13,27 @@ die()  { print -u2 "pibox: $*"; exit 1 }
 warn() { print -u2 "pibox: warning: $*" }
 have() { (( $+commands[$1] )) }
 
+long() {                                    # long <what> <command…>: a long step, with a status line every 20 s
+  # The output goes to ~/.pi-sandbox/generated/<what>.log; on failure its end is shown.
+  local what=$1; shift
+  local log="$SB/generated/${what//[^A-Za-z0-9]/-}.log" start=$SECONDS n=0 rc=0 last pid
+  mkdir -p "${log:h}"
+  ( "$@" ) >"$log" 2>&1 &
+  pid=$!
+  while kill -0 $pid 2>/dev/null; do
+    sleep 1; (( ++n % 20 )) && continue
+    last=$(tr '\r' '\n' <"$log" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-110)
+    print -r -- "  … $what: $(( SECONDS - start ))s${last:+ | $last}"
+  done
+  wait $pid || rc=$?
+  if (( rc )); then
+    print -u2 -r -- "pibox: $what failed after $(( SECONDS - start ))s; the end of $log:"
+    tr '\r' '\n' <"$log" | grep -v '^[[:space:]]*$' | tail -20 >&2
+    return $rc
+  fi
+  print -r -- "  done: $what ($(( SECONDS - start ))s)"
+}
+
 usage() {
   print "pibox <command>      (settings: $CONFIG)
 
@@ -56,6 +77,10 @@ cmd_init() {
     PIBOX_INIT_FROM_SOURCE=1 exec zsh "$src/bin/pibox" init
   fi
 
+  local -a gone=()                          # check everything first: never install half of it
+  for f in $COMPONENTS; do [[ -e "$src/sandbox/$f" ]] || gone+=("sandbox/$f"); done
+  for f in $BRIDGE_FILES; do [[ -e "$src/bridge/$f" ]] || gone+=("bridge/$f"); done
+  (( ! $#gone )) || die "the repository $src lacks ${(j:, :)gone}: is it up to date (git pull; are the files committed)? Nothing was changed"
   mkdir -p "$SB"/{bin,bridge,agent,generated}; chmod 700 "$SB"
   for f in $COMPONENTS; do
     rm -rf "$SB/$f"; mkdir -p "$SB/${f:h}"; cp -R "$src/sandbox/$f" "$SB/$f"
@@ -646,8 +671,18 @@ mounts:
     writable: true
   - location: \"$SB\"
     writable: false"
-  [[ -n "$UPSTREAM_PROXY" || "$AGENT_DOCKER" == sysbox ]] || return 0
+  # The VM's Docker (it builds the images and pulls them) uses the registry mirrors of your
+  # daemon.json too, so Docker Hub names (golang:…, node:…) come from your repository.
+  local d="$SB/generated/c/daemon.json" mirrors="" insecure=""
+  if [[ -s "$d" ]]; then
+    mirrors=$(yq -p json -o json -I0 '.["registry-mirrors"] // []' "$d")
+    insecure=$(yq -p json -o json -I0 '.["insecure-registries"] // []' "$d")
+  fi
+  [[ "$mirrors" != "[]" ]] || mirrors=""; [[ "$insecure" != "[]" ]] || insecure=""
+  [[ -n "$UPSTREAM_PROXY$mirrors$insecure" || "$AGENT_DOCKER" == sysbox ]] || return 0
   print -r -- "docker:"                     # the VM's daemon.json
+  [[ -z "$mirrors" ]] || print -r -- "  registry-mirrors: $mirrors"
+  [[ -z "$insecure" ]] || print -r -- "  insecure-registries: $insecure"
   [[ -z "$UPSTREAM_PROXY" ]] || print -r -- "  proxies:
     http-proxy: \"$UPSTREAM_PROXY\"
     https-proxy: \"$UPSTREAM_PROXY\"
@@ -679,7 +714,7 @@ cmd_setup() {
   $SB/generated/c/ (settings.xml, toolchains.xml, gradle.properties, init.gradle, npmrc, pip.conf, docker-config.json, daemon.json)
   $vmfile"
   if [[ -n "$old" && "$old" != "$(<"$vmfile")" ]] && vm_running; then
-    print "the VM settings changed: pibox down --vm && pibox up applies them"
+    print "the VM settings changed: the next pibox up restarts the VM to apply them"
   fi
   print "next: pibox up"
 }
@@ -727,26 +762,29 @@ sysbox_build() {                            # sysbox from its sources: clone on 
   local src="$SB/build/sysbox-$SYSBOX_VERSION" out="$SB/generated/sysbox" url=https://github.com/nestybox/sysbox.git
   if [[ "$(cat "$out/VERSION" 2>/dev/null)" != "$SYSBOX_VERSION" ]]; then
     if [[ ! -e "$src/.pibox-complete" ]]; then
-      print "fetching the sources of sysbox $SYSBOX_VERSION ($url, with its submodules)"
+      print "fetching the sources of sysbox $SYSBOX_VERSION ($url, with its 8 submodules)"
       rm -rf "$src"; mkdir -p "${src:h}"
-      git clone -q --depth 1 --branch "v$SYSBOX_VERSION" --recurse-submodules --shallow-submodules "$url" "$src" 2>/dev/null || {
-        rm -rf "$src"                         # a submodule's commit may not be the tip: full history
-        git -c advice.detachedHead=false clone -q --branch "v$SYSBOX_VERSION" --recurse-submodules "$url" "$src" ||
+      long "cloning sysbox" git -c advice.detachedHead=false clone --progress --depth 1 --branch "v$SYSBOX_VERSION" \
+          --recurse-submodules --shallow-submodules "$url" "$src" || {
+        print "retrying with the full history (a submodule's commit may not be a branch tip)"
+        rm -rf "$src"
+        long "cloning sysbox (full)" git -c advice.detachedHead=false clone --progress --branch "v$SYSBOX_VERSION" \
+            --recurse-submodules "$url" "$src" ||
           die "can't clone $url: git on this Mac must reach github.com (git config http.proxy, or https_proxy)"
       }
       touch "$src/.pibox-complete"
     fi
     print "building sysbox $SYSBOX_VERSION in the VM (once, a few minutes)"
     rm -rf "$out"
-    docker buildx build --progress=plain -f "$SB/sysbox/Dockerfile" \
+    long "building sysbox" docker buildx build --progress=plain -f "$SB/sysbox/Dockerfile" \
       --build-arg GOLANG_IMAGE="$GOLANG_IMAGE" --build-arg APT_DEBIAN="$APT_DEBIAN" --build-arg APT_SECURITY="$APT_SECURITY" \
       --build-arg HTTP_PROXY="$UPSTREAM_PROXY" --build-arg HTTPS_PROXY="$UPSTREAM_PROXY" --build-arg NO_PROXY="$UPSTREAM_NO_PROXY" \
       --build-arg http_proxy="$UPSTREAM_PROXY" --build-arg https_proxy="$UPSTREAM_PROXY" --build-arg no_proxy="$UPSTREAM_NO_PROXY" \
-      --output "type=local,dest=$out" "$src" 2>&1 | tail -n 15 || die "building sysbox failed (output above)"
+      --output "type=local,dest=$out" "$src" || die "building sysbox failed (output above)"
     [[ "$(cat "$out/VERSION" 2>/dev/null)" == "$SYSBOX_VERSION" ]] || die "building sysbox failed: no binaries in $out"
   fi
   print "installing sysbox $SYSBOX_VERSION in the VM"
-  colima ssh -p "$VM_PROFILE" -- sudo bash "$SB/sysbox/install.sh" "$out" "$UPSTREAM_PROXY" ||
+  long "installing sysbox" colima ssh -p "$VM_PROFILE" -- sudo bash "$SB/sysbox/install.sh" "$out" "$UPSTREAM_PROXY" ||
     die "installing sysbox in the VM failed (output above)"
 }
 
@@ -1153,9 +1191,15 @@ config)                                     # the settings in effect (secrets ma
 
 up)                                         # VM, images, bridge, proxy, the agent's Docker engine
   fresh
+  local applied="$SB/generated/colima.applied.yaml"   # the colima.yaml the running VM was started with
+  if vm_running && ! cmp -s "$(COLIMA_FILE)" "$applied"; then
+    print "the VM settings changed since it was started (pibox setup): restarting the Colima VM $VM_PROFILE"
+    colima stop "$VM_PROFILE"
+  fi
   if ! vm_running; then
     print "starting the Colima VM $VM_PROFILE"
     colima start "$VM_PROFILE" ${VM_DISK_IMAGE:+--disk-image "$VM_DISK_IMAGE"}
+    cp "$(COLIMA_FILE)" "$applied"
   fi
   colima ssh -p "$VM_PROFILE" -- sh -c 'mount | grep -E "virtiofs|9p|sshfs"' | sed 's/^/shared with the VM: /'
   [[ "$AGENT_DOCKER" != sysbox ]] || sysbox
