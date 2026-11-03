@@ -92,6 +92,17 @@ models:
     compat: { supportsReasoningEffort: true }
 ```
 
+Many repositories? Instead of URLs and logins, point it at the files you already have; `pibox setup`
+copies them and adapts them to the sandbox (proxy, `http://`, Mac paths):
+
+```yaml
+repository:
+  maven_settings: ~/.m2/settings.xml
+  npmrc: ~/.npmrc
+  pip_conf: ~/.config/pip/pip.conf            # e.g. from Artifactory's "Set Me Up"
+  docker_daemon: ~/.config/pi-sandbox/daemon.json
+```
+
 The sections are explained in [docs/pi-setup.md §6.5](docs/pi-setup.md#65-configyaml).
 
 ## Repository layout

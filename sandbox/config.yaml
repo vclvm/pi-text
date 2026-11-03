@@ -103,17 +103,18 @@ network:
 # lists also covers its subdomains (repo.corp, .corp and *.corp all work the same way; no other
 # patterns). `pibox log` shows every decision.
 egress:
-  # Hosts on private addresses (LAN, VPN) the agent may still fetch from: your artifact repository.
-  # Every other private address is refused, so the agent can't reach your router, NAS, intranet.
-  allow_private: [repo.example.com]
-  # Hosts allowed without asking you each time: your artifact repository, so builds don't wait.
-  # Every other request waits until you allow it in `pibox approve`.
-  no_approval: [repo.example.com]
+  # Hosts on private addresses (LAN, VPN) the agent may still fetch from. Every other private
+  # address is refused, so the agent can't reach your router, NAS, intranet. Your repositories
+  # (the repository section) are added automatically.
+  allow_private: []
+  # Hosts allowed without asking you each time. Every other request waits until you allow it in
+  # `pibox approve`. Your repositories are added automatically, so builds don't wait.
+  no_approval: []
   # If not empty, ONLY these hosts are reachable; everything else is refused without asking.
   allow_only: []
   # Always refused, even if you would approve: services made for uploading data.
   deny: [pastebin.com, transfer.sh, 0x0.st]
-  # Allowed ports. Add your repository's ports if they are not 80/443 (e.g. 8081, 8082).
+  # Allowed ports. Your repositories' ports are added automatically.
   ports: [80, 443]
 
 # ===================================================================================== extensions
@@ -133,32 +134,61 @@ extensions:
   fetch_max_chars: 20000
 
 # ===================================================================================== repository
-# Your artifact repository (Artifactory, Nexus…). The agent downloads its dependencies from it:
-# pibox writes Maven's settings.xml, a Gradle init script, .npmrc, pip.conf and Docker's settings
-# from these values (docs/pi-setup.md §8.9). Everything goes through the filtering proxy, which only
-# sees plain HTTP, so use http:// URLs. Add the repository's host to egress.allow_private (if it's
-# in your network) and egress.no_approval. "" = the public servers are used.
+# Where the agent downloads its dependencies from (Artifactory, Nexus…). Two ways, per tool:
+#   - your own configuration files (maven_settings, npmrc, pip_conf, docker_daemon below): any number of
+#     repositories, mirrors, credentials, exactly as on your Mac;
+#   - or the URLs below: pibox writes Maven's settings.xml, a Gradle init script, .npmrc, pip.conf
+#     and Docker's settings from them, one repository per tool.
+# Everything goes through the filtering proxy, which only sees plain HTTP: pibox turns https:// into
+# http:// in your files' copies, so your repositories must answer over plain HTTP too. Every
+# repository host it finds is added to egress.no_approval and egress.allow_private, with its port
+# to egress.ports (`pibox setup` lists them). "" = the public servers are used.
+# The agent can read all of this, credentials included: use READ-ONLY tokens.
+# More: docs/pi-setup.md §8.9.
 repository:
-  # Login, if the repository needs one. The agent can read these settings: use a READ-ONLY token.
+  # Your Maven settings.xml (absolute path or ~/…), e.g. ~/.m2/settings.xml. Used as is, except:
+  # its <proxies> become the filtering proxy, <localRepository> and <offline> are dropped,
+  # https:// <url>s become http://. Encrypted passwords ({…}) don't work in the sandbox. When set,
+  # repository.maven, user and token don't apply to Maven (Gradle still uses repository.maven).
+  maven_settings: ""
+  # Your .npmrc, e.g. ~/.npmrc: registries, scopes, tokens. Its proxy settings and Mac paths
+  # (cafile, prefix, cache) are dropped, https:// registries become http://. When set,
+  # repository.npm doesn't apply; its registry= is used to install Pi into the image.
+  npmrc: ""
+  # A daemon.json for the agent's own Docker engine, e.g. one with your registry-mirrors and
+  # insecure-registries. hosts, tls*, data-root are dropped, the proxy is set to the filtering proxy,
+  # https:// mirrors become http:// (and insecure registries). When set, repository.docker_registry
+  # and docker_mirror don't apply to the engine (the login for docker_registry still does).
+  docker_daemon: ""
+  # Your pip.conf, e.g. the one Artifactory's "Set Me Up" generates: index-url, extra-index-url,
+  # credentials in the URL. Its proxy, cert and Mac paths are dropped, https:// becomes http://,
+  # every index host is trusted (pip refuses plain http otherwise). When set, repository.pip and
+  # pip_trusted_host don't apply.
+  pip_conf: ""
+
+  # Login for the URLs below, if the repository needs one.
   user: ""
   token: ""
-  # A Maven repository that proxies Maven Central (and whatever else you need); Gradle uses it too.
-  # "" = Maven Central, plugins.gradle.org
-  maven: http://repo.example.com/artifactory/maven-remote
+  # A Maven repository that proxies Maven Central (and whatever else you need); Gradle uses it too,
+  # e.g. http://repo.example.com/artifactory/maven-remote. "" = Maven Central, plugins.gradle.org
+  maven: ""
   # A repository that proxies https://plugins.gradle.org/m2; "" = the maven URL above
   gradle_plugins: ""
-  # npm registry; "" = registry.npmjs.org
-  npm: http://repo.example.com/artifactory/api/npm/npm-remote/
-  # Python package index (the URL ending in /simple); "" = pypi.org
-  pip: http://repo.example.com/artifactory/api/pypi/pypi-remote/simple
+  # npm registry, e.g. http://repo.example.com/artifactory/api/npm/npm-remote/; "" = registry.npmjs.org
+  npm: ""
+  # Python package index (the URL ending in /simple), e.g.
+  # http://repo.example.com/artifactory/api/pypi/pypi-remote/simple; "" = pypi.org
+  pip: ""
   # pip refuses plain http:// unless the host is trusted; "" = the host of the pip URL
   pip_trusted_host: ""
-  # For the agent's own Docker (agent_docker): your Docker registry as host:port (plain HTTP)…
-  docker_registry: repo.example.com:8082
-  # …the mirror it pulls Docker Hub images through when the agent says `docker pull postgres:16`…
-  docker_mirror: http://repo.example.com:8082
-  # …and the prefix Testcontainers puts before Docker Hub image names
-  docker_image_prefix: repo.example.com:8082/
+  # For the agent's own Docker (agent_docker): your Docker registry as host:port, plain HTTP
+  # (e.g. repo.example.com:8082)…
+  docker_registry: ""
+  # …the mirror it pulls Docker Hub images through when the agent says `docker pull postgres:16`
+  # (e.g. http://repo.example.com:8082)…
+  docker_mirror: ""
+  # …and the prefix Testcontainers puts before Docker Hub image names (e.g. repo.example.com:8082/)
+  docker_image_prefix: ""
   # Debian package mirrors for building the images (http://…/debian, http://…/debian-security);
   # "" = deb.debian.org
   apt_debian: ""
