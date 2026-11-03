@@ -3,6 +3,8 @@
 # (docs/pi-setup.md). All settings live in ~/.pi-sandbox/config.yaml.
 #   pibox help      lists the commands
 setopt err_exit no_unset pipe_fail
+# A command failing where nothing expects it stops pibox (err_exit): say where, never silently.
+TRAPZERR() { print -u2 -r -- "pibox: stopped by a failing command in ${funcstack[2]:-pibox} (${funcfiletrace[1]:-?}); please report this" }
 
 SELF="${0:A}"                               # this script; $0 means the function name inside functions
 SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
@@ -780,7 +782,7 @@ dns_hosts() {                               # names only your Mac can resolve, f
   local u=${${BRIDGE_ENV[(r)PI_TEXT_URL=*]:-}#PI_TEXT_URL=}; [[ -z "$u" ]] || hosts+=(${${${u#*://}#*@}%%[/:]*})
   for h in $hosts; do
     [[ "$h" == *.* && "$h" != (registry.npmjs.org|pypi.org|deb.debian.org) && "$h" != <->.<->.<->.<-> ]] || continue
-    ip=$(resolve "$h")
+    ip=$(resolve "$h") || ip=""
     [[ -n "$ip" ]] || { warn "this Mac can't resolve $h either"; continue }
     [[ "$ip" == (10.*|192.168.*|172.(1[6-9]|2[0-9]|3[01]).*|100.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7]).*) ]] || continue
     lines+=("$h $ip")
@@ -794,7 +796,7 @@ resolve() {                                 # resolve <host>: its IPv4 address, 
   if have dscacheutil; then
     dscacheutil -q host -a name "$1" 2>/dev/null | sed -n 's/^ip_address: //p' | grep -m1 -E '^[0-9.]+$' || true
   else
-    getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+    getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' || true
   fi
 }
 
@@ -945,6 +947,7 @@ build_progress() {                          # build_progress <log>: BuildKit's p
   return 0                                  # the build's own status comes through pipe_fail
 }
 
+fresh_quiet() { [[ -f "$SB/.env" && ! "$CONFIG" -nt "$SB/.env" ]] }
 fresh() {                                   # the generated files must be newer than config.yaml
   [[ -f "$SB/.env" && -f "$SB/agent/models.json" ]] || die "nothing generated yet: run pibox setup"
   [[ ! "$CONFIG" -nt "$SB/.env" ]] || die "config.yaml changed since the last setup: run pibox setup"
@@ -960,7 +963,15 @@ compose_args() {                            # docker compose, with compose.overr
   [[ -f "$SB/compose.override.yaml" ]] && reply+=(-f "$SB/compose.override.yaml")
   return 0
 }
-compose() { compose_args; docker $reply "$@" }
+# docker for the VM's Docker, with a clean environment: pibox's own variables (config.yaml's raw
+# values) would override .env, where pibox setup wrote the final ones (image names with your
+# registry, your indexes, the egress lists). Only what docker itself needs is passed on.
+dk() {
+  reply=(env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" TERM="${TERM:-dumb}" TMPDIR="${TMPDIR:-/tmp}"
+         ${DOCKER_CONFIG:+DOCKER_CONFIG=$DOCKER_CONFIG} ${DOCKER_HOST:+DOCKER_HOST=$DOCKER_HOST}
+         ${DOCKER_CONTEXT:+DOCKER_CONTEXT=$DOCKER_CONTEXT} docker)
+}
+compose() { compose_args; local -a c=($reply); dk; $reply $c "$@" }
 
 vm_running() { colima status -p "$VM_PROFILE" >/dev/null 2>&1 }
 running() {                                 # bridge and proxy must be up, or `compose run` would build and start them
@@ -1367,9 +1378,14 @@ setup)                                      # every configuration, from config.y
   ;;
 
 config)                                     # the settings in effect (secrets masked)
-  local k v kv
+  local k v kv; local -A eff
+  if [[ -f "$SB/.env" ]] && ! fresh_quiet; then
+    print -r -- "(config.yaml changed since the last pibox setup: these are config.yaml's values, not yet in effect)"
+  elif [[ -f "$SB/.env" ]]; then              # what pibox setup made of them (image names, indexes…)
+    for kv in ${(f)"$(grep -E "^[A-Z_][A-Z0-9_]*='" "$SB/.env")"}; do eff[${kv%%=*}]=${${kv#*=\'}%\'}; done
+  fi
   for k in ${(ok)SETTING}; do
-    v="${(P)SETTING[$k]}"
+    v="${eff[${SETTING[$k]}]-${(P)SETTING[$k]}}"
     [[ "$v" == *://*:*@* ]] && v="${v%%://*}://${${v#*://}%%:*}:***@${v#*@}"     # a password in a URL
     print -r -- "$k: $v"
   done
@@ -1414,23 +1430,23 @@ up)                                         # VM, images, bridge, proxy, the age
 run)                                        # Pi in a fresh container, in the current folder
   fresh; running
   local h; h=$(here)
-  compose_args; exec docker $reply run --rm -w "$h" pi "$@"
+  compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" pi "$@"
   ;;
 
 shell)                                      # bash in the agent's container, without Pi
   fresh; running
   local h; h=$(here)
-  compose_args; exec docker $reply run --rm -w "$h" --entrypoint bash pi "$@"
+  compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" --entrypoint bash pi "$@"
   ;;
 
 approve)                                    # the approval console (detach: Ctrl-P Ctrl-Q)
   local id; id=$(compose ps -q proxy)
   [[ -n "$id" ]] || die "the proxy isn't running: pibox up"
-  exec docker attach "$id"
+  dk; exec $reply attach "$id"
   ;;
 
 log)                                        # follow the web journal
-  compose_args; exec docker $reply exec -T proxy tail -n 50 -F /home/mitmproxy/.mitmproxy/egress.log
+  compose_args; local -a c=($reply); dk; exec $reply $c exec -T proxy tail -n 50 -F /home/mitmproxy/.mitmproxy/egress.log
   ;;
 
 status)                                     # the VM and the containers
