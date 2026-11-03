@@ -29,40 +29,8 @@ COPY generated/ca/ /usr/local/share/ca-certificates/pibox/
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
-# System packages: from your repository's Debian (or Ubuntu) remotes if repository.apt_sources is set (pibox
-# setup writes generated/apt/). Mounted for this step only: the login doesn't stay in the image.
-RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
-    set -eu; \
-    if [ -s /pibox-apt/debian.sources ]; then \
-      . /etc/os-release; \
-      if [ "$VERSION_CODENAME" != "$(cat /pibox-apt/codename)" ]; then \
-        echo "pibox: the base image is Debian $VERSION_CODENAME, pibox setup asked your remotes for $(cat /pibox-apt/codename)"; exit 1; fi; \
-      rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
-      key=/usr/share/keyrings/ubuntu-archive-keyring.gpg; [ -f "$key" ] || key=/usr/share/keyrings/debian-archive-keyring.gpg; \
-      sed "s#@KEYRING@#$key#" /pibox-apt/debian.sources > /etc/apt/sources.list.d/pibox.sources; \
-      mkdir -p /etc/apt/auth.conf.d; install -m 600 /pibox-apt/auth.conf /etc/apt/auth.conf.d/pibox.conf; \
-    fi; \
-    # No -security remote: your remotes' versions win, also over the base image's newer ones.
-    up=""; if [ -e /pibox-apt/no-security ]; then \
-      printf 'Package: *\nPin: release o=Debian\nPin-Priority: 1001\n\nPackage: *\nPin: release o=Ubuntu\nPin-Priority: 1001\n' > /etc/apt/preferences.d/pibox; \
-      up=1; fi; \
-    # The base image may not have ca-certificates yet: apt trusts your CA for an https:// mirror.
-    opt=""; if ls /usr/local/share/ca-certificates/pibox/*.crt >/dev/null 2>&1; then \
-      cat /usr/local/share/ca-certificates/pibox/*.crt > /tmp/pibox-ca.pem; opt="-o Acquire::https::CaInfo=/tmp/pibox-ca.pem"; fi; \
-    { apt-get $opt update --error-on=any 2>&1; echo $? > /tmp/apt-update.rc; } | tee /tmp/apt-update.log; \
-    [ "$(cat /tmp/apt-update.rc)" = 0 ] || exit 1; \
-    # update succeeds although a source has nothing for this architecture or component: say so
-    if ! ls /var/lib/apt/lists/*Packages* >/dev/null 2>&1; then \
-      echo "pibox: apt-get update got no package lists for architecture $(dpkg --print-architecture) from:"; \
-      grep -hE '^(URIs|Suites|Components):' /etc/apt/sources.list.d/*.sources 2>/dev/null || cat /etc/apt/sources.list; \
-      echo "apt said:"; grep -E '^(Err|Ign|W|N|E):' /tmp/apt-update.log || true; exit 1; \
-    fi; \
-    if [ -n "$up" ]; then apt-get $opt -y --allow-downgrades dist-upgrade; fi; \
-    apt-get $opt install -y --allow-downgrades --no-install-recommends $PI_APT_PACKAGES; \
-    rm -f /etc/apt/preferences.d/pibox; \
-    rm -f /tmp/pibox-ca.pem /tmp/apt-update.log /tmp/apt-update.rc /etc/apt/auth.conf.d/pibox.conf; \
-    rm -rf /var/lib/apt/lists/*; \
-    update-ca-certificates
+# The steps are ordered from what changes least to what changes most: a new system package
+# (pi.apt_packages) rebuilds only the apt step and the ones after it, not the JDK copies.
 
 # Java 17/21/25, Maven, Gradle and the Docker CLI with the compose and buildx plugins, copied
 # from their official images.
@@ -94,10 +62,51 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
  && node --version && npm --version
 
+# System packages: from your repository's Debian (or Ubuntu) remotes if repository.apt_sources is set (pibox
+# setup writes generated/apt/). Mounted for this step only: the login doesn't stay in the image.
+# Downloaded .debs stay in BuildKit's cache (/var/cache/apt) between builds: adding a package
+# downloads only that one. The base image's docker-clean would delete them after each install.
+RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    set -eu; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-downloads; \
+    if [ -s /pibox-apt/debian.sources ]; then \
+      . /etc/os-release; \
+      if [ "$VERSION_CODENAME" != "$(cat /pibox-apt/codename)" ]; then \
+        echo "pibox: the base image is Debian $VERSION_CODENAME, pibox setup asked your remotes for $(cat /pibox-apt/codename)"; exit 1; fi; \
+      rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
+      key=/usr/share/keyrings/ubuntu-archive-keyring.gpg; [ -f "$key" ] || key=/usr/share/keyrings/debian-archive-keyring.gpg; \
+      sed "s#@KEYRING@#$key#" /pibox-apt/debian.sources > /etc/apt/sources.list.d/pibox.sources; \
+      mkdir -p /etc/apt/auth.conf.d; install -m 600 /pibox-apt/auth.conf /etc/apt/auth.conf.d/pibox.conf; \
+    fi; \
+    # No -security remote: your remotes' versions win, also over the base image's newer ones.
+    up=""; if [ -e /pibox-apt/no-security ]; then \
+      printf 'Package: *\nPin: release o=Debian\nPin-Priority: 1001\n\nPackage: *\nPin: release o=Ubuntu\nPin-Priority: 1001\n' > /etc/apt/preferences.d/pibox; \
+      up=1; fi; \
+    # The base image may not have ca-certificates yet: apt trusts your CA for an https:// mirror.
+    opt=""; if ls /usr/local/share/ca-certificates/pibox/*.crt >/dev/null 2>&1; then \
+      cat /usr/local/share/ca-certificates/pibox/*.crt > /tmp/pibox-ca.pem; opt="-o Acquire::https::CaInfo=/tmp/pibox-ca.pem"; fi; \
+    { apt-get $opt update --error-on=any 2>&1; echo $? > /tmp/apt-update.rc; } | tee /tmp/apt-update.log; \
+    [ "$(cat /tmp/apt-update.rc)" = 0 ] || exit 1; \
+    # update succeeds although a source has nothing for this architecture or component: say so
+    if ! ls /var/lib/apt/lists/*Packages* >/dev/null 2>&1; then \
+      echo "pibox: apt-get update got no package lists for architecture $(dpkg --print-architecture) from:"; \
+      grep -hE '^(URIs|Suites|Components):' /etc/apt/sources.list.d/*.sources 2>/dev/null || cat /etc/apt/sources.list; \
+      echo "apt said:"; grep -E '^(Err|Ign|W|N|E):' /tmp/apt-update.log || true; exit 1; \
+    fi; \
+    if [ -n "$up" ]; then apt-get $opt -y --allow-downgrades dist-upgrade; fi; \
+    apt-get $opt install -y --allow-downgrades --no-install-recommends $PI_APT_PACKAGES; \
+    rm -f /etc/apt/preferences.d/pibox; \
+    rm -f /tmp/pibox-ca.pem /tmp/apt-update.log /tmp/apt-update.rc /etc/apt/auth.conf.d/pibox.conf; \
+    rm -rf /var/lib/apt/lists/*; \
+    update-ca-certificates
+
 # Pi itself, from your npm registry; corepack provides pnpm and yarn.
 # Your .npmrc (registries, tokens), if pibox setup put one into generated/build/: mounted for this
 # step only, so the token doesn't stay in the image.
 RUN --mount=type=bind,source=generated/build,target=/pibox-build \
+    --mount=type=cache,target=/root/.npm \
     if [ -f /pibox-build/npmrc ]; then export NPM_CONFIG_USERCONFIG=/pibox-build/npmrc; fi; \
     npm install -g --ignore-scripts "$PI_PACKAGE" && corepack enable
 

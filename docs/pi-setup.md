@@ -762,6 +762,12 @@ Step by step:
   separate remote.) The build mounts the files for the `apt-get` step only (`RUN --mount`), so the
   login isn't stored in the image, stops if `apt-get update` fails or fetches no package list, and
   trusts your company's CA before `ca-certificates` is installed.
+- **Rebuilds stay small.** The steps go from what changes least to what changes most: the JDK,
+  Maven, Gradle, Docker CLI and Node copies come before the apt step, so a new package in
+  `pi.apt_packages` rebuilds only apt and the steps after it (Pi, the user). Downloaded `.deb`
+  files, npm's and pip's downloads stay in BuildKit's cache in the VM (`RUN --mount=type=cache`), so
+  adding a package downloads that package only; nothing is rebuilt when nothing changed. The cache
+  takes disk space in the VM: `docker --context colima-pi builder prune` empties it.
 - **`apt-get install $PI_APT_PACKAGES`**: the system tools the agent may use: git, ripgrep, curl,
   `jq` and HTTPie for API calls, a C compiler (`build-essential`, for native npm and pip packages),
   Python 3 with venv and pip. **Bake everything it needs into the image** by adding packages to
