@@ -189,10 +189,15 @@ repository:
   apt_sources: ""
 
 # ========================================================================================= images
-# The images the sandbox is built from. They are pulled by the VM's Docker, so they can be Docker
-# Hub names or the same images through your registry, e.g.
-# repo.example.com:8082/library/node:24-bookworm-slim.
+# The images the sandbox is built from, all pulled from your registry (registry below): nothing
+# is fetched from Docker Hub itself.
 images:
+  # The registry all of them come from: your Artifactory's Docker remote of Docker Hub, as
+  # host[:port][/path] (e.g. docker.artifactory.corp, or artifactory.corp/docker-remote).
+  # pibox puts it in front of the Docker Hub names below: node:24-… becomes
+  # <registry>/library/node:24-…; a name that already starts with a registry stays as it is.
+  # "" = the host of the first registry-mirrors entry of your daemon.json (repository.docker_daemon)
+  registry: ""
   node: node:24-bookworm-slim              # base of the agent's image
   python: python:3.12-slim                 # base of the bridge's image
   mitmproxy: mitmproxy/mitmproxy:12.3.1    # the filtering proxy

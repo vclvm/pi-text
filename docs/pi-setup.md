@@ -456,6 +456,7 @@ What the sections mean:
 | `egress` | The agent's web policy (§8.6) |
 | `extensions` | Settings of the Pi extensions (§9) |
 | `repository` | Paths of your own `settings.xml`, `.npmrc`, `pip.conf` and `daemon.json`: `pibox setup` adapts copies to the sandbox (the filtering proxy, no Mac paths) and makes Gradle's settings from `settings.xml` (§8.9). Debian mirrors for the image builds |
+| `images.registry` | The registry every image comes from: your Artifactory's Docker remote of Docker Hub (`host[:port][/path]`). `pibox setup` writes each image with it in front (`node:24-…` becomes `<registry>/library/node:24-…`), so neither the VM's Docker nor the build ever asks `docker.io`. Empty: the host of the first `registry-mirrors` entry of your `daemon.json` |
 | `images`, `pi` | The images the sandbox is built from (JDK 17/21/25, Maven, Gradle, Docker CLI, Docker engine), the Pi version, the system tools in the agent's image, the default JDK, the container's limits |
 | `agent_docker` | The agent's own Docker engine and its isolation (§8.10) |
 | `vm` | Name and size of the Colima VM |
@@ -1216,6 +1217,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: the sandbox isn't running` | `pibox up` |
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
 | `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected for the web: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself. Your repositories are the exception: if one is refused, it isn't in `repository` (check `EGRESS_TUNNEL` in `pibox config`) |
+| `Temporary failure resolving '<host>'` / `no such host` for a host your Mac resolves | The VM has its own DNS. `pibox setup` resolves every host it uses (repositories, Debian sources, image registry, router) on the Mac and puts those with an internal address into `colima.yaml` as `dnsHosts`; `pibox up` restarts the VM to apply it. Check what `setup` printed ("the VM resolves these…"); a host missing there isn't in any of your files |
 | `certificate verify failed`, `self-signed certificate`, `PKIX path building failed`, `unable to get local issuer certificate` | Your company's CA isn't in the sandbox: check what `pibox setup` prints about CA certificates. If it finds none in the System keychain, export your company's root CA from Keychain Access as a `.pem` and set `network.ca_certs` to it; then `pibox setup && pibox up` (the images are rebuilt with it) |
 | `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | Set `repository.npmrc` / `repository.pip_conf` to your files with your mirror; public registries answer only over HTTPS |
 | Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
