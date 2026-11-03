@@ -15,7 +15,8 @@ usage() {
   print "pibox <command>      (settings: $CONFIG)
 
 Install and configure:
-  init           install or update ~/.pi-sandbox from the repository; creates config.yaml on first run
+  init           install or update ~/.pi-sandbox from the repository; creates config.yaml, or
+                 rebuilds it from the newest template keeping the values you changed
   check          check the prerequisites and config.yaml
   setup          (re)generate every configuration from config.yaml
   config         show the settings in effect (secrets masked)
@@ -57,14 +58,7 @@ cmd_init() {
   print -r -- "$src" > "$SB/.source"
   print "installed the components from $src into $SB"
 
-  if [[ ! -e "$CONFIG" ]]; then
-    (umask 077; cp "$src/sandbox/config.yaml" "$CONFIG")
-    print "created $CONFIG: fill it in, then run pibox setup"
-  else
-    local new; new=$(missing_keys "$src/sandbox/config.yaml")
-    [[ -z "$new" ]] || print "settings of the new template that config.yaml doesn't have yet (defaults apply):\n$new"
-    print "kept $CONFIG; run pibox setup to regenerate the configurations"
-  fi
+  update_config "$src/sandbox/config.yaml"
 
   mkdir -p "$HOME/.local/bin"; ln -sfn "$SB/bin/pibox" "$HOME/.local/bin/pibox"
   [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] ||
@@ -72,11 +66,147 @@ cmd_init() {
   docker_plugins
 }
 
-missing_keys() {                            # top-level sections of the template that config.yaml lacks
-  local k
-  for k in ${(f)"$(yq '... comments="" | keys | .[]' "$1")"}; do
-    [[ "$(yq "has(\"$k\")" "$CONFIG")" == true ]] || print "  $k"
+# config.yaml is rebuilt from the newest template on every init, so new settings and their explanations
+# appear in it. A value of yours is carried over if it differs from the default you were given: the
+# value in the template your config.yaml was made from (saved as .config-template.yaml), or, if that
+# isn't known, the new template. A default you never changed follows the new template.
+TEMPLATE_COPY=.config-template.yaml
+# yq: one line per setting, '<path as JSON>\t<value as JSON>'; models is one setting (the whole list)
+YQ_LEAVES='... comments="" | (.. | select(tag == "!!null")) |= ""
+  | .. | select(((path | length) == 2 and (path | .[0]) != "models") or ((path | length) == 1 and (path | .[0]) == "models"))
+  | (path | to_json(0)) + "\t" + ((select(tag == "!!map" or tag == "!!seq") | to_json(0)) // (tostring | to_json(0)))'
+
+leaves() {                                  # leaves <file> <assoc name>: the settings of a config file
+  local line; set -A $2                     # the caller declares it: local -A NAME
+  for line in ${(f)"$(yq "$YQ_LEAVES" "$1")"}; do
+    eval "$2[\${line%%\$'\t'*}]=\${line#*\$'\t'}"
   done
+}
+
+update_config() {                           # update_config <template>
+  local tpl=$1 old="$SB/$TEMPLATE_COPY" p name base tmp
+  local -a kept changed added dropped T
+  local -A U O N
+  T=("${(@f)$(<"$tpl")}")
+  if [[ -e "$CONFIG" ]]; then
+    yq '.' "$CONFIG" >/dev/null 2>&1 || die "$CONFIG is not valid YAML: fix it, then run pibox init again"
+    [[ -f "$old" ]] || old="$tpl"
+    leaves "$CONFIG" U; leaves "$old" O; leaves "$tpl" N
+    for p in ${(ok)U}; do
+      name="${${${p:1:-1}//\"/}//,/.}"                 # ["network","bridge_port"] -> network.bridge_port
+      if [[ -z "${N[$p]+x}" && "$p" != '["bridge",'* ]]; then
+        dropped+=("$name: ${U[$p]}"); continue
+      fi
+      base="${O[$p]-${N[$p]-}}"
+      if [[ -n "${O[$p]+x}" && "${U[$p]}" == "$base" ]]; then  # a default you never changed
+        [[ "${N[$p]-}" == "$base" ]] || changed+=("$name: ${N[$p]-}")
+        continue
+      fi
+      [[ "${U[$p]}" == "${N[$p]-}" ]] && continue
+      kept+=("$name"); put_value ${(s:.:)name}
+    done
+    for p in ${(ok)N}; do                    # settings of the new template that config.yaml doesn't have
+      [[ -n "${U[$p]+x}" ]] && continue
+      name="${${${p:1:-1}//\"/}//,/.}"
+      if [[ "$p" == '["bridge",'* && -n "${O[$p]+x}" && "$old" != "$tpl" ]]; then
+        del_value ${(s:.:)name}              # a bridge variable you removed stays removed
+      else
+        added+=("$name")
+      fi
+    done
+  fi
+  tmp="$SB/.config.yaml.new"
+  (umask 077; print -rl -- "${T[@]}" > "$tmp")
+  yq '.' "$tmp" >/dev/null || { rm -f "$tmp"; die "merging $CONFIG with the template failed: $CONFIG is unchanged" }
+  cp "$tpl" "$SB/$TEMPLATE_COPY"
+  if [[ ! -e "$CONFIG" ]]; then
+    mv "$tmp" "$CONFIG"
+    print "created $CONFIG: fill it in, then run pibox check and pibox setup"
+    return
+  fi
+  if cmp -s "$tmp" "$CONFIG"; then
+    rm -f "$tmp"; print "$CONFIG is up to date with the template"; return
+  fi
+  cp -p "$CONFIG" "$CONFIG.bak"; mv "$tmp" "$CONFIG"
+  print "rebuilt $CONFIG from the new template (previous file: $CONFIG.bak; your own comments are only there)"
+  (( $#kept ))    && print -rl -- "  your values, kept:" "${(@)kept/#/    }"
+  (( $#changed )) && print -rl -- "  defaults you never changed, now the template's new ones:" "${(@)changed/#/    }"
+  (( $#added ))   && print -rl -- "  new settings, at their defaults:" "${(@)added/#/    }"
+  (( $#dropped )) && print -rl -- "  settings that no longer exist, removed (they are still in config.yaml.bak):" "${(@)dropped/#/    }"
+  print "  next: look through config.yaml, then pibox setup"
+  return 0
+}
+
+# Line editing of the template (array T), so its layout and comments stay as they are.
+# find_key <section> [key]: REPLY = line of "section:" or of "  key:", 0 if absent;
+# END = its last line (continuation lines of a multi-line value), SEC_END = the section's last value line.
+find_key() {
+  setopt local_options extended_glob
+  local sec=$1 key=${2:-} i n=$#T top=0
+  REPLY=0 END=0 SEC_END=0
+  for (( i = 1; i <= n; i++ )); do [[ "$T[i]" == "$sec:"(| *) ]] && { top=$i; break }; done
+  (( top )) || return 0
+  SEC_END=$top
+  for (( i = top + 1; i <= n; i++ )); do
+    [[ "$T[i]" == [^\ \#]* ]] && break                          # the next section
+    [[ "$T[i]" == \ ##[^\ \#]* ]] && SEC_END=$i                   # a value line (not blank, not a comment)
+  done
+  if [[ -z "$key" ]]; then
+    REPLY=$top; END=$top
+    for (( i = top + 1; i <= n; i++ )); do [[ "$T[i]" == \ ##[^\ \#]* ]] && END=$i || break; done
+    return 0
+  fi
+  for (( i = top + 1; i <= SEC_END; i++ )); do
+    [[ "$T[i]" == "  $key:"(| *) ]] || continue
+    REPLY=$i; END=$i
+    while (( END < n )) && [[ "$T[END+1]" == "   "*[^\ ]* && "$T[END+1]" != \ ##\#* ]]; do (( END++ )); done
+    return 0
+  done
+}
+
+render() {                                  # render <section> [key]: your value, as YAML lines for the template
+  local e=".[\"$1\"]"; [[ -n "${2:-}" ]] && e="${e}[\"$2\"]"
+  if [[ -n "${2:-}" ]]; then                # one line: maps and lists in flow style {…} […]
+    U="$CONFIG" yq -n "(load(strenv(U)) | ... comments=\"\") as \$u | {\"v\": \$u$e}
+      | (.v | select(tag == \"!!map\" or tag == \"!!seq\")) |= (... style=\"flow\")" | sed '1s/^v: //'
+  else                                      # a whole section's value (models): block style
+    U="$CONFIG" yq -n "(load(strenv(U)) | ... comments=\"\") as \$u | {\"v\": \$u$e}" | sed 1d
+  fi
+}
+
+put_value() {                               # put_value <section> [key]: your value into T
+  local sec=$1 key=${2:-} val line comment col
+  local -a match
+  local -a block
+  find_key $sec $key
+  if [[ -z "$key" ]]; then                  # models: the lines after "models:" up to the first comment
+    block=("${(@f)$(render $sec)}")
+    (( REPLY )) || { T+=("" "$sec:"); REPLY=$#T END=$#T }
+    T[REPLY+1,END]=("${block[@]}"); return
+  fi
+  val=$(render $sec $key)
+  if (( REPLY )); then
+    line=$T[REPLY]
+    if [[ "$line" =~ '^(  [^ #][^#]*[^ ])( +)(# .*)$' && "$match[1]" != *[\"\']* ]]; then   # keep the template's comment
+      col=$(( ${#match[1]} + ${#match[2]} )) comment=$match[3]
+      line="  $key: $val"; (( ${#line} < col )) && line="${(r:col:)line}" || line="$line "
+      T[REPLY,END]=("$line$comment")
+    else
+      T[REPLY,END]=("  $key: $val")
+    fi
+  elif (( SEC_END )); then                  # a key the template doesn't have (bridge): end of the section
+    T[SEC_END+1,SEC_END]=("  $key: $val")
+  else
+    T+=("" "$sec:" "  $key: $val")
+  fi
+}
+
+del_value() {                               # del_value <section> <key>: remove the key and its comment
+  setopt local_options extended_glob
+  local i
+  find_key $1 $2; (( REPLY )) || return 0
+  i=$REPLY; while (( i > 1 )) && [[ "$T[i-1]" == \ ##\#* ]]; do (( i-- )); done
+  T[i,END]=()
 }
 
 docker_plugins() {                          # Homebrew's compose/buildx are CLI plugins in its own folder
@@ -204,6 +334,7 @@ load_config() {                             # defaults, then config.yaml on top
     key="${line%%=*}"; eval "val=${line#*=}"
     [[ "$key" != *.* && -z "$val" ]] && (( ${keys[(I)$key.*]} )) && continue   # a section, all commented out
     [[ -n "${SETTING[$key]:-}" ]] || die "unknown setting $key in $CONFIG"
+    [[ -n "$val" ]] || continue                                                 # empty = the default
     [[ "$key" == pi.apt_packages ]] && val="${val//,/ }"
     [[ "$val" == true ]] && val=1; [[ "$val" == false ]] && val=0
     typeset -gx "${SETTING[$key]}=$val"

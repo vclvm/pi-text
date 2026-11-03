@@ -391,20 +391,21 @@ web policy or its own guard rails. `~/.pi-sandbox` is outside its reach (§6.2),
 everything runs from. Keep the clone anywhere you like; `pibox check` warns if it is inside the
 agent's folders, because the next `pibox init` would install whatever is in it.
 
-**Updating:** `git pull` in the clone, then `pibox init` again. It replaces the components, keeps your
-`config.yaml`, and lists template sections your file doesn't have yet (their defaults apply). Then
-`pibox setup` and `pibox up`.
+**Updating:** `git pull` in the clone, then `pibox init` again. It replaces the components and
+rebuilds `config.yaml` from the new template with your values in it (§6.5), so new settings and
+their explanations show up in your file. Then `pibox setup` and `pibox up`.
 
 ### 6.5 `config.yaml`
 
 **What:** the only file you edit. The template, [sandbox/config.yaml](../sandbox/config.yaml),
-documents every setting next to its default; `pibox init` copies it to `~/.pi-sandbox/config.yaml`
-with `chmod 600`, because it holds the router key and the repository token.
+lists every setting with its default value and an explanation of what it does; `pibox init` copies
+it to `~/.pi-sandbox/config.yaml` with `chmod 600`, because it holds the router key and the
+repository token.
 
 How to read it:
 
-- **Commented-out lines show the defaults**: uncomment a line only to change it. Lists are YAML
-  lists (`[a, b]` or one `- item` per line). Quote values YAML would read as something else:
+- **Every setting is there with its default value**: change what you need, leave the rest. An
+  empty value (`""`, `[]`) also means the default. Lists are YAML lists (`[a, b]` or one `- item` per line). Quote values YAML would read as something else:
   `"-"`, `"1.24"`, values starting with `@`, `*`, `&` or `{`.
 - `pibox` stops with an error on a setting it doesn't know, so a typo doesn't silently fall back to a
   default. `pibox check` also refuses the template's placeholders (`YOUR_KEY`, `YOUR_MODEL_ID`,
@@ -413,6 +414,21 @@ How to read it:
   `config.yaml` is newer than the generated files. `pibox config` prints the values in effect
   (secrets masked).
 
+**When the template changes** (`git pull`, then `pibox init`), `init` doesn't leave your file as it
+is and doesn't overwrite it either. It builds a new `config.yaml` from the new template and puts
+your values into it:
+
+- a value you changed (it differs from the default the template had when you got it) is kept;
+- a default you never changed follows the new template, so improved defaults reach you;
+- new settings appear with their defaults and explanations;
+- settings that no longer exist are removed; a `bridge` variable you added stays, one you deleted
+  stays deleted;
+- `init` lists all of this. The previous file is kept as `config.yaml.bak`: your own comments are
+  only there, the new file has the template's.
+
+`init` remembers the template your file was made from in `~/.pi-sandbox/.config-template.yaml`;
+that's how it tells your values from defaults. If nothing changed, `config.yaml` isn't touched.
+
 What the sections mean:
 
 | Section | Notes |
@@ -420,14 +436,14 @@ What the sections mean:
 | `folders` | Your projects and the vault. Absolute paths, no `~`. They are mounted into the VM and the agent's container **at the same path**, so a path the agent prints is the path you open on the Mac (§6.2) |
 | `bridge` | The bridge's environment, under the names of [bridge/README.md](../bridge/README.md) (`PI_TEXT_URL`, `PI_TEXT_KEY`, `TRACE`, …). Only the bridge container gets it. A map or list is passed as JSON, e.g. `UPSTREAM_EXTRA_BODY` |
 | `models` | The models Pi offers, each with its own `contextWindow` (Pi compacts the conversation before it fills up), `maxTokens` (the output limit of one reply: big `write`/`edit` calls need room), `reasoning` and `compat`. These are entries of Pi's `models.json` (§8.7) |
-| `network` | The bridge's and the proxy's ports inside the sandbox; `upstream_proxy`, the HTTP proxy that allowed requests go to after the sandbox's own filter, written as the VM sees it (empty: connect directly); `upstream_no_proxy`, hosts the bridge and image builds reach without it; the internal subnet |
+| `network` | `bridge_port` and `proxy_port`: ports of the sandbox's own two services, the bridge and the filtering proxy. They exist only on the internal Docker network (`http://bridge:8789`, `http://proxy:8080`), are not opened on the Mac or the LAN, and normally stay as they are. `upstream_proxy`: something else entirely, the proxy **your network** requires to reach the internet (a corporate proxy), if any; the bridge, the filtering proxy and image downloads go out through it. Written as the VM sees it; empty: connect directly. `upstream_no_proxy`: hosts reached without it. `sandbox_subnet`: the internal network's addresses |
 | `egress` | The agent's web policy (§8.6) |
 | `extensions` | Settings of the Pi extensions (§9) |
 | `repository` | Your artifact repository. `pibox setup` writes Maven's, Gradle's, npm's, pip's and Docker's settings from these values (§8.9). The agent's downloads leave the sandbox as plain HTTP requests (§4.6), so these are `http://` addresses |
 | `images`, `pi` | The images the sandbox is built from (JDK 17/21/25, Maven, Gradle, Docker CLI, Docker engine), the Pi version, the system tools in the agent's image, the default JDK, the container's limits |
 | `agent_docker` | The agent's own Docker engine and its isolation (§8.10) |
 | `vm` | Name and size of the Colima VM |
-| `mac` | Your user and group ids, detected automatically |
+| `mac` | Your user and group ids; empty: detected automatically |
 
 ### 6.6 Generate the configuration: `pibox setup`
 
@@ -1061,7 +1077,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 
 | Command | What it does |
 |---|---|
-| `init` | Install or update the components in `~/.pi-sandbox` from the repository; create `config.yaml` on the first run (§6.4) |
+| `init` | Install or update the components in `~/.pi-sandbox` from the repository; create `config.yaml`, or rebuild it from the newest template with your values (§6.4, §6.5) |
 | `check` | Prerequisites, `config.yaml`, placeholders, folders (§6.1) |
 | `setup` | Generate every configuration from `config.yaml` (§6.6) |
 | `config` | Print the settings in effect, secrets masked |

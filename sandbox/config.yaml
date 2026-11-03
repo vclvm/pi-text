@@ -1,144 +1,233 @@
-# ~/.pi-sandbox/config.yaml: the only file you edit (`pibox init` created it from the template in
-# the repository and never overwrites it). After a change run `pibox setup`: it generates everything
-# else from this file (.env for docker compose, the bridge's environment, Pi's model list, the package
-# managers' settings, the Colima config), then `pibox up`. A commented-out line shows the default.
-# Explained in docs/pi-setup.md §6.5.
+# ~/.pi-sandbox/config.yaml: the only file of pi-sandbox you edit.
+#
+#   pibox setup   generates every other configuration from this file (.env for docker compose, the
+#                 bridge's environment, Pi's model list, Maven/Gradle/npm/pip/Docker settings, the VM)
+#   pibox up      starts everything with those configurations
+#
+# Every setting below is shown with its default value. Change what you need; the rest can stay.
+# `pibox init` (after `git pull` in the repository) rebuilds this file from the newest template and
+# carries over every value you changed, so new settings and their explanations show up here too.
+# Your own comments are not carried over; the previous file is kept as config.yaml.bak.
+# More: docs/pi-setup.md §6.5.
+#
+# How the agent's traffic flows (both arrows go through the VM's network to the outside):
+#
+#   Pi ──► bridge (holds the API key) ─────────────────────► [upstream_proxy] ──► your model router
+#   Pi, git, mvn, npm, curl… ──► proxy (filters, asks you) ─► [upstream_proxy] ──► web, artifact repository
+#
+# The agent's container has no other way out: it is only on an internal network with these two.
 
-# ---- Folders the agent may use (absolute paths on the Mac) ----
+# ======================================================================================== folders
+# The only folders of your Mac the agent sees: absolute paths. Inside the container they have the
+# same paths as on the Mac. Both are writable for the agent, except <vault>/.obsidian (read-only).
+# Avoid ~/Documents and ~/Desktop: macOS protects them, and mounts of them behave unpredictably.
 folders:
+  # Your code: the agent works in subfolders of it (`cd ~/Projects/api && pibox run`)
   projects: /Users/you/Projects
+  # Your Obsidian vault: the agent can read and write notes
   vault: /Users/you/Notes/Main Vault
 
-# ---- The bridge's environment, passed as is: any setting from bridge/README.md, "Configuration" ----
+# ========================================================================================= bridge
+# The pi-text bridge: Pi talks to it, it talks to your model router and turns Pi's tool calls into
+# text the router accepts. These are its environment variables, passed to it as they are. Only the
+# bridge's container gets them; the agent never sees the key. Every variable the bridge knows is
+# in bridge/README.md, "Configuration". A map or list value is passed as JSON.
 bridge:
+  # Your router's OpenAI-compatible API: a base URL ending in /v1, or a full endpoint
+  # (…/chat/completions, …/responses)
   PI_TEXT_URL: https://router.example.com/v1
+  # Your router's API key, sent as "Authorization: Bearer <key>"
   PI_TEXT_KEY: YOUR_KEY
+  # A readable trace of every turn: "-" = into the bridge's log (`docker logs` of the bridge
+  # container), "" = off
   TRACE: "-"
-  # A map or a list is passed as JSON, e.g. for OpenRouter:
+  # Example: extra fields for every request to the router; for OpenRouter, pin the provider:
   # UPSTREAM_EXTRA_BODY: { provider: { only: [wafer/fp8], allow_fallbacks: false } }
 
-# ---- The models Pi offers, each with its own settings ----
-# Entries of Pi's models.json (bridge/README.md, "Configuring Pi"). Required: id, contextWindow, maxTokens.
-# Defaults: name "<id> (sandbox)", reasoning: false, input: [text], cost 0. compat changes the
-# provider's compat for this model only.
+# ========================================================================================= models
+# The models Pi offers you (`/model` in Pi). Each model has its own entry and its own limits.
+#   id             the model name exactly as your router expects it (forwarded unchanged)
+#   contextWindow  the model's context window in tokens: Pi compacts (summarizes) the conversation
+#                  before it fills up. Take the real value from your router
+#   maxTokens      the most tokens the model may write in ONE reply. A file the agent writes is part
+#                  of a reply, so too little cuts big write/edit calls off. Must fit into contextWindow
+# Optional:
+#   reasoning: true    for thinking models (gpt-oss, Qwen3 thinking…): Pi shows a thinking level
+#   name               shown in Pi; default "<id> (sandbox)"
+#   cost               prices per million tokens, for Pi's cost display; default 0
+#   compat             overrides of Pi's API options for this model only, e.g.
+#                      { supportsReasoningEffort: true } if the router accepts reasoning_effort
+# Any other field of Pi's models.json works too (bridge/README.md, "Configuring Pi").
 models:
   - id: YOUR_MODEL_ID
-    contextWindow: 32768      # the model's context window: Pi compacts the conversation before it fills up
-    maxTokens: 8192           # output limit of one reply: big write/edit calls need room
+    contextWindow: 32768
+    maxTokens: 8192
   # - id: YOUR_REASONING_MODEL_ID
   #   reasoning: true
   #   contextWindow: 131072
   #   maxTokens: 32768
   #   compat: { supportsReasoningEffort: true }
 
-# ---- Network ----
+# ======================================================================================== network
 network:
-  # Ports of the bridge and the filtering proxy inside the sandbox's networks
-  # bridge_port: 8789
-  # proxy_port: 8080
-  # Outgoing HTTP proxy, as seen from inside the VM; empty = connect directly.
-  # A proxy listening on the Mac's own 127.0.0.1:PORT is http://192.168.5.2:PORT from the VM.
+  # The port the bridge listens on. Only inside the sandbox's internal Docker network: Pi reaches
+  # it as http://bridge:<port>/v1. It is NOT opened on your Mac or your LAN and can't conflict
+  # with anything there; there is normally no reason to change it.
+  bridge_port: 8789
+
+  # The port of the filtering proxy (mitmproxy), also only inside the internal network. Every web
+  # request of the agent and its tools goes to http://proxy:<port>: it lets GET requests through
+  # after your approval (`pibox approve`) and refuses everything else (§8.6). Not opened on your
+  # Mac either; normally no reason to change it.
+  proxy_port: 8080
+
+  # NOT a part of the sandbox: the HTTP proxy YOUR network requires to reach the internet (a
+  # corporate proxy), if any. Bridge, filtering proxy, image builds and the VM's Docker send their
+  # outgoing traffic through it. "" = your network needs no proxy, connect directly.
+  # Format: http://host:port (http://user:password@host:port if it needs a login). It is used
+  # from inside the VM: a proxy that runs on your Mac itself (127.0.0.1:PORT) is
+  # http://192.168.5.2:PORT from there.
   upstream_proxy: ""
-  # Hosts the bridge and image builds reach directly, not through upstream_proxy
+
+  # Hosts reached directly although upstream_proxy is set, e.g. an artifact repository in your
+  # own network that the corporate proxy can't reach. A host also covers its subdomains.
   upstream_no_proxy: []
-  # The sandbox's internal network: change it if it overlaps with networks you need to reach
-  # sandbox_subnet: 172.30.0.0/24
 
-# ---- The agent's web policy (docs/pi-setup.md §8.6) ----
+  # The address range of the sandbox's internal Docker network. Change it only if it overlaps with
+  # a network you need (your LAN, VPN): its addresses would be unreachable from the sandbox.
+  sandbox_subnet: 172.30.0.0/24
+
+# ========================================================================================= egress
+# What the filtering proxy lets the agent fetch from the web (docs/pi-setup.md §8.6). Only GET and
+# HEAD ever pass; uploads (POST, PUT…) and encrypted tunnels are always refused. Every host in these
+# lists also covers its subdomains. `pibox log` shows every decision.
 egress:
-  # Hosts on private IPs the agent may still GET from: your package mirror
+  # Hosts on private addresses (LAN, VPN) the agent may still fetch from: your artifact repository.
+  # Every other private address is refused, so the agent can't reach your router, NAS, intranet.
   allow_private: [repo.example.com]
-  # Hosts that don't wait for your approval: the package mirror
+  # Hosts allowed without asking you each time: your artifact repository, so builds don't wait.
+  # Every other request waits until you allow it in `pibox approve`.
   no_approval: [repo.example.com]
-  # If not empty, ONLY these hosts are reachable
+  # If not empty, ONLY these hosts are reachable; everything else is refused without asking.
   allow_only: []
-  # Always refused
+  # Always refused, even if you would approve: services made for uploading data.
   deny: [pastebin.com, transfer.sh, 0x0.st]
-  # Allowed ports; add your repository's ports if they are not 80/443
-  # ports: [80, 443]
+  # Allowed ports. Add your repository's ports if they are not 80/443 (e.g. 8081, 8082).
+  ports: [80, 443]
 
-# ---- Pi extensions (docs/pi-setup.md §9) ----
+# ===================================================================================== extensions
+# Pi extensions of the sandbox (docs/pi-setup.md §9).
 extensions:
-  # bash_approval: risky
-  # web_plain_http: true
-  # searxng: ""
-  # fetch_max_chars: 20000
+  # Which bash commands of the agent need your OK in Pi:
+  #   risky  network tools, rm -rf, sudo/chmod, git push, paths in your home or /etc…
+  #   all    every command
+  #   off    none (the container's limits still apply)
+  bash_approval: risky
+  # The web tools send https:// pages to the proxy as plain http:// requests, so the proxy can see
+  # and check them (it refuses encrypted tunnels). false = they use tunnels and get refused.
+  web_plain_http: true
+  # The web_search tool: URL of a SearXNG instance the proxy can reach; "" = DuckDuckGo
+  searxng: ""
+  # The most characters web_fetch returns of one page (the rest is cut off)
+  fetch_max_chars: 20000
 
-# ---- Your artifact repository (Artifactory, Nexus, ...) ----
-# The agent downloads everything through the filtering proxy as plain HTTP, so use http:// URLs.
-# pibox writes Maven's settings.xml, Gradle's init script, .npmrc, pip.conf and Docker's
-# config from these values (docs/pi-setup.md §8.9). The agent can read them: use a READ-ONLY token.
+# ===================================================================================== repository
+# Your artifact repository (Artifactory, Nexus…). The agent downloads its dependencies from it:
+# pibox writes Maven's settings.xml, a Gradle init script, .npmrc, pip.conf and Docker's settings
+# from these values (docs/pi-setup.md §8.9). Everything goes through the filtering proxy, which only
+# sees plain HTTP, so use http:// URLs. Add the repository's host to egress.allow_private (if it's
+# in your network) and egress.no_approval. "" = the public servers are used.
 repository:
+  # Login, if the repository needs one. The agent can read these settings: use a READ-ONLY token.
   user: ""
   token: ""
-  # Maven repository (a virtual repo that proxies Maven Central etc.); Gradle uses it too
+  # A Maven repository that proxies Maven Central (and whatever else you need); Gradle uses it too.
+  # "" = Maven Central, plugins.gradle.org
   maven: http://repo.example.com/artifactory/maven-remote
-  # Gradle plugins (a remote repo of https://plugins.gradle.org/m2); empty = maven
+  # A repository that proxies https://plugins.gradle.org/m2; "" = the maven URL above
   gradle_plugins: ""
-  # npm registry, Python package index (+ its host name for pip)
+  # npm registry; "" = registry.npmjs.org
   npm: http://repo.example.com/artifactory/api/npm/npm-remote/
+  # Python package index (the URL ending in /simple); "" = pypi.org
   pip: http://repo.example.com/artifactory/api/pypi/pypi-remote/simple
-  pip_trusted_host: repo.example.com
-  # Docker registry for the agent's own Docker (host[:port], plain HTTP), the mirror used for
-  # Docker Hub names (postgres:16), and the prefix Testcontainers puts before Docker Hub names
+  # pip refuses plain http:// unless the host is trusted; "" = the host of the pip URL
+  pip_trusted_host: ""
+  # For the agent's own Docker (agent_docker): your Docker registry as host:port (plain HTTP)…
   docker_registry: repo.example.com:8082
+  # …the mirror it pulls Docker Hub images through when the agent says `docker pull postgres:16`…
   docker_mirror: http://repo.example.com:8082
+  # …and the prefix Testcontainers puts before Docker Hub image names
   docker_image_prefix: repo.example.com:8082/
-  # Debian package mirrors for the images, http:// addresses; empty = the official servers
+  # Debian package mirrors for building the images (http://…/debian, http://…/debian-security);
+  # "" = deb.debian.org
   apt_debian: ""
   apt_security: ""
 
-# ---- Images the sandbox is built from ----
-# Docker Hub names, or the same images through your registry mirror,
-# e.g. repo.example.com:8082/library/node:24-bookworm-slim. They are pulled by the VM's Docker.
+# ========================================================================================= images
+# The images the sandbox is built from. They are pulled by the VM's Docker, so they can be Docker
+# Hub names or the same images through your registry, e.g.
+# repo.example.com:8082/library/node:24-bookworm-slim.
 images:
-  # node: node:24-bookworm-slim
-  # python: python:3.12-slim
-  # mitmproxy: mitmproxy/mitmproxy:12.3.1
-  # jdk17: eclipse-temurin:17-jdk
-  # jdk21: eclipse-temurin:21-jdk
-  # jdk25: eclipse-temurin:25-jdk
-  # maven: maven:3-eclipse-temurin-21
-  # gradle: gradle:jdk21
-  # docker_cli: docker:29-cli
-  # dind: docker:29-dind
+  node: node:24-bookworm-slim              # base of the agent's image
+  python: python:3.12-slim                 # base of the bridge's image
+  mitmproxy: mitmproxy/mitmproxy:12.3.1    # the filtering proxy
+  jdk17: eclipse-temurin:17-jdk            # JDKs copied into the agent's image
+  jdk21: eclipse-temurin:21-jdk
+  jdk25: eclipse-temurin:25-jdk
+  maven: maven:3-eclipse-temurin-21        # Maven and Gradle are copied from these
+  gradle: gradle:jdk21
+  docker_cli: docker:29-cli                # docker CLI and compose for the agent
+  dind: docker:29-dind                     # the agent's own Docker engine
 
-# ---- The agent's image and container ----
+# ============================================================================================= pi
+# The agent's image and container
 pi:
-  # Pi version (npm spec), the system packages baked into the image, the default JDK
-  # package: "@earendil-works/pi-coding-agent"
-  # apt_packages: [bash, ca-certificates, curl, git, ripgrep, jq, httpie, unzip, zip, less, procps,
-  #                build-essential, python3, python3-dev, python3-venv, python3-pip]
-  # java_default: 21
-  # Limits of the agent's container
-  # memory: 8g
-  # cpus: 4
-  # pids: 4096
+  # Pi's npm package, optionally with a version: "@earendil-works/pi-coding-agent@1.5.0"
+  package: "@earendil-works/pi-coding-agent"
+  # Debian packages installed into the agent's image: the tools it can use
+  apt_packages: [bash, ca-certificates, curl, git, ripgrep, jq, httpie, unzip, zip, less, procps,
+                 build-essential, python3, python3-dev, python3-venv, python3-pip]
+  # The JDK on PATH: 17, 21 or 25 (`jdk 17 mvn …` runs one command with another)
+  java_default: 21
+  # Limits of the agent's container: memory, CPUs, number of processes
+  memory: 8g
+  cpus: 4
+  pids: 4096
 
-# ---- The agent's own Docker engine (docs/pi-setup.md §8.10) ----
+# =================================================================================== agent_docker
+# The agent's own Docker engine, so it can use docker, Docker Compose and Testcontainers
+# (docs/pi-setup.md §8.10). It runs in its own container, on the internal network only.
 agent_docker:
-  # sysbox: nested containers without a privileged container; needs sysbox_deb_url
-  # privileged: works everywhere, but the agent can then become root in the VM
-  # off: no Docker for the agent
+  # sysbox      the engine runs without a privileged container: safest; needs sysbox_deb_url
+  # privileged  works without sysbox, but the agent can then become root in the VM (not on your Mac)
+  # off         no Docker for the agent
   mode: sysbox
-  # The sysbox-ce .deb for the VM (Apple Silicon: arm64), e.g. on your mirror of the GitHub releases:
-  # http://repo.example.com/artifactory/github/nestybox/sysbox/releases/download/v0.6.7/sysbox-ce_0.6.7-0.linux_arm64.deb
+  # Download URL of the sysbox-ce .deb for the VM (Apple Silicon: arm64), e.g. your mirror of
+  # https://github.com/nestybox/sysbox/releases/download/v0.6.7/sysbox-ce_0.6.7-0.linux_arm64.deb
   # `pibox up` installs it into the VM once.
   sysbox_deb_url: ""
-  # Address pool of the agent's Docker: change it if it overlaps with networks you need to reach
-  # address_pool: 172.31.0.0/16
-  # min_api_version: "1.24"
+  # The addresses of the networks the agent's containers get. Change it only if it overlaps with
+  # a network you need (LAN, VPN).
+  address_pool: 172.31.0.0/16
+  # The oldest Docker API version the engine accepts; 1.24 lets old clients (Testcontainers 1.x) work
+  min_api_version: "1.24"
 
-# ---- The Colima VM ----
+# ============================================================================================= vm
+# The Colima VM everything runs in. It sees only the two folders above and ~/.pi-sandbox.
+# A change takes effect after `pibox setup` and `pibox down --vm && pibox up`.
 vm:
-  # profile: pi
-  # cpus: 6
-  # memory: 12
-  # disk: 100
-  # disk_image: ""
+  # Colima's profile name: `colima list` shows it, the Docker context is colima-<profile>
+  profile: pi
+  # CPUs, memory in GB, disk in GB (the disk can only grow)
+  cpus: 6
+  memory: 12
+  disk: 100
+  # A Colima disk image file to start from, if Colima can't download its own; "" = Colima's
+  disk_image: ""
 
-# ---- The Mac ----
+# ============================================================================================ mac
+# Your user and group id on the Mac: files the agent creates in your folders belong to you.
+# "" = detected (`id -u`, `id -g`); set them only if pibox runs as a different user.
 mac:
-  # Your user and group ids; detected automatically
-  # uid: 501
-  # gid: 20
+  uid: ""
+  gid: ""

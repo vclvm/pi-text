@@ -57,7 +57,7 @@ After a session: `pibox review` (git hooks, risky git config, `.obsidian` change
 
 | Command | What it does |
 |---|---|
-| `pibox init` | Install or update the components in `~/.pi-sandbox` from the repository; creates `config.yaml` from the template on the first run, never overwrites it |
+| `pibox init` | Install or update the components in `~/.pi-sandbox` from the repository; creates `config.yaml` from the template; later runs rebuild it from the newest template and carry over every value you changed (previous file: `config.yaml.bak`) |
 | `pibox check` | Check the prerequisites and `config.yaml` |
 | `pibox setup` | (Re)generate every configuration from `config.yaml`: `.env` for Compose, the bridge's environment, Pi's `models.json`, Maven/Gradle/npm/pip/Docker settings, the Colima VM |
 | `pibox config` | Show the settings in effect, secrets masked |
@@ -76,8 +76,9 @@ After changing `config.yaml`: `pibox setup`, then `pibox up`. After `git pull` i
 
 ## Configuration
 
-[sandbox/config.yaml](sandbox/config.yaml) is the template; every setting is documented next to its
-default. Each model gets its own limits:
+[sandbox/config.yaml](sandbox/config.yaml) is the template: every setting with its default and an
+explanation. After `git pull`, `pibox init` puts your values into the new template, so new settings
+show up in your file. Each model gets its own limits:
 
 ```yaml
 models:
