@@ -906,10 +906,11 @@ apt_sources() {                             # your Debian remotes: generated/apt
       host=${${url#*://}%/}
       print -r -- "machine $host login $user password $pass" >>"$dir/auth.conf"
     fi
-    if [[ "$dist" == '<DISTRIBUTION>' ]]; then
+    if [[ "$dist" == '<'*'>' ]]; then                              # <DISTRIBUTION>, <DIST>, …
       if [[ "$url" == *security* ]]; then dist='@CODENAME@-security'; sec=1; else dist='@CODENAME@ @CODENAME@-updates'; fi
     fi
-    t=(${t[3,-1]}); [[ $#t -eq 0 || "${t[*]}" == '<COMPONENT>' ]] && t=(main)
+    t=(${t[3,-1]}); t=(${t:#<*>})                                  # <COMPONENT>, <COMPONENTS>, …
+    (( $#t )) || t=(main)
     print -r -- "Types: deb
 URIs: $url
 Suites: $dist
