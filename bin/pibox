@@ -361,6 +361,19 @@ load_config() {                             # defaults, then config.yaml on top
   done
 
   DOCKER_CONTEXT="${DOCKER_CONTEXT:-colima-$VM_PROFILE}"
+  # Host lists: "repo.corp", ".corp" and "*.corp" all mean the domain and its subdomains. The
+  # programs reading them disagree on "*." and ".", so they all get the plain form.
+  local v h; local -a hosts
+  for v in UPSTREAM_NO_PROXY EGRESS_ALLOW_PRIVATE EGRESS_NO_APPROVAL EGRESS_ALLOW_ONLY EGRESS_DENY; do
+    hosts=()
+    for h in ${(s:,:)${(P)v}}; do
+      h="${${h#\*.}#.}"
+      [[ "$h" != *[*?/:\ ]* && -n "$h" ]] ||
+        die "${(k)SETTING[(r)$v]}: $h: write a host or domain (repo.corp, *.corp); no other patterns, ports or URLs"
+      hosts+=("$h")
+    done
+    typeset -gx "$v=${(j:,:)hosts}"
+  done
   [[ "$MAC_PROXY_PORT" == <1-65535> ]] || [[ -z "$MAC_PROXY_PORT" ]] ||
     die "network.mac_proxy_port: a port number, or \"\" for none"
   # The proxy on the Mac, as the VM and its containers reach it: Colima's address of the Mac

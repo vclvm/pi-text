@@ -407,6 +407,11 @@ How to read it:
 - **Every setting is there with its default value**: change what you need, leave the rest. An
   empty value (`""`, `[]`) also means the default. Lists are YAML lists (`[a, b]` or one `- item` per line). Quote values YAML would read as something else:
   `"-"`, `"1.24"`, values starting with `@`, `*`, `&` or `{`.
+- **Host lists** (`network.upstream_no_proxy`, the `egress` lists): a name covers its subdomains, and
+  `localcorp`, `.localcorp` and `*.localcorp` mean the same, all of `localcorp` and everything under
+  it. `pibox setup` writes the plain form, because the programs reading these lists (curl, pip, npm,
+  the bridge's httpx, Docker, the egress policy) disagree on `*.` and `.`. Other patterns, ports and
+  URLs are refused.
 - `pibox` stops with an error on a setting it doesn't know, so a typo doesn't silently fall back to a
   default. `pibox check` also refuses the template's placeholders (`YOUR_KEY`, `YOUR_MODEL_ID`,
   `/Users/you`) and folders that don't exist.

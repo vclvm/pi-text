@@ -89,7 +89,8 @@ network:
   mac_proxy_port: ""
 
   # Hosts reached directly although mac_proxy_port is set, e.g. an artifact repository in your
-  # network that the proxy can't reach. A host also covers its subdomains.
+  # network that the proxy can't reach. A name also covers its subdomains: localcorp, .localcorp
+  # and *.localcorp all mean localcorp and everything under it. No other patterns, ports or URLs.
   upstream_no_proxy: []
 
   # The address range of the sandbox's internal Docker network. Change it only if it overlaps with
@@ -99,7 +100,8 @@ network:
 # ========================================================================================= egress
 # What the filtering proxy lets the agent fetch from the web (docs/pi-setup.md §8.6). Only GET and
 # HEAD ever pass; uploads (POST, PUT…) and encrypted tunnels are always refused. Every host in these
-# lists also covers its subdomains. `pibox log` shows every decision.
+# lists also covers its subdomains (repo.corp, .corp and *.corp all work the same way; no other
+# patterns). `pibox log` shows every decision.
 egress:
   # Hosts on private addresses (LAN, VPN) the agent may still fetch from: your artifact repository.
   # Every other private address is refused, so the agent can't reach your router, NAS, intranet.
