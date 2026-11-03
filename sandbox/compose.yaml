@@ -1,0 +1,183 @@
+name: pi-sandbox
+# pi-sandbox: the agent, the bridge, the filtering proxy and the agent's Docker engine (docs/pi-setup.md §8).
+# Installed into ~/.pi-sandbox by `pibox init`; don't edit it there, `pibox init` replaces it. All values
+# come from .env next to it, which `pibox setup` generates from config.yaml, like the generated/ files
+# used below. Start it with `pibox up`. To add or change a service, use compose.override.yaml.
+
+x-build-proxy: &build-proxy           # only for downloads while images are built
+  HTTP_PROXY: ${UPSTREAM_PROXY:-}
+  HTTPS_PROXY: ${UPSTREAM_PROXY:-}
+  http_proxy: ${UPSTREAM_PROXY:-}
+  https_proxy: ${UPSTREAM_PROXY:-}
+  NO_PROXY: ${UPSTREAM_NO_PROXY:-}
+  no_proxy: ${UPSTREAM_NO_PROXY:-}
+
+networks:
+  sandbox:
+    internal: true          # no gateway: containers here cannot reach the internet, LAN or host
+    ipam:
+      config: [{ subnet: "${SANDBOX_SUBNET:-172.30.0.0/24}" }]
+  egress: {}
+
+volumes:
+  pi-home: {}               # sessions and Pi state, inside the VM only
+  pi-m2: {}                 # build caches: Maven, Gradle, npm, pip; kept between runs
+  pi-gradle: {}
+  pi-npm: {}
+  pi-cache: {}
+  pi-docker: {}             # docker CLI state (buildx)
+  docker-data: {}           # images and containers of the agent's Docker engine
+
+services:
+  bridge:
+    build:
+      context: ./bridge
+      args:
+        <<: *build-proxy
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    env_file: generated/bridge.env           # the bridge section of config.yaml, and BRIDGE_PORT
+    environment:
+      HTTP_PROXY: ${UPSTREAM_PROXY:-}        # empty = direct
+      HTTPS_PROXY: ${UPSTREAM_PROXY:-}
+      NO_PROXY: ${UPSTREAM_NO_PROXY:-}
+    networks: [sandbox, egress]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  proxy:
+    image: ${MITMPROXY_IMAGE:-mitmproxy/mitmproxy:12.3.1}
+    # Give the console a terminal size (docker attach resizes it later), then start it as the
+    # unprivileged mitmproxy user. With UPSTREAM_PROXY set, allowed requests are forwarded there.
+    # stream_large_bodies: big downloads (images, archives) pass through instead of being buffered.
+    command:
+      - sh
+      - -c
+      - >-
+        stty cols 160 rows 48
+        && exec env HOME=/home/mitmproxy gosu mitmproxy
+        mitmproxy --listen-port $${PROXY_PORT:-8080} --set connection_strategy=lazy
+        --set stream_large_bodies=1m
+        $${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY}
+        -s /addons/egress_policy.py
+    environment:
+      EGRESS_ALLOW_ONLY: ${EGRESS_ALLOW_ONLY:-}
+      EGRESS_DENY: ${EGRESS_DENY:-}
+      EGRESS_ALLOW_PRIVATE: ${EGRESS_ALLOW_PRIVATE:-}
+      EGRESS_NO_APPROVAL: ${EGRESS_NO_APPROVAL:-}
+      EGRESS_PORTS: ${EGRESS_PORTS:-80,443}
+      UPSTREAM_PROXY: ${UPSTREAM_PROXY:-}
+      UPSTREAM_NO_PROXY: ${UPSTREAM_NO_PROXY:-}
+      PROXY_PORT: ${PROXY_PORT:-8080}
+    volumes:
+      - ./addons:/addons:ro
+    networks:
+      sandbox: { ipv4_address: "${SANDBOX_PROXY_IP:-172.30.0.10}" }   # fixed: containers inside the agent's Docker use it
+      egress: {}
+    stdin_open: true                         # console UI: approve with `docker attach`
+    tty: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]   # the image's entrypoint drops to user mitmproxy
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  docker:                                    # the agent's own Docker engine (agent_docker.mode)
+    image: ${DIND_IMAGE:-docker:29-dind}
+    profiles: [docker]
+    runtime: ${DIND_RUNTIME:-sysbox-runc}    # sysbox: nested containers without a privileged container
+    privileged: ${DIND_PRIVILEGED:-false}
+    command: ["--tls=false"]                 # explicit: plain TCP without TLS, see the network below
+    environment:
+      DOCKER_TLS_CERTDIR: ""                 # plain tcp://docker:2375, reachable only on the internal network
+      DOCKER_MIN_API_VERSION: ${DIND_MIN_API_VERSION:-1.24}   # older clients, e.g. Testcontainers 1.x, still work
+    volumes:
+      - docker-data:/var/lib/docker
+      - ./generated/c/daemon.json:/etc/docker/daemon.json:ro   # registry mirror, proxy, address pools
+    networks: [sandbox]                      # ONLY the internal network: its containers can't get out either
+    depends_on: [proxy]
+    restart: unless-stopped
+
+  pi:
+    build:
+      context: .
+      dockerfile: Dockerfile.pi
+      args:
+        <<: *build-proxy
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-bookworm-slim}
+        JDK17_IMAGE: ${JDK17_IMAGE:-eclipse-temurin:17-jdk}
+        JDK21_IMAGE: ${JDK21_IMAGE:-eclipse-temurin:21-jdk}
+        JDK25_IMAGE: ${JDK25_IMAGE:-eclipse-temurin:25-jdk}
+        JAVA_DEFAULT: ${JAVA_DEFAULT:-21}
+        MAVEN_IMAGE: ${MAVEN_IMAGE:-maven:3-eclipse-temurin-21}
+        GRADLE_IMAGE: ${GRADLE_IMAGE:-gradle:jdk21}
+        DOCKER_CLI_IMAGE: ${DOCKER_CLI_IMAGE:-docker:29-cli}
+        APT_DEBIAN: ${APT_DEBIAN:-}
+        APT_SECURITY: ${APT_SECURITY:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+        PI_PACKAGE: ${PI_PACKAGE:-@earendil-works/pi-coding-agent}
+        PI_APT_PACKAGES: ${PI_APT_PACKAGES:-bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip}
+        UID: ${HOST_UID:-501}
+        GID: ${HOST_GID:-20}
+    depends_on:
+      bridge: { condition: service_started }
+      proxy: { condition: service_started }
+      docker: { condition: service_started, required: false }
+    networks: [sandbox]                      # ONLY the internal network
+    stdin_open: true
+    tty: true
+    working_dir: ${PROJECTS_DIR:?run pibox setup, it generates .env from config.yaml}
+    environment:
+      http_proxy: http://proxy:${PROXY_PORT:-8080}
+      HTTP_PROXY: http://proxy:${PROXY_PORT:-8080}
+      https_proxy: http://proxy:${PROXY_PORT:-8080}
+      HTTPS_PROXY: http://proxy:${PROXY_PORT:-8080}
+      no_proxy: bridge,docker,localhost,127.0.0.1
+      NO_PROXY: bridge,docker,localhost,127.0.0.1
+      NODE_USE_ENV_PROXY: "1"                # Node >= 24: fetch() in agent scripts honours the proxy vars
+      # Package managers: their configuration is generated from config.yaml into generated/c (docs/pi-setup.md §8.9)
+      NPM_CONFIG_USERCONFIG: /home/pi/.config/pi-sandbox/npmrc
+      PIP_CONFIG_FILE: /home/pi/.config/pi-sandbox/pip.conf
+      COREPACK_NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+      MVNW_REPOURL: ${MAVEN_REPO_URL:-}      # the Maven wrapper downloads Maven from here
+      # The agent's Docker engine, and Testcontainers pulling images through your registry:
+      DOCKER_HOST: ${PI_DOCKER_HOST:-}
+      TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX: ${DOCKER_IMAGE_PREFIX:-}
+      # Pi extensions (docs/pi-setup.md §9):
+      PI_BASH_APPROVAL: ${PI_BASH_APPROVAL:-risky}
+      PI_WEB_PLAIN_HTTP: ${PI_WEB_PLAIN_HTTP:-1}   # web.ts: send https:// pages as plain http:// requests
+      WEB_SEARCH_SEARXNG: ${WEB_SEARCH_SEARXNG:-}
+      WEB_FETCH_MAX_CHARS: ${WEB_FETCH_MAX_CHARS:-20000}
+      # Folders the file tools may touch (sandbox-guard.ts):
+      PI_SANDBOX_ROOTS: ${PROJECTS_DIR}:${VAULT_DIR:?run pibox setup, it generates .env from config.yaml}
+      PI_WEB_PROXY: http://proxy:${PROXY_PORT:-8080}
+    volumes:
+      # Same paths as on the Mac, so paths in notes, logs and Pi sessions mean the same everywhere.
+      - ${PROJECTS_DIR}:${PROJECTS_DIR}
+      - ${VAULT_DIR}:${VAULT_DIR}
+      - ${VAULT_DIR}/.obsidian:${VAULT_DIR}/.obsidian:ro   # Obsidian config and plugins: read-only
+      - pi-home:/home/pi/.pi/agent
+      - ./agent/models.json:/home/pi/.pi/agent/models.json:ro
+      - ./agent/settings.json:/home/pi/.pi/agent/settings.json:ro
+      - ./extensions:/home/pi/.pi/agent/extensions:ro
+      # Build caches (writable) and the generated tool settings on top of them (read-only):
+      - pi-m2:/home/pi/.m2
+      - pi-gradle:/home/pi/.gradle
+      - pi-npm:/home/pi/.npm
+      - pi-cache:/home/pi/.cache
+      - pi-docker:/home/pi/.docker
+      - ./generated/c:/home/pi/.config/pi-sandbox:ro
+      - ./generated/c/settings.xml:/home/pi/.m2/settings.xml:ro
+      - ./generated/c/toolchains.xml:/home/pi/.m2/toolchains.xml:ro
+      - ./generated/c/gradle.properties:/home/pi/.gradle/gradle.properties:ro
+      - ./generated/c/init.gradle:/home/pi/.gradle/init.d/pi-sandbox.gradle:ro
+      - ./generated/c/docker-config.json:/home/pi/.docker/config.json:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: ${PI_PIDS:-4096}
+    mem_limit: ${PI_MEMORY:-8g}
+    cpus: ${PI_CPUS:-4}

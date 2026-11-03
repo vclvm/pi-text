@@ -1,0 +1,144 @@
+# ~/.pi-sandbox/config.yaml: the only file you edit (`pibox init` created it from the template in
+# the repository and never overwrites it). After a change run `pibox setup`: it generates everything
+# else from this file (.env for docker compose, the bridge's environment, Pi's model list, the package
+# managers' settings, the Colima config), then `pibox up`. A commented-out line shows the default.
+# Explained in docs/pi-setup.md §6.5.
+
+# ---- Folders the agent may use (absolute paths on the Mac) ----
+folders:
+  projects: /Users/you/Projects
+  vault: /Users/you/Notes/Main Vault
+
+# ---- The bridge's environment, passed as is: any setting from bridge/README.md, "Configuration" ----
+bridge:
+  PI_TEXT_URL: https://router.example.com/v1
+  PI_TEXT_KEY: YOUR_KEY
+  TRACE: "-"
+  # A map or a list is passed as JSON, e.g. for OpenRouter:
+  # UPSTREAM_EXTRA_BODY: { provider: { only: [wafer/fp8], allow_fallbacks: false } }
+
+# ---- The models Pi offers, each with its own settings ----
+# Entries of Pi's models.json (bridge/README.md, "Configuring Pi"). Required: id, contextWindow, maxTokens.
+# Defaults: name "<id> (sandbox)", reasoning: false, input: [text], cost 0. compat changes the
+# provider's compat for this model only.
+models:
+  - id: YOUR_MODEL_ID
+    contextWindow: 32768      # the model's context window: Pi compacts the conversation before it fills up
+    maxTokens: 8192           # output limit of one reply: big write/edit calls need room
+  # - id: YOUR_REASONING_MODEL_ID
+  #   reasoning: true
+  #   contextWindow: 131072
+  #   maxTokens: 32768
+  #   compat: { supportsReasoningEffort: true }
+
+# ---- Network ----
+network:
+  # Ports of the bridge and the filtering proxy inside the sandbox's networks
+  # bridge_port: 8789
+  # proxy_port: 8080
+  # Outgoing HTTP proxy, as seen from inside the VM; empty = connect directly.
+  # A proxy listening on the Mac's own 127.0.0.1:PORT is http://192.168.5.2:PORT from the VM.
+  upstream_proxy: ""
+  # Hosts the bridge and image builds reach directly, not through upstream_proxy
+  upstream_no_proxy: []
+  # The sandbox's internal network: change it if it overlaps with networks you need to reach
+  # sandbox_subnet: 172.30.0.0/24
+
+# ---- The agent's web policy (docs/pi-setup.md §8.6) ----
+egress:
+  # Hosts on private IPs the agent may still GET from: your package mirror
+  allow_private: [repo.example.com]
+  # Hosts that don't wait for your approval: the package mirror
+  no_approval: [repo.example.com]
+  # If not empty, ONLY these hosts are reachable
+  allow_only: []
+  # Always refused
+  deny: [pastebin.com, transfer.sh, 0x0.st]
+  # Allowed ports; add your repository's ports if they are not 80/443
+  # ports: [80, 443]
+
+# ---- Pi extensions (docs/pi-setup.md §9) ----
+extensions:
+  # bash_approval: risky
+  # web_plain_http: true
+  # searxng: ""
+  # fetch_max_chars: 20000
+
+# ---- Your artifact repository (Artifactory, Nexus, ...) ----
+# The agent downloads everything through the filtering proxy as plain HTTP, so use http:// URLs.
+# pibox writes Maven's settings.xml, Gradle's init script, .npmrc, pip.conf and Docker's
+# config from these values (docs/pi-setup.md §8.9). The agent can read them: use a READ-ONLY token.
+repository:
+  user: ""
+  token: ""
+  # Maven repository (a virtual repo that proxies Maven Central etc.); Gradle uses it too
+  maven: http://repo.example.com/artifactory/maven-remote
+  # Gradle plugins (a remote repo of https://plugins.gradle.org/m2); empty = maven
+  gradle_plugins: ""
+  # npm registry, Python package index (+ its host name for pip)
+  npm: http://repo.example.com/artifactory/api/npm/npm-remote/
+  pip: http://repo.example.com/artifactory/api/pypi/pypi-remote/simple
+  pip_trusted_host: repo.example.com
+  # Docker registry for the agent's own Docker (host[:port], plain HTTP), the mirror used for
+  # Docker Hub names (postgres:16), and the prefix Testcontainers puts before Docker Hub names
+  docker_registry: repo.example.com:8082
+  docker_mirror: http://repo.example.com:8082
+  docker_image_prefix: repo.example.com:8082/
+  # Debian package mirrors for the images, http:// addresses; empty = the official servers
+  apt_debian: ""
+  apt_security: ""
+
+# ---- Images the sandbox is built from ----
+# Docker Hub names, or the same images through your registry mirror,
+# e.g. repo.example.com:8082/library/node:24-bookworm-slim. They are pulled by the VM's Docker.
+images:
+  # node: node:24-bookworm-slim
+  # python: python:3.12-slim
+  # mitmproxy: mitmproxy/mitmproxy:12.3.1
+  # jdk17: eclipse-temurin:17-jdk
+  # jdk21: eclipse-temurin:21-jdk
+  # jdk25: eclipse-temurin:25-jdk
+  # maven: maven:3-eclipse-temurin-21
+  # gradle: gradle:jdk21
+  # docker_cli: docker:29-cli
+  # dind: docker:29-dind
+
+# ---- The agent's image and container ----
+pi:
+  # Pi version (npm spec), the system packages baked into the image, the default JDK
+  # package: "@earendil-works/pi-coding-agent"
+  # apt_packages: [bash, ca-certificates, curl, git, ripgrep, jq, httpie, unzip, zip, less, procps,
+  #                build-essential, python3, python3-dev, python3-venv, python3-pip]
+  # java_default: 21
+  # Limits of the agent's container
+  # memory: 8g
+  # cpus: 4
+  # pids: 4096
+
+# ---- The agent's own Docker engine (docs/pi-setup.md §8.10) ----
+agent_docker:
+  # sysbox: nested containers without a privileged container; needs sysbox_deb_url
+  # privileged: works everywhere, but the agent can then become root in the VM
+  # off: no Docker for the agent
+  mode: sysbox
+  # The sysbox-ce .deb for the VM (Apple Silicon: arm64), e.g. on your mirror of the GitHub releases:
+  # http://repo.example.com/artifactory/github/nestybox/sysbox/releases/download/v0.6.7/sysbox-ce_0.6.7-0.linux_arm64.deb
+  # `pibox up` installs it into the VM once.
+  sysbox_deb_url: ""
+  # Address pool of the agent's Docker: change it if it overlaps with networks you need to reach
+  # address_pool: 172.31.0.0/16
+  # min_api_version: "1.24"
+
+# ---- The Colima VM ----
+vm:
+  # profile: pi
+  # cpus: 6
+  # memory: 12
+  # disk: 100
+  # disk_image: ""
+
+# ---- The Mac ----
+mac:
+  # Your user and group ids; detected automatically
+  # uid: 501
+  # gid: 20

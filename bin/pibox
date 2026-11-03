@@ -1,0 +1,622 @@
+#!/bin/zsh
+# pibox: installs, configures and runs pi-sandbox, the isolated setup for the Pi coding agent
+# (docs/pi-setup.md). All settings live in ~/.pi-sandbox/config.yaml.
+#   pibox help      lists the commands
+setopt err_exit no_unset pipe_fail
+
+SELF="${0:A}"                               # this script; $0 means the function name inside functions
+SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
+CONFIG="$SB/config.yaml"
+die()  { print -u2 "pibox: $*"; exit 1 }
+warn() { print -u2 "pibox: warning: $*" }
+have() { (( $+commands[$1] )) }
+
+usage() {
+  print "pibox <command>      (settings: $CONFIG)
+
+Install and configure:
+  init           install or update ~/.pi-sandbox from the repository; creates config.yaml on first run
+  check          check the prerequisites and config.yaml
+  setup          (re)generate every configuration from config.yaml
+  config         show the settings in effect (secrets masked)
+
+Run:
+  up             start the VM, build the images, start bridge, proxy and the agent's Docker engine
+  run [args]     Pi in a fresh container, in the current folder (args go to pi)
+  approve        the approval console for the agent's web requests (detach: Ctrl-P Ctrl-Q)
+  log            follow the web journal
+  shell          a bash shell in the agent's container, without Pi
+  status         the VM and the containers
+  down [--vm]    stop the containers (--vm: the Colima VM too)
+
+Check:
+  verify         try everything the agent must not be able to do
+  review         git hooks, risky git config, recent .obsidian changes in your folders"
+}
+
+# ---------------------------------------------------------------- init (runs from the repository)
+# Copies the components into ~/.pi-sandbox. The agent can write to your projects, so the files that
+# hold the key and define the guard rails are copies outside its reach, never the repository itself.
+COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json)
+BRIDGE_FILES=(Dockerfile proxy.py requirements.txt pi-trace.py)
+
+cmd_init() {
+  local src="${SELF:h:h}" f
+  [[ -d "$src/sandbox" && -d "$src/bridge" ]] || src="$(cat "$SB/.source" 2>/dev/null || true)"
+  [[ -n "$src" && -d "$src/sandbox" && -d "$src/bridge" ]] ||
+    die "run init from the repository: <path-to-pi-text>/bin/pibox init"
+  [[ "$SB/" != "$src"/* && "$src/" != "$SB"/* ]] || die "$SB and the repository $src must not contain each other"
+  have yq || die "yq not found: brew install yq (pibox check lists everything that is needed)"
+
+  mkdir -p "$SB"/{bin,bridge,agent,generated}; chmod 700 "$SB"
+  for f in $COMPONENTS; do
+    rm -rf "$SB/$f"; mkdir -p "$SB/${f:h}"; cp -R "$src/sandbox/$f" "$SB/$f"
+  done
+  for f in $BRIDGE_FILES; do cp "$src/bridge/$f" "$SB/bridge/$f"; done
+  cp "$src/bin/pibox" "$SB/bin/pibox"; chmod 755 "$SB/bin/pibox"
+  print -r -- "$src" > "$SB/.source"
+  print "installed the components from $src into $SB"
+
+  if [[ ! -e "$CONFIG" ]]; then
+    (umask 077; cp "$src/sandbox/config.yaml" "$CONFIG")
+    print "created $CONFIG: fill it in, then run pibox setup"
+  else
+    local new; new=$(missing_keys "$src/sandbox/config.yaml")
+    [[ -z "$new" ]] || print "settings of the new template that config.yaml doesn't have yet (defaults apply):\n$new"
+    print "kept $CONFIG; run pibox setup to regenerate the configurations"
+  fi
+
+  mkdir -p "$HOME/.local/bin"; ln -sfn "$SB/bin/pibox" "$HOME/.local/bin/pibox"
+  [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] ||
+    print "add ~/.local/bin to PATH, e.g. in ~/.zprofile: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  docker_plugins
+}
+
+missing_keys() {                            # top-level sections of the template that config.yaml lacks
+  local k
+  for k in ${(f)"$(yq '... comments="" | keys | .[]' "$1")"}; do
+    [[ "$(yq "has(\"$k\")" "$CONFIG")" == true ]] || print "  $k"
+  done
+}
+
+docker_plugins() {                          # Homebrew's compose/buildx are CLI plugins in its own folder
+  local dir=/opt/homebrew/lib/docker/cli-plugins cfg="$HOME/.docker/config.json"
+  have docker && [[ -d "$dir" ]] || return 0
+  docker compose version >/dev/null 2>&1 && return 0
+  mkdir -p "${cfg:h}"; [[ -s "$cfg" ]] || print '{}' > "$cfg"
+  cp "$cfg" "$cfg.bak"
+  DIR="$dir" yq -i -o=json '.cliPluginsExtraDirs = ((.cliPluginsExtraDirs // []) + [strenv(DIR)] | unique)' "$cfg"
+  print "added $dir to cliPluginsExtraDirs in $cfg (backup: $cfg.bak)"
+}
+
+# ---------------------------------------------------------------- check
+cmd_check() {
+  local bad=0 t
+  ok()   { print "  ok       $*" }
+  miss() { print "  MISSING  $*"; bad=1 }
+  print "Prerequisites:"
+  [[ "$(uname -s)" == Darwin ]] && ok "macOS $(sw_vers -productVersion 2>/dev/null)" || print "  note     not macOS: the Colima commands won't work here"
+  [[ "$(uname -m)" == arm64 ]] && ok "Apple Silicon" || print "  note     $(uname -m): Colima's vz needs Apple Silicon or a recent Intel Mac"
+  have brew && ok "Homebrew" || miss "Homebrew: https://brew.sh (or your company's installation)"
+  for t in colima docker yq git; do
+    have $t && ok "$t" || miss "$t: brew install $t"
+  done
+  if have docker; then
+    docker compose version >/dev/null 2>&1 && ok "docker compose" || miss "docker compose: brew install docker-compose, then pibox init"
+    docker buildx version >/dev/null 2>&1 && ok "docker buildx" || miss "docker buildx: brew install docker-buildx, then pibox init"
+  fi
+  [[ -x "$SB/bin/pibox" && -f "$SB/compose.yaml" ]] && ok "components in $SB" || miss "components: <path-to-pi-text>/bin/pibox init"
+  print "Configuration:"
+  if [[ ! -r "$CONFIG" ]]; then
+    miss "$CONFIG: pibox init creates it"
+  else
+    ( load_config && check_config ) && ok "$CONFIG" || bad=1
+  fi
+  print "Not checkable from here: your terminal must not have Full Disk Access (docs/pi-setup.md §6.2)."
+  return $bad
+}
+
+check_config() {                            # values that are certainly wrong; warnings for risky ones
+  local f
+  grep -qE 'YOUR_KEY|YOUR_MODEL_ID|/Users/you/' "$CONFIG" && die "$CONFIG still has placeholders (YOUR_KEY, YOUR_MODEL_ID, /Users/you)"
+  for f in "$PROJECTS" "$VAULT"; do [[ -d "$f" ]] || die "folder $f doesn't exist"; done
+  [[ "$SB/" != "$PROJECTS"/* && "$SB/" != "$VAULT"/* ]] || die "$SB must not be inside the agent's folders"
+  [[ "$AGENT_DOCKER" != sysbox || -n "$SYSBOX_DEB_URL" ]] ||
+    die "agent_docker.mode is sysbox: set agent_docker.sysbox_deb_url (or mode: privileged / off)"
+  for f in "$PROJECTS" "$VAULT"; do
+    [[ "$f/" != "$HOME"/(Documents|Desktop)/* ]] || warn "$f is TCC-protected; mounts are more predictable elsewhere (§6.1)"
+  done
+  local src="$(cat "$SB/.source" 2>/dev/null || true)"
+  [[ -z "$src" || ( "$src/" != "$PROJECTS"/* && "$src/" != "$VAULT"/* ) ]] ||
+    warn "the repository $src is inside the agent's folders: the agent could change it. Check git status before the next pibox init"
+  return 0
+}
+
+# ---------------------------------------------------------------- settings
+# Every key of config.yaml (except bridge and models) and the variable that this script,
+# compose.yaml and the extensions use for it.
+typeset -A SETTING=(
+  folders.projects PROJECTS_DIR                  folders.vault VAULT_DIR
+  network.bridge_port BRIDGE_PORT                network.proxy_port PROXY_PORT
+  network.upstream_proxy UPSTREAM_PROXY          network.upstream_no_proxy UPSTREAM_NO_PROXY
+  network.sandbox_subnet SANDBOX_SUBNET
+  egress.allow_private EGRESS_ALLOW_PRIVATE      egress.no_approval EGRESS_NO_APPROVAL
+  egress.allow_only EGRESS_ALLOW_ONLY            egress.deny EGRESS_DENY
+  egress.ports EGRESS_PORTS
+  extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
+  extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
+  repository.user ARTIFACTORY_USER               repository.token ARTIFACTORY_TOKEN
+  repository.maven MAVEN_REPO_URL                repository.gradle_plugins GRADLE_PLUGIN_REPO_URL
+  repository.npm NPM_REGISTRY
+  repository.pip PIP_INDEX_URL                   repository.pip_trusted_host PIP_TRUSTED_HOST
+  repository.docker_registry DOCKER_REGISTRY     repository.docker_mirror DOCKER_REGISTRY_MIRROR
+  repository.docker_image_prefix DOCKER_IMAGE_PREFIX
+  repository.apt_debian APT_DEBIAN               repository.apt_security APT_SECURITY
+  images.node NODE_IMAGE                         images.python PYTHON_IMAGE
+  images.mitmproxy MITMPROXY_IMAGE               images.jdk17 JDK17_IMAGE
+  images.jdk21 JDK21_IMAGE                       images.jdk25 JDK25_IMAGE
+  images.maven MAVEN_IMAGE                       images.gradle GRADLE_IMAGE
+  images.docker_cli DOCKER_CLI_IMAGE             images.dind DIND_IMAGE
+  pi.package PI_PACKAGE                          pi.apt_packages PI_APT_PACKAGES
+  pi.java_default JAVA_DEFAULT                   pi.memory PI_MEMORY
+  pi.cpus PI_CPUS                                pi.pids PI_PIDS
+  agent_docker.mode AGENT_DOCKER                 agent_docker.sysbox_deb_url SYSBOX_DEB_URL
+  agent_docker.address_pool DIND_ADDRESS_POOL    agent_docker.min_api_version DIND_MIN_API_VERSION
+  vm.profile VM_PROFILE                          vm.cpus VM_CPUS
+  vm.memory VM_MEMORY                            vm.disk VM_DISK
+  vm.disk_image VM_DISK_IMAGE
+  mac.uid HOST_UID                               mac.gid HOST_GID
+)
+# yq programs: the settings as key=value lines (lists joined with commas), the bridge's environment
+# as NAME=value lines (maps and lists as JSON); every value shell-quoted.
+YQ_SETTINGS='del(.bridge, .models) | (.. | select(tag == "!!seq")) |= (map(tostring) | join(","))
+  | (.. | select(tag == "!!null")) |= "" | .. | select(tag != "!!map" and (parent | tag) == "!!map")
+  | (path | join(".")) + "=" + (tostring | @sh)'
+YQ_BRIDGE='.bridge // {} | (.[] | select(tag == "!!map" or tag == "!!seq")) |= to_json(0)
+  | (.[] | select(tag == "!!null")) |= "" | to_entries | .[] | .key + "=" + (.value | tostring | @sh)'
+
+load_config() {                             # defaults, then config.yaml on top
+  [[ -r "$CONFIG" ]] || die "$CONFIG not found: run <path-to-pi-text>/bin/pibox init"
+  have yq || die "yq not found: brew install yq"
+  # set -a exports them, so docker compose sees the same values. The agent gets a clean environment.
+  set -a
+  PROJECTS_DIR="" VAULT_DIR=""
+  BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 UPSTREAM_PROXY="" UPSTREAM_NO_PROXY=""
+  EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
+  PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
+  ARTIFACTORY_USER="" ARTIFACTORY_TOKEN="" MAVEN_REPO_URL="" GRADLE_PLUGIN_REPO_URL=""
+  NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple PIP_TRUSTED_HOST=""
+  DOCKER_REGISTRY="" DOCKER_REGISTRY_MIRROR="" DOCKER_IMAGE_PREFIX="" APT_DEBIAN="" APT_SECURITY=""
+  NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
+  JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
+  MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
+  DIND_IMAGE=docker:29-dind
+  PI_PACKAGE=@earendil-works/pi-coding-agent JAVA_DEFAULT=21
+  PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
+  PI_MEMORY=8g PI_CPUS=4 PI_PIDS=4096
+  AGENT_DOCKER=sysbox SYSBOX_DEB_URL="" DIND_ADDRESS_POOL=172.31.0.0/16 DIND_MIN_API_VERSION=1.24
+  VM_PROFILE=pi VM_CPUS=6 VM_MEMORY=12 VM_DISK=100 VM_DISK_IMAGE=""
+  HOST_UID=$(id -u) HOST_GID=$(id -g)
+
+  local out line key val; local -a keys=(${(k)SETTING})
+  out=$(yq "$YQ_SETTINGS" "$CONFIG") || die "can't read $CONFIG"
+  for line in ${(f)out}; do
+    key="${line%%=*}"; eval "val=${line#*=}"
+    [[ "$key" != *.* && -z "$val" ]] && (( ${keys[(I)$key.*]} )) && continue   # a section, all commented out
+    [[ -n "${SETTING[$key]:-}" ]] || die "unknown setting $key in $CONFIG"
+    [[ "$key" == pi.apt_packages ]] && val="${val//,/ }"
+    [[ "$val" == true ]] && val=1; [[ "$val" == false ]] && val=0
+    typeset -gx "${SETTING[$key]}=$val"
+  done
+
+  DOCKER_CONTEXT="${DOCKER_CONTEXT:-colima-$VM_PROFILE}"
+  SANDBOX_PROXY_IP="${SANDBOX_SUBNET%.*}.10"          # fixed address of the proxy on the internal network
+  case "$AGENT_DOCKER" in                              # the agent's own Docker engine
+    sysbox)     DIND_RUNTIME=sysbox-runc DIND_PRIVILEGED=false PI_DOCKER_HOST=tcp://docker:2375 COMPOSE_PROFILES=docker ;;
+    privileged) DIND_RUNTIME=runc DIND_PRIVILEGED=true PI_DOCKER_HOST=tcp://docker:2375 COMPOSE_PROFILES=docker ;;
+    off)        DIND_RUNTIME=runc DIND_PRIVILEGED=false PI_DOCKER_HOST="" COMPOSE_PROFILES="" ;;
+    *)          die "agent_docker.mode must be sysbox, privileged or off" ;;
+  esac
+  set +a
+
+  # The bridge's environment: not exported, only the bridge container gets it.
+  typeset -ga BRIDGE_ENV=()
+  out=$(yq "$YQ_BRIDGE" "$CONFIG") || die "can't read $CONFIG"
+  for line in ${(f)out}; do
+    [[ "${line%%=*}" =~ '^[A-Z_][A-Z0-9_]*$' ]] || die "bridge.${line%%=*}: not an environment variable name"
+    eval "val=${line#*=}"; BRIDGE_ENV+=("${line%%=*}=$val")
+  done
+
+  [[ -n "$PROJECTS_DIR" && -n "$VAULT_DIR" ]] || die "set folders.projects and folders.vault in $CONFIG"
+  typeset -g PROJECTS="${PROJECTS_DIR:A}" VAULT="${VAULT_DIR:A}"
+  [[ $(yq '(.models | tag == "!!seq" and length > 0) and ([.models[] | select((.id | tag) != "!!str"
+         or (.contextWindow | tag) != "!!int" or (.maxTokens | tag) != "!!int")] | length == 0)' "$CONFIG") == true ]] ||
+    die "models in $CONFIG: a list of entries, each with id, contextWindow and maxTokens"
+}
+
+# ---------------------------------------------------------------- generated files
+dotenv() {                                  # dotenv <file> NAME=value...: a file docker compose and sh read
+  local kv; local -a lines=("# Generated by pibox setup from $CONFIG; edit config.yaml instead.")
+  for kv in "${@:2}"; do
+    [[ "$kv" != *[\'$'\n']* ]] || die "${kv%%=*}: values with ' or a line break are not supported"
+    lines+=("${kv%%=*}='${kv#*=}'")
+  done
+  mkdir -p "${1:h}"; (umask 077; print -rl -- $lines > "$1")
+}
+
+models() {                                  # models <baseUrl> <file>: Pi's model list from config.yaml
+  mkdir -p "${2:h}"
+  BASE_URL="$1" yq -o=json '{"providers": {"pi-sandbox": {
+    "baseUrl": strenv(BASE_URL), "api": "openai-completions", "apiKey": "unused",
+    "compat": {"supportsDeveloperRole": false, "supportsStore": false,
+               "supportsReasoningEffort": false, "supportsUsageInStreaming": true},
+    "models": [.models[] | {"id": .id, "name": .id + " (sandbox)", "reasoning": false, "input": ["text"],
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}} * .]}}}' "$CONFIG" > "$2"
+}
+
+colima_config() {                           # the VM: only your two folders and ~/.pi-sandbox are shared
+  print -r -- "# Generated by pibox setup from $CONFIG; edit config.yaml instead."
+  print -r -- "vmType: vz
+mountType: virtiofs
+runtime: docker
+cpu: $VM_CPUS
+memory: $VM_MEMORY
+disk: $VM_DISK
+forwardAgent: false
+mounts:
+  - location: \"$PROJECTS\"
+    writable: true
+  - location: \"$VAULT\"
+    writable: true
+  - location: \"$SB\"
+    writable: false"
+  [[ -z "$UPSTREAM_PROXY" ]] || print -r -- "docker:
+  proxies:
+    http-proxy: \"$UPSTREAM_PROXY\"
+    https-proxy: \"$UPSTREAM_PROXY\"
+    no-proxy: \"$UPSTREAM_NO_PROXY\""
+}
+
+COLIMA_FILE() { print -r -- "${COLIMA_HOME:-$HOME/.colima}/$VM_PROFILE/colima.yaml" }
+
+cmd_setup() {
+  local v vmfile old="" ; local -a kv
+  [[ -f "$SB/compose.yaml" ]] || die "components missing in $SB: run <path-to-pi-text>/bin/pibox init"
+  check_config
+  for v in ${(ou)SETTING} SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
+    kv+=("$v=${(P)v}")
+  done
+  dotenv "$SB/.env" $kv                                         # docker compose
+  dotenv "$SB/generated/bridge.env" BRIDGE_PORT="$BRIDGE_PORT" $BRIDGE_ENV   # the bridge container only
+  models "http://bridge:$BRIDGE_PORT/v1" "$SB/agent/models.json"
+  tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
+  vmfile=$(COLIMA_FILE); mkdir -p "${vmfile:h}"
+  [[ -f "$vmfile" ]] && old=$(<"$vmfile")
+  colima_config > "$vmfile"
+  print "generated from $CONFIG:
+  $SB/.env, $SB/generated/bridge.env, $SB/agent/models.json
+  $SB/generated/c/ (settings.xml, toolchains.xml, gradle.properties, init.gradle, npmrc, pip.conf, docker-config.json, daemon.json)
+  $vmfile"
+  if [[ -n "$old" && "$old" != "$(<"$vmfile")" ]] && vm_running; then
+    print "the VM settings changed: pibox down --vm && pibox up applies them"
+  fi
+  print "next: pibox up"
+}
+
+fresh() {                                   # the generated files must be newer than config.yaml
+  [[ -f "$SB/.env" && -f "$SB/agent/models.json" ]] || die "nothing generated yet: run pibox setup"
+  [[ ! "$CONFIG" -nt "$SB/.env" ]] || die "config.yaml changed since the last setup: run pibox setup"
+}
+
+# ---------------------------------------------------------------- helpers
+compose_args() {                            # docker compose, with compose.override.yaml if present
+  reply=(compose --project-directory "$SB" -f "$SB/compose.yaml")
+  [[ -f "$SB/compose.override.yaml" ]] && reply+=(-f "$SB/compose.override.yaml")
+  return 0
+}
+compose() { compose_args; docker $reply "$@" }
+
+vm_running() { colima status -p "$VM_PROFILE" >/dev/null 2>&1 }
+running() {                                 # bridge and proxy must be up, or `compose run` would build and start them
+  vm_running && [[ -n "$(compose ps -q --status running bridge 2>/dev/null)" ]] || die "the sandbox isn't running: pibox up"
+}
+
+here() {                                    # the current folder, if the agent may work in it
+  local h="${PWD:A}"
+  [[ "$h/" == "$PROJECTS"/* || "$h/" == "$VAULT"/* ]] || die "start it from a folder under $PROJECTS or $VAULT"
+  print -r -- "$h"
+}
+
+sysbox() {                                  # install the sysbox runtime in the VM, once
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q sysbox-runc && return 0
+  [[ -n "$SYSBOX_DEB_URL" ]] || die "set agent_docker.sysbox_deb_url in $CONFIG (the sysbox-ce .deb for the VM's architecture)"
+  print "installing the sysbox runtime in the VM"
+  colima ssh -p "$VM_PROFILE" -- env URL="$SYSBOX_DEB_URL" UPSTREAM_PROXY="$UPSTREAM_PROXY" bash -s <<'EOF'
+set -euo pipefail
+[ -n "$UPSTREAM_PROXY" ] && export http_proxy="$UPSTREAM_PROXY" https_proxy="$UPSTREAM_PROXY"
+cd "$(mktemp -d)" && curl -fsSL -o sysbox.deb "$URL"
+docker ps -q | xargs -r docker stop                   # the installer restarts Docker
+sudo apt-get install -y ./sysbox.deb
+docker info --format '{{json .Runtimes}}' | grep -q sysbox-runc && echo "sysbox-runc is available"
+EOF
+}
+
+xml() { local s="$1"; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; print -rn -- "$s" }
+b64() { print -rn -- "$1" | base64 | tr -d '\n' }
+hostpart() { local u="${1#*://}"; print -rn -- "${u%%/*}" }      # host[:port] of a URL
+urlenc() {                                  # percent-encode for the user:password part of a URL
+  local s="$1" out="" c i
+  for (( i = 1; i <= ${#s}; i++ )); do
+    c="${s[i]}"
+    if [[ "$c" == [A-Za-z0-9._~-] ]]; then out+="$c"; else out+=$(printf '%%%02X' "'$c"); fi
+  done
+  print -rn -- "$out"
+}
+
+tooling() {                                 # tooling <dir> <proxy host> <proxy port> <jdk dir or "">
+  local dir=$1 ph=$2 pp=$3 jdks=$4 nonproxy="localhost|127.0.0.1|bridge|docker" v auth=""
+  mkdir -p "$dir"; chmod 700 "$dir"
+  [[ -n "$ARTIFACTORY_USER" ]] && auth=$(b64 "$ARTIFACTORY_USER:$ARTIFACTORY_TOKEN")
+
+  # Maven: one mirror for every repository, your credentials, the filtering proxy.
+  {
+    print -r -- "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!-- Generated by pibox setup from config.yaml; edit config.yaml instead. -->
+<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\">"
+    [[ -n "$MAVEN_REPO_URL" ]] && print -r -- "  <mirrors>
+    <mirror><id>pi-sandbox-mirror</id><mirrorOf>*</mirrorOf><url>$(xml "$MAVEN_REPO_URL")</url></mirror>
+  </mirrors>"
+    [[ -n "$ARTIFACTORY_USER" ]] && print -r -- "  <servers>
+    <server><id>pi-sandbox-mirror</id><username>$(xml "$ARTIFACTORY_USER")</username><password>$(xml "$ARTIFACTORY_TOKEN")</password></server>
+  </servers>"
+    print -r -- "  <proxies>
+    <proxy><id>pi-sandbox</id><active>true</active><protocol>http</protocol><host>$ph</host><port>$pp</port><nonProxyHosts>$nonproxy</nonProxyHosts></proxy>
+  </proxies>
+</settings>"
+  } > "$dir/settings.xml"
+
+  # Maven toolchains and Gradle toolchain paths: the JDKs baked into the image.
+  {
+    print -r -- "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<toolchains>"
+    if [[ -n "$jdks" ]]; then
+      for v in 17 21 25; do
+        print -r -- "  <toolchain><type>jdk</type><provides><version>$v</version></provides><configuration><jdkHome>$jdks/$v</jdkHome></configuration></toolchain>"
+      done
+    fi
+    print -r -- "</toolchains>"
+  } > "$dir/toolchains.xml"
+  {
+    print -r -- "# Generated by pibox setup from config.yaml
+systemProp.http.proxyHost=$ph
+systemProp.http.proxyPort=$pp
+systemProp.http.nonProxyHosts=$nonproxy
+systemProp.https.proxyHost=$ph
+systemProp.https.proxyPort=$pp
+systemProp.https.nonProxyHosts=$nonproxy
+org.gradle.java.installations.auto-download=false"
+    [[ -n "$jdks" ]] && print -r -- "org.gradle.java.installations.paths=$jdks/17,$jdks/21,$jdks/25"
+  } > "$dir/gradle.properties"
+
+  # Gradle: replace every remote repository (projects, buildscripts, plugins) by the mirror.
+  print -r -- "// Generated by pibox setup from config.yaml: remote repositories are replaced by your mirror.
+def MIRROR_NAME = 'pi-sandbox-mirror'
+def MIRROR_URL = '$MAVEN_REPO_URL'
+def PLUGIN_URL = '${GRADLE_PLUGIN_REPO_URL:-$MAVEN_REPO_URL}'
+def REPO_USER = '$ARTIFACTORY_USER'
+def REPO_PASSWORD = '$ARTIFACTORY_TOKEN'
+if (!MIRROR_URL) return
+
+def addMirror = { RepositoryHandler repos, String target ->
+    repos.maven { r ->
+        r.name = MIRROR_NAME
+        r.url = target
+        r.allowInsecureProtocol = true
+        if (REPO_USER) { r.credentials { username = REPO_USER; password = REPO_PASSWORD } }
+    }
+}
+def dropRemote = { RepositoryHandler repos ->
+    def found = [false]
+    repos.all { r ->
+        if (r.name != MIRROR_NAME && (r instanceof MavenArtifactRepository || r instanceof IvyArtifactRepository)
+                && ['http', 'https'].contains(r.url?.scheme)) {
+            found[0] = true
+            repos.remove(r)
+        }
+    }
+    return { -> found[0] }
+}
+
+beforeSettings { settings ->
+    dropRemote(settings.pluginManagement.repositories)
+    addMirror(settings.pluginManagement.repositories, PLUGIN_URL)
+    dropRemote(settings.dependencyResolutionManagement.repositories)
+    addMirror(settings.dependencyResolutionManagement.repositories, MIRROR_URL)
+}
+allprojects { p ->
+    dropRemote(p.buildscript.repositories)
+    addMirror(p.buildscript.repositories, MIRROR_URL)
+    def used = dropRemote(p.repositories)
+    p.afterEvaluate { if (used()) addMirror(p.repositories, MIRROR_URL) }
+}" > "$dir/init.gradle"
+
+  # npm, pip
+  {
+    print -r -- "# Generated by pibox setup from config.yaml
+registry=$NPM_REGISTRY
+proxy=http://$ph:$pp/
+https-proxy=http://$ph:$pp/
+noproxy=${nonproxy//|/,}
+audit=false
+fund=false
+update-notifier=false"
+    if [[ -n "$auth" ]]; then
+      print -r -- "//${NPM_REGISTRY#*://}:_auth=$auth"
+      print -r -- "always-auth=true"
+    fi
+  } > "$dir/npmrc"
+  local index="$PIP_INDEX_URL"
+  [[ -n "$ARTIFACTORY_USER" ]] && index="${PIP_INDEX_URL%%://*}://$(urlenc "$ARTIFACTORY_USER"):$(urlenc "$ARTIFACTORY_TOKEN")@${PIP_INDEX_URL#*://}"
+  print -r -- "# Generated by pibox setup from config.yaml
+[global]
+index-url = $index
+trusted-host = ${PIP_TRUSTED_HOST:-$(hostpart "$PIP_INDEX_URL")}
+proxy = http://$ph:$pp" > "$dir/pip.conf"
+
+  # Docker CLI: registry login, and the proxy for containers and builds it starts.
+  local auths=""
+  [[ -n "$DOCKER_REGISTRY" && -n "$auth" ]] && auths="\"$DOCKER_REGISTRY\": { \"auth\": \"$auth\" }"
+  print -r -- "{
+  \"auths\": { $auths },
+  \"proxies\": { \"default\": { \"httpProxy\": \"http://$SANDBOX_PROXY_IP:$pp\", \"httpsProxy\": \"http://$SANDBOX_PROXY_IP:$pp\",
+                             \"noProxy\": \"localhost,127.0.0.1\" } }
+}" > "$dir/docker-config.json"
+
+  # The agent's Docker engine: your registry over plain HTTP, through the filtering proxy.
+  local -aU regs=()
+  [[ -n "$DOCKER_REGISTRY" ]] && regs+=("\"$DOCKER_REGISTRY\"")
+  [[ -n "$DOCKER_REGISTRY_MIRROR" ]] && regs+=("\"$(hostpart "$DOCKER_REGISTRY_MIRROR")\"")
+  print -r -- "{
+  \"insecure-registries\": [${(j:, :)regs}],
+  \"registry-mirrors\": [${DOCKER_REGISTRY_MIRROR:+\"$DOCKER_REGISTRY_MIRROR\"}],
+  \"proxies\": { \"http-proxy\": \"http://proxy:$pp\", \"https-proxy\": \"http://proxy:$pp\", \"no-proxy\": \"localhost,127.0.0.1\" },
+  \"default-address-pools\": [{ \"base\": \"$DIND_ADDRESS_POOL\", \"size\": 24 }],
+  \"features\": { \"containerd-snapshotter\": false }
+}" > "$dir/daemon.json"
+}
+
+
+# ---------------------------------------------------------------- commands
+cmd="${1:-help}"; (( $# )) && shift
+case "$cmd" in
+  help|-h|--help) usage; exit 0 ;;
+  init)           cmd_init; exit 0 ;;
+  check)          cmd_check; exit $? ;;
+esac
+
+load_config
+case "$cmd" in
+
+setup)                                      # every configuration, from config.yaml
+  cmd_setup
+  ;;
+
+config)                                     # the settings in effect (secrets masked)
+  local k v kv
+  for k in ${(ok)SETTING}; do
+    v="${(P)SETTING[$k]}"
+    [[ "$k" == repository.token ]] && v="${v:+set (${#v} chars)}"
+    print -r -- "$k: $v"
+  done
+  for kv in $BRIDGE_ENV; do
+    k="${kv%%=*}" v="${kv#*=}"
+    [[ "$k" == *(KEY|TOKEN|SECRET|PASSWORD)* ]] && v="${v:+set (${#v} chars)}"
+    print -r -- "bridge.$k: $v"
+  done
+  yq '.models[] | "model: " + .id + "  contextWindow " + (.contextWindow | tostring)
+      + ", maxTokens " + (.maxTokens | tostring) + ", reasoning " + (.reasoning // false | tostring)' "$CONFIG"
+  print -r -- "docker context: $DOCKER_CONTEXT, VM config: $(COLIMA_FILE)"
+  ;;
+
+up)                                         # VM, images, bridge, proxy, the agent's Docker engine
+  fresh
+  if ! vm_running; then
+    print "starting the Colima VM $VM_PROFILE"
+    colima start "$VM_PROFILE" ${VM_DISK_IMAGE:+--disk-image "$VM_DISK_IMAGE"}
+  fi
+  colima ssh -p "$VM_PROFILE" -- sh -c 'mount | grep -E "virtiofs|9p|sshfs"' | sed 's/^/shared with the VM: /'
+  [[ "$AGENT_DOCKER" != sysbox ]] || sysbox
+  compose build
+  compose up -d --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
+  for i in {1..30}; do                      # wait until the bridge accepts connections
+    compose exec -T bridge python3 -c "import socket; socket.create_connection(('127.0.0.1', $BRIDGE_PORT), 1)" \
+      2>/dev/null && { print "bridge is up on port $BRIDGE_PORT; next: pibox approve (one terminal), pibox run (another)"; exit 0 }
+    sleep 1
+  done
+  die "the bridge didn't start: pibox status, docker --context $DOCKER_CONTEXT compose --project-directory $SB logs bridge"
+  ;;
+
+run)                                        # Pi in a fresh container, in the current folder
+  fresh; running
+  local h; h=$(here)
+  compose_args; exec docker $reply run --rm -w "$h" pi "$@"
+  ;;
+
+shell)                                      # bash in the agent's container, without Pi
+  fresh; running
+  local h; h=$(here)
+  compose_args; exec docker $reply run --rm -w "$h" --entrypoint bash pi "$@"
+  ;;
+
+approve)                                    # the approval console (detach: Ctrl-P Ctrl-Q)
+  local id; id=$(compose ps -q proxy)
+  [[ -n "$id" ]] || die "the proxy isn't running: pibox up"
+  exec docker attach "$id"
+  ;;
+
+log)                                        # follow the web journal
+  compose_args; exec docker $reply exec -T proxy tail -n 50 -F /home/mitmproxy/.mitmproxy/egress.log
+  ;;
+
+status)                                     # the VM and the containers
+  colima status -p "$VM_PROFILE" 2>&1 || true
+  vm_running && compose ps
+  ;;
+
+down)                                       # stop the containers; --vm: the VM too
+  vm_running && compose down
+  [[ "${1:-}" != --vm ]] || colima stop "$VM_PROFILE"
+  ;;
+
+verify)                                     # try everything the agent must not be able to do
+  fresh; running
+  compose run --rm -T --entrypoint bash pi -c "
+    B=$BRIDGE_PORT; V=${(q)VAULT}; cd ${(q)PROJECTS}; set -x
+    ls \"\$PWD\" | head -3                                       # your projects
+    ls ~/.pi-sandbox /Users/*/.ssh 2>&1 | head -2                # no such directory
+    curl -sS --noproxy '*' -m 5 http://example.com               # fails: no route
+    curl -sS --noproxy '*' -m 5 http://192.168.5.2:\$B           # fails: the Mac is unreachable
+    curl -sS -m 5 https://example.com                            # 403: encrypted tunnels refused
+    curl -sS -X POST -d x http://example.com                     # 405 from the egress policy
+    curl -sS -m 5 http://192.168.1.1/                            # 403: private address
+    curl -sS http://bridge:\$B/v1/models | head -c 100; echo     # the bridge answers
+    touch \"\$PWD/.pi-ok\" && rm \"\$PWD/.pi-ok\" && echo projects-writable
+    touch \"\$V/.pi-ok\" && rm \"\$V/.pi-ok\" && echo vault-writable
+    touch \"\$V/.obsidian/x\"                                    # read-only file system
+    touch /home/pi/.pi/agent/extensions/x                        # read-only file system
+    java -version 2>&1 | head -1; jdk 17 java -version 2>&1 | head -1; mvn -v | head -1; gradle -v | grep ^Gradle
+    node -v; python3 -V; docker compose version
+    if [ -n \"\$DOCKER_HOST\" ]; then docker info --format 'agent docker: {{.ServerVersion}}'; fi
+    curl -sS -m 30 http://example.com | head -c 200; echo        # waits for your approval (pibox approve)
+  " </dev/null
+  ;;
+
+review)                                     # changes that would make YOUR tools run code later
+  local risky='^(core\.(fsmonitor|hookspath|sshcommand|pager|editor|askpass|gitproxy|worktree)|alias\.|filter\.|diff\..*\.(textconv|command)|merge\..*\.driver|credential\.|include\.|includeif\.|uploadpack\.|remote\..*\.(uploadpack|receivepack|vcs))'
+  local found=0 gitdir keys h changed
+  local -a hooks
+  while IFS= read -r gitdir; do
+    hooks=("${(@f)$(find "$gitdir/hooks" -type f ! -name '*.sample' 2>/dev/null)}")
+    keys=$(git config --file "$gitdir/config" --get-regexp "$risky" 2>/dev/null || true)
+    if [[ -n "${hooks[*]}" || -n "$keys" ]]; then
+      found=1
+      print "⚠️  ${gitdir:h}"
+      for h in $hooks; do [[ -n "$h" ]] && print "    hook: ${h#$gitdir/}"; done
+      [[ -n "$keys" ]] && print -r -- "$keys" | sed 's/^/    config: /'
+      print "    → inspect before running any git command in it (git itself would run these)"
+    fi
+  done < <(find "$PROJECTS" "$VAULT" -maxdepth 4 -name node_modules -prune -o -name .git -type d -print 2>/dev/null)
+  changed=$(find "$VAULT/.obsidian" -type f -mtime -1 2>/dev/null || true)
+  if [[ -n "$changed" ]]; then
+    found=1
+    print "⚠️  Obsidian settings changed in the last 24 h (plugins run with your rights):"
+    print -r -- "$changed" | sed 's/^/    /'
+  fi
+  (( found )) || print "pibox review: nothing suspicious (hooks, git config, .obsidian)"
+  exit $found
+  ;;
+
+*)
+  usage; exit 1
+  ;;
+esac

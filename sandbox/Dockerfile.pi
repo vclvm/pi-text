@@ -1,0 +1,64 @@
+# The agent's image: Pi plus a development toolchain. Every image name comes from config.yaml, so all of
+# them can be pulled through your registry mirror.
+ARG NODE_IMAGE=node:24-bookworm-slim
+ARG JDK17_IMAGE=eclipse-temurin:17-jdk
+ARG JDK21_IMAGE=eclipse-temurin:21-jdk
+ARG JDK25_IMAGE=eclipse-temurin:25-jdk
+ARG MAVEN_IMAGE=maven:3-eclipse-temurin-21
+ARG GRADLE_IMAGE=gradle:jdk21
+ARG DOCKER_CLI_IMAGE=docker:29-cli
+FROM ${JDK17_IMAGE} AS jdk17
+FROM ${JDK21_IMAGE} AS jdk21
+FROM ${JDK25_IMAGE} AS jdk25
+FROM ${MAVEN_IMAGE} AS maven
+FROM ${GRADLE_IMAGE} AS gradle
+FROM ${DOCKER_CLI_IMAGE} AS dockercli
+
+FROM ${NODE_IMAGE}
+ARG UID=501
+ARG GID=20
+ARG APT_DEBIAN=
+ARG APT_SECURITY=
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+ARG PI_PACKAGE=@earendil-works/pi-coding-agent
+ARG PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
+ARG JAVA_DEFAULT=21
+
+# System packages, from your Debian mirror if APT_DEBIAN/APT_SECURITY are set.
+RUN set -eu; src=/etc/apt/sources.list.d/debian.sources; \
+    if [ -n "$APT_DEBIAN" ]; then sed -i "s#^URIs: http://deb.debian.org/debian\$#URIs: $APT_DEBIAN#" "$src"; fi; \
+    if [ -n "$APT_SECURITY" ]; then sed -i "s#^URIs: http://deb.debian.org/debian-security\$#URIs: $APT_SECURITY#" "$src"; fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends $PI_APT_PACKAGES; \
+    rm -rf /var/lib/apt/lists/*
+
+# Java 17/21/25, Maven, Gradle and the Docker CLI with the compose and buildx plugins, copied
+# from their official images.
+COPY --from=jdk17 /opt/java/openjdk /opt/jdk/17
+COPY --from=jdk21 /opt/java/openjdk /opt/jdk/21
+COPY --from=jdk25 /opt/java/openjdk /opt/jdk/25
+COPY --from=maven /usr/share/maven /opt/maven
+COPY --from=gradle /opt/gradle /opt/gradle
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+# `jdk 17 mvn test` runs one command with another JDK.
+RUN printf '#!/bin/sh\n[ -d "/opt/jdk/$1" ] || { echo "jdk: available: $(ls /opt/jdk)" >&2; exit 2; }\nexport JAVA_HOME="/opt/jdk/$1" PATH="/opt/jdk/$1/bin:$PATH"; shift; exec "$@"\n' \
+      > /usr/local/bin/jdk && chmod +x /usr/local/bin/jdk
+ENV JAVA_HOME=/opt/jdk/${JAVA_DEFAULT} JAVA_HOME_17=/opt/jdk/17 JAVA_HOME_21=/opt/jdk/21 JAVA_HOME_25=/opt/jdk/25 \
+    MAVEN_HOME=/opt/maven GRADLE_HOME=/opt/gradle \
+    PATH=/opt/jdk/${JAVA_DEFAULT}/bin:/opt/maven/bin:/opt/gradle/bin:$PATH
+
+# Pi itself, from your npm registry; corepack provides pnpm and yarn.
+RUN npm install -g --ignore-scripts --registry "$NPM_REGISTRY" "$PI_PACKAGE" && corepack enable
+
+# Same UID/GID as the Mac user, so files written to the bind mounts belong to you. The cache
+# folders exist in the image so that the volumes mounted on them belong to that user too.
+RUN userdel -r node 2>/dev/null; groupdel node 2>/dev/null; \
+    (getent group "$GID" || groupadd -g "$GID" pi) \
+ && useradd -m -o -u "$UID" -g "$GID" -s /bin/bash pi \
+ && mkdir -p /home/pi/.pi/agent/sessions /home/pi/.m2 /home/pi/.gradle /home/pi/.npm /home/pi/.cache /home/pi/.docker \
+ && chown -R "$UID:$GID" /home/pi
+USER pi
+RUN git config --global --add safe.directory '*'
+ENV HOME=/home/pi PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0
+ENTRYPOINT ["pi"]
