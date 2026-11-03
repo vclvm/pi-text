@@ -4,7 +4,8 @@
 #   pibox help      lists the commands
 setopt err_exit no_unset pipe_fail
 # A command failing where nothing expects it stops pibox (err_exit): say where, never silently.
-TRAPZERR() { print -u2 -r -- "pibox: stopped by a failing command in ${funcstack[2]:-pibox} (${funcfiletrace[1]:-?}); please report this" }
+# Only in pibox itself: inside $(…) a failing grep is often just "nothing found".
+TRAPZERR() { (( ZSH_SUBSHELL )) || print -u2 -r -- "pibox: stopped by a failing command in ${funcstack[2]:-pibox} (${funcfiletrace[1]:-?}); please report this" }
 
 SELF="${0:A}"                               # this script; $0 means the function name inside functions
 SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
@@ -332,7 +333,7 @@ cmd_check() {
 
 check_config() {                            # values that are certainly wrong; warnings for risky ones
   local f k l; CFG_ERRORS=()
-  for l in ${(f)"$(grep -nE 'YOUR_KEY|YOUR_MODEL_ID|/Users/you/' "$CONFIG" | grep -vE '^[0-9]+:[[:space:]]*#')"}; do
+  for l in ${(f)"$(grep -nE 'YOUR_KEY|YOUR_MODEL_ID|/Users/you/' "$CONFIG" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"}; do
     CFG_ERRORS+=("${CONFIG:t}:${l%%:*}: still the template's placeholder: ${${l#*:}##[[:space:]]#}")
   done
   for k in folders.projects folders.vault; do
@@ -1107,7 +1108,7 @@ gradle_repos() {                            # gradle_repos <the adapted settings
     esac
   done
   repos+=("central"$'\t'"http://repo.maven.apache.org/maven2")      # Maven's own default, last
-  resolve() {                               # resolve <id> <url>: REPLY = "id<TAB>url" after mirrors
+  gradle_mirror() {                         # gradle_mirror <id> <url>: REPLY = "id<TAB>url" after mirrors
     local rid=$1 rurl=$2 mm mid mof murl p hit
     REPLY="$rid"$'\t'"$rurl"
     for mm in $mirrors; do                  # an exact id wins over patterns
@@ -1126,8 +1127,8 @@ gradle_repos() {                            # gradle_repos <the adapted settings
       (( hit )) && { REPLY="$mid"$'\t'"$murl"; return }
     done
   }
-  add() {                                   # add <array> <id> <url>, unless the URL is listed already
-    resolve "$2" "$3"; id=${REPLY%%$'\t'*} u=${REPLY#*$'\t'}
+  gradle_add() {                            # gradle_add <array> <id> <url>, unless the URL is listed already
+    gradle_mirror "$2" "$3"; id=${REPLY%%$'\t'*} u=${REPLY#*$'\t'}
     if [[ "$id" == central && "$u" == http://repo.maven.apache.org/* ]]; then
       warn "Gradle: Maven Central has no mirror in $MAVEN_SETTINGS_FILE, so builds can't reach it (only plain HTTP passes the filter)"
       return 0
@@ -1136,9 +1137,9 @@ gradle_repos() {                            # gradle_repos <the adapted settings
     [[ -z "${seen[$k]:-}" ]] || return 0; seen[$k]=1
     eval "$1+=(\"\$(grepo \"\$id\" \"\$u\" \"\${user[\$id]:-}\" \"\${pass[\$id]:-}\")\")"
   }
-  for m in $repos; do add GRADLE_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done
-  for m in $plugins $repos; do add GRADLE_PLUGIN_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done 2>/dev/null
-  resolve central http://repo.maven.apache.org/maven2
+  for m in $repos; do gradle_add GRADLE_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done
+  for m in $plugins $repos; do gradle_add GRADLE_PLUGIN_REPOS "${m%%$'\t'*}" "${m#*$'\t'}"; done 2>/dev/null
+  gradle_mirror central http://repo.maven.apache.org/maven2
   if [[ "${REPLY#*$'\t'}" != http://repo.maven.apache.org/* ]]; then
     id=${REPLY%%$'\t'*}; MVNW_REPOURL=${REPLY#*$'\t'} MVNW_USERNAME=${user[$id]:-} MVNW_PASSWORD=${pass[$id]:-}
   fi
@@ -1433,7 +1434,7 @@ cmd="${1:-help}"; (( $# )) && shift
 case "$cmd" in
   help|-h|--help) usage; exit 0 ;;
   init)           cmd_init; exit 0 ;;
-  check)          cmd_check; exit $? ;;
+  check)          cmd_check && exit 0 || exit 1 ;;     # 1: something is missing (listed above)
 esac
 
 load_config
