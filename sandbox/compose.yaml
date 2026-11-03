@@ -30,6 +30,8 @@ volumes:
 
 services:
   bridge:
+    image: pibox.local/bridge                # built here, never pulled
+    pull_policy: never
     build:
       context: ./bridge
       args:
@@ -103,6 +105,8 @@ services:
     restart: unless-stopped
 
   pi:
+    image: pibox.local/pi                    # built here, never pulled
+    pull_policy: never
     build:
       context: .
       dockerfile: Dockerfile.pi

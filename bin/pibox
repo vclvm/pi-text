@@ -1000,9 +1000,11 @@ vm_ca() {                                   # the CA certificates into the VM's 
 }
 
 build_images() {                            # compose build, telling what happens and where things come from
+  local -A e; local kv
+  for kv in ${(f)"$(grep -E "^[A-Z_][A-Z0-9_]*='" "$SB/.env")"}; do e[${kv%%=*}]=${${kv#*=\'}%\'}; done
   print "building the images (the first time takes a while; later only what changed). Sources:
-  base images  $BASE_IMAGE, $NODE_IMAGE, $PYTHON_IMAGE, $JDK21_IMAGE, …
-  Debian       ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-deb.debian.org (repository.apt_sources is empty)}
+  base images  ${e[BASE_IMAGE]-}, ${e[NODE_IMAGE]-}, ${e[PYTHON_IMAGE]-}, ${e[JDK21_IMAGE]-}, …
+  apt          ${${(j:, :)${(f)"$(sed -n 's/^URIs: //p' "$SB/generated/apt/debian.sources" 2>/dev/null)"}}:-Ubuntu's own servers (repository.apt_sources is empty)}
   npm (Pi)     ${${${(M)NPMRC_FILE:#?*}:+your .npmrc ($NPMRC_FILE)}:-registry.npmjs.org}
   pip (bridge) ${${${(M)PIP_CONF_FILE:#?*}:+your pip.conf ($PIP_CONF_FILE)}:-pypi.org}
   through      ${UPSTREAM_PROXY:-a direct connection} (network.mac_proxy_port)"
@@ -1082,6 +1084,8 @@ compose() { compose_args; local -a c=($reply); dk; $reply $c "$@" }
 
 vm_running() { colima status -p "$VM_PROFILE" >/dev/null 2>&1 }
 running() {                                 # bridge and proxy must be up, or `compose run` would build and start them
+  [[ "$SB/generated/up.stamp" -nt "$SB/.env" && ! "$SB/bin/pibox" -nt "$SB/generated/up.stamp" ]] ||
+    die "pibox setup or init ran since the last pibox up: run pibox up (it recreates the containers)"
   vm_running && [[ -n "$(compose ps -q --status running bridge 2>/dev/null)" ]] || die "the sandbox isn't running: pibox up"
 }
 
@@ -1538,7 +1542,10 @@ up)                                         # VM, images, bridge, proxy, the age
   [[ "$AGENT_DOCKER" != sysbox ]] || sysbox
   build_images
   print "starting the containers: bridge, proxy${PI_DOCKER_HOST:+, the agent's Docker engine}"
-  compose up -d --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
+  # Always new containers: pibox init/setup replace the files they mount, and a container keeps
+  # the old (deleted) ones until it is created again.
+  compose up -d --force-recreate --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
+  touch "$SB/generated/up.stamp"
   for i in {1..30}; do                      # wait until the bridge accepts connections
     compose exec -T bridge python3 -c "import socket; socket.create_connection(('127.0.0.1', $BRIDGE_PORT), 1)" \
       2>/dev/null && { print "bridge is up on port $BRIDGE_PORT; next: pibox approve (one terminal), pibox run (another)"; exit 0 }
