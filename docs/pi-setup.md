@@ -240,7 +240,7 @@ An HTTP proxy is a server that makes web requests on behalf of clients. Tools fi
 
 So the sandbox works with plain requests only. The agent's tools talk to our filtering proxy over
 plain HTTP, the proxy allows `GET`/`HEAD` and refuses every tunnel, and passes allowed requests on to
-the next proxy (`network.upstream_proxy`), which takes care of the connection to the site. Nothing is decrypted
+the proxy on your Mac (`network.mac_proxy_port`), which takes care of the connection to the site. Nothing is decrypted
 and no certificates are involved. In practice that means: inside the sandbox use `http://` URLs, and
 `http://` addresses for package mirrors; the `web_fetch` tool converts URLs for you.
 
@@ -436,7 +436,7 @@ What the sections mean:
 | `folders` | Your projects and the vault. Absolute paths, no `~`. They are mounted into the VM and the agent's container **at the same path**, so a path the agent prints is the path you open on the Mac (§6.2) |
 | `bridge` | The bridge's environment, under the names of [bridge/README.md](../bridge/README.md) (`PI_TEXT_URL`, `PI_TEXT_KEY`, `TRACE`, …). Only the bridge container gets it. A map or list is passed as JSON, e.g. `UPSTREAM_EXTRA_BODY` |
 | `models` | The models Pi offers, each with its own `contextWindow` (Pi compacts the conversation before it fills up), `maxTokens` (the output limit of one reply: big `write`/`edit` calls need room), `reasoning` and `compat`. These are entries of Pi's `models.json` (§8.7) |
-| `network` | `bridge_port` and `proxy_port`: ports of the sandbox's own two services, the bridge and the filtering proxy. They exist only on the internal Docker network (`http://bridge:8789`, `http://proxy:8080`), are not opened on the Mac or the LAN, and normally stay as they are. `upstream_proxy`: something else entirely, the proxy **your network** requires to reach the internet (a corporate proxy), if any; the bridge, the filtering proxy and image downloads go out through it. Written as the VM sees it; empty: connect directly. `upstream_no_proxy`: hosts reached without it. `sandbox_subnet`: the internal network's addresses |
+| `network` | `bridge_port` and `proxy_port`: ports of the sandbox's own two services, the bridge and the filtering proxy. They exist only on the internal Docker network (`http://bridge:8789`, `http://proxy:8080`), are not opened on the Mac or the LAN, and normally stay as they are. `mac_proxy_port`: something else entirely, the port of the HTTP proxy **on your Mac** that everything leaves the sandbox through: the bridge, the filtering proxy, image downloads. Only the port: `pibox setup` fills in the Mac's address as the VM sees it (`192.168.5.2`, Colima's `host.lima.internal`, which leads to the Mac's `127.0.0.1`), and `pibox check` tests that the proxy is listening. Empty: connect directly. `upstream_no_proxy`: hosts reached without it. `sandbox_subnet`: the internal network's addresses |
 | `egress` | The agent's web policy (§8.6) |
 | `extensions` | Settings of the Pi extensions (§9) |
 | `repository` | Your artifact repository. `pibox setup` writes Maven's, Gradle's, npm's, pip's and Docker's settings from these values (§8.9). The agent's downloads leave the sandbox as plain HTTP requests (§4.6), so these are `http://` addresses |
@@ -595,7 +595,7 @@ Three containers run inside the Colima VM, four with the agent's own Docker engi
 |---|---|---|
 | `pi` | `sandbox` only (internal) | Runs the agent and every command it starts. Sees your projects and the vault, nothing else |
 | `bridge` | `sandbox` + `egress` | The pi-text bridge. Holds the router key. The only way to the model |
-| `proxy` | `sandbox` + `egress` | mitmproxy with our policy. The only way to the web and to your artifact repository. Pauses requests for your approval, then passes them on to `network.upstream_proxy` |
+| `proxy` | `sandbox` + `egress` | mitmproxy with our policy. The only way to the web and to your artifact repository. Pauses requests for your approval, then passes them on to the proxy on your Mac (`network.mac_proxy_port`) |
 | `docker` | `sandbox` only (internal) | The agent's own Docker engine (§8.10): the containers the agent starts (databases, services, Testcontainers) run here, with the same network limits |
 
 **Walk-through of what happens:**
@@ -604,7 +604,7 @@ Three containers run inside the Colima VM, four with the agent's own Docker engi
   sends the request to the proxy (the only host it can reach) as plain text:
   `GET http://docs.python.org/3/`. The policy sees `GET`, a public host and port 80, so it's allowed.
   It then **pauses** the request, and it appears in the approval console in your second terminal. You
-  press `a`; the proxy passes it to `network.upstream_proxy` and returns the page to curl.
+  press `a`; the proxy passes it to the proxy on your Mac and returns the page to curl.
 - *The agent runs `curl https://docs.python.org/3/`.* For an `https://` URL curl asks the proxy for an
   encrypted tunnel (`CONNECT docs.python.org:443`). Nobody could see the method inside it, so the
   policy refuses it with a message telling the agent to use `http://` URLs (§4.6).
@@ -669,7 +669,7 @@ What it means:
   - **nothing else:** your home directory is not shared at all;
 - `forwardAgent: false`: with SSH agent forwarding, processes in the VM could use your SSH keys
   without seeing them;
-- with `network.upstream_proxy` set, a `docker: proxies:` block is added, so the VM's Docker downloads images
+- with `network.mac_proxy_port` set, a `docker: proxies:` block is added, so the VM's Docker downloads images
   through it.
 
 On its first start Colima downloads a VM disk image. If that download is blocked, get the image file
@@ -747,8 +747,8 @@ Step by step:
 - `safe.directory '*'`: git otherwise refuses to work in a folder owned by "another" user ID.
 - `ENV HOME=… PI_OFFLINE=1 …`: a fixed home directory, and no network calls by Pi itself (§8.7).
 
-The proxy variables used while building (`HTTP_PROXY` and friends) are passed by Compose from
-`network.upstream_proxy` (§8.8). Docker uses them only for the build and doesn't store them in the image.
+The proxy variables used while building (`HTTP_PROXY` and friends) are passed by Compose: the proxy on your Mac,
+`network.mac_proxy_port` (§8.8). Docker uses them only for the build and doesn't store them in the image.
 The image is large (about 3 GB with three JDKs); it is built once and then reused.
 
 ### 8.5 The bridge: `bridge/Dockerfile`
@@ -762,15 +762,15 @@ The image is large (about 3 GB with three JDKs); it is built once and then reuse
 
 The bridge's settings (the `bridge` section of `config.yaml`, plus `network.bridge_port`) come from
 `generated/bridge.env` through `env_file` in `compose.yaml`: only the bridge container receives them.
-If the router must be reached directly while other traffic uses `network.upstream_proxy`, add the
+If the router must be reached directly while other traffic uses the proxy on your Mac, add the
 router's host to `network.upstream_no_proxy`.
 
 ### 8.6 The web policy: `sandbox/addons/egress_policy.py`
 
 mitmproxy calls functions in an addon at specific moments ("hooks").
 [sandbox/addons/egress_policy.py](../sandbox/addons/egress_policy.py) decides, for every
-request, whether it may go out, asks you when needed, and writes a journal. Forwarding to
-`network.upstream_proxy` is mitmproxy's own `--mode upstream` (§8.8):
+request, whether it may go out, asks you when needed, and writes a journal. Forwarding to the proxy on
+your Mac is mitmproxy's own `--mode upstream` (§8.8):
 
 The hooks, in the order mitmproxy calls them:
 
@@ -792,7 +792,7 @@ Details that matter:
   and the full URL are visible as they are. `connection_strategy=lazy` (in `compose.yaml`) means the
   proxy opens no connection onwards before the policy has looked at the request.
 - **Private addresses** are found by resolving the name. A host that can't be resolved inside the VM
-  is allowed to go on (only the upstream proxy could reach it). If you use `network.upstream_proxy`, add your
+  is allowed to go on (only the proxy on your Mac could reach it). If you use `network.mac_proxy_port`, add your
   internal domain to `egress.deny` so the agent can't reach intranet sites through it.
 - **The journal** (`egress.log`) records every decision with a time stamp:
   `docker compose exec proxy tail -f /home/mitmproxy/.mitmproxy/egress.log`.
@@ -881,13 +881,13 @@ Service by service:
 - **`x-build-proxy`**: a reusable block (YAML anchor) with the proxy variables for image builds.
   Empty values mean "no proxy".
 - **`networks`**: `sandbox` is `internal: true`, so it has no route out (§4.5). `egress` is a normal network with internet access.
-- **`bridge`**: on both networks. It uses `network.upstream_proxy` for the router unless the router is in
+- **`bridge`**: on both networks. It uses the proxy on your Mac for the router unless the router is in
   `network.upstream_no_proxy`. `read_only`, `cap_drop: [ALL]` (no special kernel privileges) and
   `no-new-privileges` (setuid binaries can't elevate) are standard container hardening.
 - **`proxy`**:
   - `command` starts the mitmproxy **console** with our addon. `connection_strategy=lazy` means it
     doesn't connect onwards before the request is checked.
-  - `$${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY}`: if `network.upstream_proxy` is set, the shell adds
+  - `$${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY}`: if `network.mac_proxy_port` is set, the shell adds
     `--mode upstream:<proxy>`, and mitmproxy passes every allowed request to that proxy. Empty: it
     connects directly. (`$$` is how Compose writes a literal `$` for the shell inside the container.)
   - `stty cols 160 rows 48` gives the console a terminal size before you attach. Without it the
@@ -963,7 +963,7 @@ lists five repositories still resolves everything from the one mirror.
   read them. Use a token that can only read.
 - **Your repository must be reachable through the proxy**: put its host into `egress.allow_private`
   (it has an internal address) and `egress.no_approval` (no prompt per download), into
-  `network.upstream_no_proxy` if it is reached directly rather than through `network.upstream_proxy`, and its ports
+  `network.upstream_no_proxy` if it is reached directly rather than through the proxy on your Mac, and its ports
   into `egress.ports` if they aren't 80/443.
 - **Deploy, publish, push** (POST/PUT) are refused by the proxy: the agent builds and tests, you publish.
 
@@ -1166,12 +1166,12 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
 | `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself |
 | `npm`/`pip` in the sandbox fail with 403 on `CONNECT` | `repository.npm`/`repository.pip` must be your mirror's `http://` address (and `repository.pip_trusted_host` its host name). Public registries answer only over HTTPS |
-| Image pulls fail with timeout errors | If pulls must go through a proxy, set `network.upstream_proxy`; `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
+| Image pulls fail with timeout errors | If pulls must go through the proxy on your Mac, set `network.mac_proxy_port` (and check that the proxy runs: `pibox check`); `pibox setup` adds the Docker proxy settings to the VM, `pibox down --vm && pibox up` applies them |
 | `apt-get update` fails during the build | Check `repository.apt_debian`/`repository.apt_security` in `config.yaml`: they replace `http://deb.debian.org/debian` and `…/debian-security` as whole URLs |
 | `docker compose` / `docker buildx`: unknown command | The CLI doesn't find Homebrew's plugins: `pibox init` adds `cliPluginsExtraDirs` to `~/.docker/config.json` (§6.1) |
 | Requests hang | They're waiting for approval: `pibox approve`. The journal (`pibox log`) shows `ASK` for them |
 | A package mirror or internal host gets `403 … private/internal address` | Add it to `egress.allow_private` (and to `egress.no_approval` for registries), then `pibox up` |
-| The bridge or an image build should reach a host directly, not through `network.upstream_proxy` | Add it to `network.upstream_no_proxy`. The agent's own web traffic always goes through the filtering proxy |
+| The bridge or an image build should reach a host directly, not through the proxy on your Mac | Add it to `network.upstream_no_proxy`. The agent's own web traffic always goes through the filtering proxy |
 | `pibox run -p "…"` never finishes | It waits for stdin: add `</dev/null` |
 | `proxy` keeps restarting: `invalid width 0` or `usermod: invalid user ID` | Keep the `stty …` command and the `cap_add` list from §8.8 |
 | mitmproxy logs `AssertionError: Unexpected event type at TCPLayer.done` | Printed when the policy kills a raw TCP tunnel (`BLOCKED raw TCP` comes right after). The connection is closed as intended, so the message is harmless |

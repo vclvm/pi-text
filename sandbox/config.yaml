@@ -12,8 +12,8 @@
 #
 # How the agent's traffic flows (both arrows go through the VM's network to the outside):
 #
-#   Pi ──► bridge (holds the API key) ─────────────────────► [upstream_proxy] ──► your model router
-#   Pi, git, mvn, npm, curl… ──► proxy (filters, asks you) ─► [upstream_proxy] ──► web, artifact repository
+#   Pi ──► bridge (holds the API key) ─────────────────────► [proxy on your Mac] ──► your model router
+#   Pi, git, mvn, npm, curl… ──► proxy (filters, asks you) ─► [proxy on your Mac] ──► web, artifact repository
 #
 # The agent's container has no other way out: it is only on an internal network with these two.
 
@@ -81,16 +81,15 @@ network:
   # Mac either; normally no reason to change it.
   proxy_port: 8080
 
-  # NOT a part of the sandbox: the HTTP proxy YOUR network requires to reach the internet (a
-  # corporate proxy), if any. Bridge, filtering proxy, image builds and the VM's Docker send their
-  # outgoing traffic through it. "" = your network needs no proxy, connect directly.
-  # Format: http://host:port (http://user:password@host:port if it needs a login). It is used
-  # from inside the VM: a proxy that runs on your Mac itself (127.0.0.1:PORT) is
-  # http://192.168.5.2:PORT from there.
-  upstream_proxy: ""
+  # NOT a part of the sandbox: the port of the HTTP proxy that runs on your Mac, through which
+  # everything leaves the sandbox: the bridge (to your model router), the filtering proxy (the
+  # agent's allowed requests), image builds and the VM's Docker. Only the port: pibox fills in
+  # the Mac's address as the VM sees it. A proxy listening on the Mac's 127.0.0.1 is fine.
+  # `pibox check` tests that something listens on it. "" = no proxy, connect directly.
+  mac_proxy_port: ""
 
-  # Hosts reached directly although upstream_proxy is set, e.g. an artifact repository in your
-  # own network that the corporate proxy can't reach. A host also covers its subdomains.
+  # Hosts reached directly although mac_proxy_port is set, e.g. an artifact repository in your
+  # network that the proxy can't reach. A host also covers its subdomains.
   upstream_no_proxy: []
 
   # The address range of the sandbox's internal Docker network. Change it only if it overlaps with

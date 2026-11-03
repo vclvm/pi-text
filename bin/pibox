@@ -7,6 +7,7 @@ setopt err_exit no_unset pipe_fail
 SELF="${0:A}"                               # this script; $0 means the function name inside functions
 SB="${PI_SANDBOX_DIR:-$HOME/.pi-sandbox}"; SB="${SB:A}"
 CONFIG="$SB/config.yaml"
+MAC_FROM_VM=192.168.5.2                     # the Mac, seen from Colima's VM (host.lima.internal)
 die()  { print -u2 "pibox: $*"; exit 1 }
 warn() { print -u2 "pibox: warning: $*" }
 have() { (( $+commands[$1] )) }
@@ -91,7 +92,8 @@ update_config() {                           # update_config <template>
   if [[ -e "$CONFIG" ]]; then
     yq '.' "$CONFIG" >/dev/null 2>&1 || die "$CONFIG is not valid YAML: fix it, then run pibox init again"
     [[ -f "$old" ]] || old="$tpl"
-    leaves "$CONFIG" U; leaves "$old" O; leaves "$tpl" N
+    migrate
+    leaves "$MERGE_SRC" U; leaves "$old" O; leaves "$tpl" N
     for p in ${(ok)U}; do
       name="${${${p:1:-1}//\"/}//,/.}"                 # ["network","bridge_port"] -> network.bridge_port
       if [[ -z "${N[$p]+x}" && "$p" != '["bridge",'* ]]; then
@@ -115,6 +117,7 @@ update_config() {                           # update_config <template>
       fi
     done
   fi
+  rm -f "$SB/.config.migrated.yaml"
   tmp="$SB/.config.yaml.new"
   (umask 077; print -rl -- "${T[@]}" > "$tmp")
   yq '.' "$tmp" >/dev/null || { rm -f "$tmp"; die "merging $CONFIG with the template failed: $CONFIG is unchanged" }
@@ -135,6 +138,19 @@ update_config() {                           # update_config <template>
   (( $#dropped )) && print -rl -- "  settings that no longer exist, removed (they are still in config.yaml.bak):" "${(@)dropped/#/    }"
   print "  next: look through config.yaml, then pibox setup"
   return 0
+}
+
+migrate() {                                 # renamed settings: MERGE_SRC = config.yaml in today's terms
+  MERGE_SRC="$CONFIG"
+  [[ "$(yq '.network | has("upstream_proxy")' "$CONFIG")" == true ]] || return 0
+  local up port='""'; local -a match; up=$(yq '.network.upstream_proxy // ""' "$CONFIG")
+  if [[ "$up" =~ '^(https?://)?([^@/]*@)?(192\.168\.5\.2|host\.lima\.internal|127\.0\.0\.1|localhost):([0-9]+)/?$' ]]; then
+    port=$match[4]; print "network.upstream_proxy $up is now network.mac_proxy_port: $port"
+  elif [[ -n "$up" ]]; then
+    warn "network.upstream_proxy $up is not a proxy on this Mac; only network.mac_proxy_port exists now"
+  fi
+  MERGE_SRC="$SB/.config.migrated.yaml"
+  (umask 077; P="$port" yq '.network.mac_proxy_port = env(P) | del(.network.upstream_proxy)' "$CONFIG" > "$MERGE_SRC")
 }
 
 # Line editing of the template (array T), so its layout and comments stay as they are.
@@ -167,10 +183,10 @@ find_key() {
 render() {                                  # render <section> [key]: your value, as YAML lines for the template
   local e=".[\"$1\"]"; [[ -n "${2:-}" ]] && e="${e}[\"$2\"]"
   if [[ -n "${2:-}" ]]; then                # one line: maps and lists in flow style {…} […]
-    U="$CONFIG" yq -n "(load(strenv(U)) | ... comments=\"\") as \$u | {\"v\": \$u$e}
+    U="$MERGE_SRC" yq -n "(load(strenv(U)) | ... comments=\"\") as \$u | {\"v\": \$u$e}
       | (.v | select(tag == \"!!map\" or tag == \"!!seq\")) |= (... style=\"flow\")" | sed '1s/^v: //'
   else                                      # a whole section's value (models): block style
-    U="$CONFIG" yq -n "(load(strenv(U)) | ... comments=\"\") as \$u | {\"v\": \$u$e}" | sed 1d
+    U="$MERGE_SRC" yq -n "(load(strenv(U)) | ... comments=\"\") as \$u | {\"v\": \$u$e}" | sed 1d
   fi
 }
 
@@ -256,6 +272,10 @@ check_config() {                            # values that are certainly wrong; w
   for f in "$PROJECTS" "$VAULT"; do
     [[ "$f/" != "$HOME"/(Documents|Desktop)/* ]] || warn "$f is TCC-protected; mounts are more predictable elsewhere (§6.1)"
   done
+  if [[ -n "$MAC_PROXY_PORT" && "$(uname -s)" == Darwin ]]; then
+    ( zmodload zsh/net/tcp && ztcp 127.0.0.1 "$MAC_PROXY_PORT" && ztcp -c "$REPLY" ) 2>/dev/null ||
+      warn "nothing listens on port $MAC_PROXY_PORT of this Mac (network.mac_proxy_port): start your proxy"
+  fi
   local src="$(cat "$SB/.source" 2>/dev/null || true)"
   [[ -z "$src" || ( "$src/" != "$PROJECTS"/* && "$src/" != "$VAULT"/* ) ]] ||
     warn "the repository $src is inside the agent's folders: the agent could change it. Check git status before the next pibox init"
@@ -268,7 +288,7 @@ check_config() {                            # values that are certainly wrong; w
 typeset -A SETTING=(
   folders.projects PROJECTS_DIR                  folders.vault VAULT_DIR
   network.bridge_port BRIDGE_PORT                network.proxy_port PROXY_PORT
-  network.upstream_proxy UPSTREAM_PROXY          network.upstream_no_proxy UPSTREAM_NO_PROXY
+  network.mac_proxy_port MAC_PROXY_PORT          network.upstream_no_proxy UPSTREAM_NO_PROXY
   network.sandbox_subnet SANDBOX_SUBNET
   egress.allow_private EGRESS_ALLOW_PRIVATE      egress.no_approval EGRESS_NO_APPROVAL
   egress.allow_only EGRESS_ALLOW_ONLY            egress.deny EGRESS_DENY
@@ -311,7 +331,7 @@ load_config() {                             # defaults, then config.yaml on top
   # set -a exports them, so docker compose sees the same values. The agent gets a clean environment.
   set -a
   PROJECTS_DIR="" VAULT_DIR=""
-  BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 UPSTREAM_PROXY="" UPSTREAM_NO_PROXY=""
+  BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
   PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
   ARTIFACTORY_USER="" ARTIFACTORY_TOKEN="" MAVEN_REPO_URL="" GRADLE_PLUGIN_REPO_URL=""
@@ -341,6 +361,11 @@ load_config() {                             # defaults, then config.yaml on top
   done
 
   DOCKER_CONTEXT="${DOCKER_CONTEXT:-colima-$VM_PROFILE}"
+  [[ "$MAC_PROXY_PORT" == <1-65535> ]] || [[ -z "$MAC_PROXY_PORT" ]] ||
+    die "network.mac_proxy_port: a port number, or \"\" for none"
+  # The proxy on the Mac, as the VM and its containers reach it: Colima's address of the Mac
+  # (host.lima.internal), which leads to the Mac's 127.0.0.1.
+  UPSTREAM_PROXY="${MAC_PROXY_PORT:+http://$MAC_FROM_VM:$MAC_PROXY_PORT}"
   SANDBOX_PROXY_IP="${SANDBOX_SUBNET%.*}.10"          # fixed address of the proxy on the internal network
   case "$AGENT_DOCKER" in                              # the agent's own Docker engine
     sysbox)     DIND_RUNTIME=sysbox-runc DIND_PRIVILEGED=false PI_DOCKER_HOST=tcp://docker:2375 COMPOSE_PROFILES=docker ;;
@@ -414,7 +439,7 @@ cmd_setup() {
   local v vmfile old="" ; local -a kv
   [[ -f "$SB/compose.yaml" ]] || die "components missing in $SB: run <path-to-pi-text>/bin/pibox init"
   check_config
-  for v in ${(ou)SETTING} SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
+  for v in ${(ou)SETTING} UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
     kv+=("$v=${(P)v}")
   done
   dotenv "$SB/.env" $kv                                         # docker compose
@@ -646,6 +671,7 @@ config)                                     # the settings in effect (secrets ma
   done
   yq '.models[] | "model: " + .id + "  contextWindow " + (.contextWindow | tostring)
       + ", maxTokens " + (.maxTokens | tostring) + ", reasoning " + (.reasoning // false | tostring)' "$CONFIG"
+  print -r -- "proxy on the Mac, as the VM reaches it: ${UPSTREAM_PROXY:-none (direct)}"
   print -r -- "docker context: $DOCKER_CONTEXT, VM config: $(COLIMA_FILE)"
   ;;
 
@@ -706,7 +732,8 @@ verify)                                     # try everything the agent must not 
     ls \"\$PWD\" | head -3                                       # your projects
     ls ~/.pi-sandbox /Users/*/.ssh 2>&1 | head -2                # no such directory
     curl -sS --noproxy '*' -m 5 http://example.com               # fails: no route
-    curl -sS --noproxy '*' -m 5 http://192.168.5.2:\$B           # fails: the Mac is unreachable
+    curl -sS --noproxy '*' -m 5 http://$MAC_FROM_VM:\$B           # fails: the Mac is unreachable
+    ${MAC_PROXY_PORT:+curl -sS --noproxy '*' -m 5 -x http://$MAC_FROM_VM:$MAC_PROXY_PORT http://example.com  # fails: the Mac's proxy too}
     curl -sS -m 5 https://example.com                            # 403: encrypted tunnels refused
     curl -sS -X POST -d x http://example.com                     # 405 from the egress policy
     curl -sS -m 5 http://192.168.1.1/                            # 403: private address
