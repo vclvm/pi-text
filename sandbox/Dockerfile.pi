@@ -20,7 +20,7 @@ FROM ${BASE_IMAGE}
 ARG UID=501
 ARG GID=20
 ARG PI_PACKAGE=@earendil-works/pi-coding-agent
-ARG PI_APT_PACKAGES="bash ca-certificates curl git ripgrep jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
+ARG PI_APT_PACKAGES="bash ca-certificates curl git ripgrep fd-find jq httpie unzip zip less procps build-essential python3 python3-dev python3-venv python3-pip"
 ARG JAVA_DEFAULT=21
 
 # Your company's CA certificates (network.ca_certs; pibox setup puts them into generated/ca):
@@ -42,6 +42,10 @@ RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
       sed "s#@KEYRING@#$key#" /pibox-apt/debian.sources > /etc/apt/sources.list.d/pibox.sources; \
       mkdir -p /etc/apt/auth.conf.d; install -m 600 /pibox-apt/auth.conf /etc/apt/auth.conf.d/pibox.conf; \
     fi; \
+    # No -security remote: your remotes' versions win, also over the base image's newer ones.
+    up=""; if [ -e /pibox-apt/no-security ]; then \
+      printf 'Package: *\nPin: release o=Debian\nPin-Priority: 1001\n\nPackage: *\nPin: release o=Ubuntu\nPin-Priority: 1001\n' > /etc/apt/preferences.d/pibox; \
+      up=1; fi; \
     # The base image may not have ca-certificates yet: apt trusts your CA for an https:// mirror.
     opt=""; if ls /usr/local/share/ca-certificates/pibox/*.crt >/dev/null 2>&1; then \
       cat /usr/local/share/ca-certificates/pibox/*.crt > /tmp/pibox-ca.pem; opt="-o Acquire::https::CaInfo=/tmp/pibox-ca.pem"; fi; \
@@ -53,7 +57,9 @@ RUN --mount=type=bind,source=generated/apt,target=/pibox-apt \
       grep -hE '^(URIs|Suites|Components):' /etc/apt/sources.list.d/*.sources 2>/dev/null || cat /etc/apt/sources.list; \
       echo "apt said:"; grep -E '^(Err|Ign|W|N|E):' /tmp/apt-update.log || true; exit 1; \
     fi; \
-    apt-get $opt install -y --no-install-recommends $PI_APT_PACKAGES; \
+    if [ -n "$up" ]; then apt-get $opt -y --allow-downgrades dist-upgrade; fi; \
+    apt-get $opt install -y --allow-downgrades --no-install-recommends $PI_APT_PACKAGES; \
+    rm -f /etc/apt/preferences.d/pibox; \
     rm -f /tmp/pibox-ca.pem /tmp/apt-update.log /tmp/apt-update.rc /etc/apt/auth.conf.d/pibox.conf; \
     rm -rf /var/lib/apt/lists/*; \
     update-ca-certificates

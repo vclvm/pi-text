@@ -751,9 +751,12 @@ Step by step:
   `pibox setup` asks each remote, from the Mac, which of `bookworm`, `bookworm-updates` and
   `bookworm-security` it has with packages for the VM's architecture, and writes exactly those into
   `generated/apt/` (a deb822 `sources` file, `<COMPONENT>` = `main`) with an apt `auth.conf` for the
-  login. It stops with a clear message if a remote can't be reached, refuses the login, has no
-  packages for the architecture, or no remote has `bookworm-security` (the base image's libraries
-  are newer than the release's: without it, `perl depends on perl-base … but … is to be installed`).
+  login. It stops with a clear message if a remote can't be reached, refuses the login or has no
+  packages for the architecture. Without a remote of `debian-security` the base image's libraries
+  are newer than the release's (`perl depends on perl-base … but … is to be installed`): the build
+  then pins your remotes (priority 1001) and brings the base image's packages to their versions
+  (`dist-upgrade --allow-downgrades`); `setup` warns that security fixes released after Debian's
+  last point release are then not in the image.
   Debian keeps every architecture, arm64 included, in the same archive, so the same remotes serve
   Apple Silicon. (With `ubuntu:24.04`, arm64 packages are on `ports.ubuntu.com/ubuntu-ports`, a
   separate remote.) The build mounts the files for the `apt-get` step only (`RUN --mount`), so the
