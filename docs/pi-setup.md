@@ -412,6 +412,13 @@ How to read it:
   it. `pibox setup` writes the plain form, because the programs reading these lists (curl, pip, npm,
   the bridge's httpx, Docker, the egress policy) disagree on `*.` and `.`. Other patterns, ports and
   URLs are refused.
+- **Every problem is reported at once**, with its line: `pibox check`, `setup`, `up`… print e.g.
+  `config.yaml:54: network.bridge_port: must be a port number (1-65535), not 'abc'`, one line per
+  problem (unknown sections and settings with the known names, wrong types, lists where one value
+  is expected, ports, ranges, URLs that must be `http://`, models without `id`, `contextWindow` or
+  `maxTokens`, `maxTokens` not below `contextWindow`, duplicate model ids, missing router URL or
+  key), and change nothing. Invalid YAML is reported with yq's line and column. `pibox init`
+  checks an existing `config.yaml` the same way after rebuilding it.
 - `pibox` stops with an error on a setting it doesn't know, so a typo doesn't silently fall back to a
   default. `pibox check` also refuses the template's placeholders (`YOUR_KEY`, `YOUR_MODEL_ID`,
   `/Users/you`) and folders that don't exist.
@@ -941,7 +948,7 @@ from `config.yaml`, and `compose.yaml` mounts them read-only where each tool loo
 | `settings.xml` | `~/.m2/settings.xml` | Your `repository.maven_settings`, adapted (below); or one mirror (`mirrorOf *`) = `repository.maven` with its credentials. The filtering proxy |
 | `toolchains.xml` | `~/.m2/toolchains.xml` | JDK 17, 21 and 25 for projects that use Maven toolchains |
 | `gradle.properties` | `~/.gradle/gradle.properties` | The proxy for Gradle; the JDKs for Gradle toolchains, no JDK downloads |
-| `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by your mirror |
+| `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by your repositories: those of `repository.maven_settings` (below) or the mirror `repository.maven` |
 | `npmrc` | `NPM_CONFIG_USERCONFIG` | Your `repository.npmrc`, adapted; or `repository.npm` with credentials (`_auth`). The proxy; no audit, no update checks |
 | `pip.conf` | `PIP_CONFIG_FILE` | Your `repository.pip_conf`, adapted; or `repository.pip` with credentials and its trusted host. The proxy |
 | `docker-config.json` | `~/.docker/config.json` | Login for `repository.docker_registry`; the proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
@@ -968,8 +975,16 @@ them (the VM doesn't see your home folder) and changes only what can't work in t
 Things that can't be fixed in a copy are reported: encrypted Maven passwords (`{…}`: the sandbox has
 no `settings-security.xml`) and references to environment variables of your Mac (`${env.…}`,
 `${…}`). `pibox up`, `run` and `verify` refuse to start when one of these files changed after the
-last `pibox setup`. Gradle doesn't read `settings.xml`: it still uses `repository.maven` as its
-mirror (or, if that's empty, the repositories of the build itself).
+last `pibox setup`.
+
+**Gradle from `settings.xml`.** Gradle doesn't read `settings.xml`, so `pibox setup` translates it
+into `init.gradle` the way Maven itself resolves repositories: the repositories of the active
+profiles (`<activeProfiles>`, `activeByDefault`) and Maven Central last, each replaced by the mirror
+whose `mirrorOf` matches it (an exact id first, then `*`, `external:*`, with `!id` exclusions),
+with the login of the `<server>` of the same id. Plugins come from `repository.gradle_plugins` if
+set, otherwise from the `pluginRepositories` and the same list. Without `maven_settings`, Gradle
+uses the single mirror `repository.maven`. If Maven Central has no mirror, `setup` warns: builds
+that need it can't reach it.
 
 **Repository hosts in the egress policy.** `pibox setup` collects every repository host from the
 generated files (`<url>`s, registries, mirrors, `repository.*` URLs) and adds it to

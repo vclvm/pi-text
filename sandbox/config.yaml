@@ -148,8 +148,11 @@ extensions:
 repository:
   # Your Maven settings.xml (absolute path or ~/…), e.g. ~/.m2/settings.xml. Used as is, except:
   # its <proxies> become the filtering proxy, <localRepository> and <offline> are dropped,
-  # https:// <url>s become http://. Encrypted passwords ({…}) don't work in the sandbox. When set,
-  # repository.maven, user and token don't apply to Maven (Gradle still uses repository.maven).
+  # https:// <url>s become http://. Encrypted passwords ({…}) don't work in the sandbox.
+  # Gradle gets the same repositories: those of the active profiles and Maven Central, each through
+  # the mirror whose mirrorOf matches it, with the login of the <server> of the same id; plugins
+  # from repository.gradle_plugins if set, else from the pluginRepositories and the same list.
+  # When set, repository.maven, user and token don't apply to Maven and Gradle.
   maven_settings: ""
   # Your .npmrc, e.g. ~/.npmrc: registries, scopes, tokens. Its proxy settings and Mac paths
   # (cafile, prefix, cache) are dropped, https:// registries become http://. When set,
@@ -169,7 +172,8 @@ repository:
   # Login for the URLs below, if the repository needs one.
   user: ""
   token: ""
-  # A Maven repository that proxies Maven Central (and whatever else you need); Gradle uses it too,
+  # A Maven repository that proxies Maven Central (and whatever else you need); Gradle uses it too
+  # (unless maven_settings is set),
   # e.g. http://repo.example.com/artifactory/maven-remote. "" = Maven Central, plugins.gradle.org
   maven: ""
   # A repository that proxies https://plugins.gradle.org/m2; "" = the maven URL above
