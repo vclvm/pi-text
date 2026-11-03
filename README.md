@@ -101,6 +101,7 @@ repository:
   npmrc: ~/.npmrc
   pip_conf: ~/.config/pip/pip.conf            # e.g. from Artifactory's "Set Me Up"
   docker_daemon: ~/.config/pi-sandbox/daemon.json
+  docker_config: ~/.docker/config.json             # registry logins ("auths")
 ```
 
 The sections are explained in [docs/pi-setup.md §6.5](docs/pi-setup.md#65-configyaml).

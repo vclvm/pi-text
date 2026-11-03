@@ -167,6 +167,12 @@ repository:
   # insecure-registries. hosts, tls*, data-root are dropped, the proxy is the filtering proxy,
   # mirrors become insecure registries (plain HTTP).
   docker_daemon: ""
+  # The docker CLI's config.json, e.g. ~/.docker/config.json: the logins ("auths") for your
+  # registries, so the agent can pull e.g. registry.corp:5000/team/app. Only entries with the
+  # login in the file ("auth", or username/password) are kept: credsStore/credHelpers keep it in
+  # your Mac's keychain, which the sandbox doesn't have. Registries with a login are reached over
+  # plain HTTP (added to the engine's insecure-registries).
+  docker_config: ""
   # Debian package mirrors for building the images (http://…/debian, http://…/debian-security);
   # "" = deb.debian.org
   apt_debian: ""

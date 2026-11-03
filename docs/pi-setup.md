@@ -951,7 +951,7 @@ from `config.yaml`, and `compose.yaml` mounts them read-only where each tool loo
 | `init.gradle` | `~/.gradle/init.d/pi-sandbox.gradle` | Replaces every remote repository of a build (plugins, buildscript, settings, projects) by the repositories of your `repository.maven_settings` (below) |
 | `npmrc` | `NPM_CONFIG_USERCONFIG` | Your `repository.npmrc`, adapted; without it only the proxy. No audit, no update checks |
 | `pip.conf` | `PIP_CONFIG_FILE` | Your `repository.pip_conf`, adapted; without it only the proxy |
-| `docker-config.json` | `~/.docker/config.json` | The proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
+| `docker-config.json` | `~/.docker/config.json` | The logins of your `repository.docker_config`; the proxy that `docker run`, `docker compose` and `docker build` give to the containers they start |
 | `daemon.json` | `/etc/docker/daemon.json` of the `docker` service | The agent's engine: your `repository.docker_daemon`, adapted; the proxy, the address pool (§8.10) |
 
 **Why:** the agent has no route to Maven Central, npmjs.com, PyPI or Docker Hub, and HTTPS tunnels
@@ -961,7 +961,8 @@ lists five repositories still resolves everything through your mirrors.
 
 **Your own files.** You give `pibox` the files you already use: `repository.maven_settings` (e.g. `~/.m2/settings.xml`),
 `repository.npmrc` (`~/.npmrc`), `repository.pip_conf` (e.g. the `pip.conf` of Artifactory's "Set Me
-Up"), `repository.docker_daemon` (a `daemon.json`). `pibox setup` copies them
+Up"), `repository.docker_daemon` (a `daemon.json`), `repository.docker_config` (the docker CLI's
+`config.json` with your registry logins). `pibox setup` copies them
 (the VM doesn't see your home folder) and changes only what can't work in the sandbox. Without a
 file, a tool gets only the filtering proxy and can't download anything (the public servers answer
 HTTPS only):
@@ -971,6 +972,7 @@ HTTPS only):
 | `settings.xml` | comments removed; `<proxies>` replaced by the filtering proxy; `<localRepository>` and `<offline>` dropped (Mac paths); `https://` in `<url>` becomes `http://` |
 | `.npmrc` | `proxy`, `https-proxy`, `noproxy`, `cafile`, `ca`, `strict-ssl`, `prefix`, `cache` and similar lines dropped; `https://` registries (scoped ones too) become `http://`; the filtering proxy added. Its `registry=` is also used to install Pi into the image |
 | `pip.conf` | `proxy`, `trusted-host`, `cert`, `client-cert`, `cache-dir`, `target`, `prefix`, `user` and similar keys dropped (in every section, with their continuation lines); `https://` becomes `http://`; the filtering proxy and a `trusted-host` with every index host added to `[global]` (pip refuses plain HTTP from untrusted hosts) |
+| `config.json` | only `auths` entries with the login in the file (`auth`, or `username`/`password`) are kept; `credsStore`, `credHelpers` and the rest dropped (they point to your Mac's keychain and settings; `setup` warns about registries whose login isn't in the file); the filtering proxy added. Registries with a login are added to the engine's `insecure-registries` and the egress lists |
 | `daemon.json` | `hosts`, `tls*`, `data-root`, `exec-root`, `pidfile` dropped; `proxies` set to the filtering proxy; `https://` mirrors become `http://` and are added to `insecure-registries`; the address pool and snapshotter set if missing |
 
 Things that can't be fixed in a copy are reported: encrypted Maven passwords (`{…}`: the sandbox has

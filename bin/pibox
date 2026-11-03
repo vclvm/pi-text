@@ -278,7 +278,7 @@ check_config() {                            # values that are certainly wrong; w
   done
   [[ "$SB/" != "$PROJECTS"/* ]] || bad folders.projects "must not contain $SB (the agent could change its own sandbox)"
   [[ "$SB/" != "$VAULT"/* ]] || bad folders.vault "must not contain $SB (the agent could change its own sandbox)"
-  for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf; do
+  for k in repository.maven_settings repository.npmrc repository.docker_daemon repository.pip_conf repository.docker_config; do
     f=${(P)SETTING[$k]}; [[ -z "$f" || -r "$f" ]] || bad $k "the file $f doesn't exist or isn't readable"
   done
   [[ "$AGENT_DOCKER" != sysbox || -n "$SYSBOX_DEB_URL" ]] ||
@@ -316,6 +316,7 @@ typeset -A SETTING=(
   repository.apt_debian APT_DEBIAN               repository.apt_security APT_SECURITY
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
   repository.docker_daemon DOCKER_DAEMON_FILE    repository.pip_conf PIP_CONF_FILE
+  repository.docker_config DOCKER_CONFIG_FILE
   images.node NODE_IMAGE                         images.python PYTHON_IMAGE
   images.mitmproxy MITMPROXY_IMAGE               images.jdk17 JDK17_IMAGE
   images.jdk21 JDK21_IMAGE                       images.jdk25 JDK25_IMAGE
@@ -353,7 +354,7 @@ load_config() {                             # defaults, then config.yaml on top
   # Maven wrapper's repository and login.
   NPM_REGISTRY=https://registry.npmjs.org/ PIP_INDEX_URL=https://pypi.org/simple
   MVNW_REPOURL="" MVNW_USERNAME="" MVNW_PASSWORD=""
-  MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE=""
+  MAVEN_SETTINGS_FILE="" NPMRC_FILE="" DOCKER_DAEMON_FILE="" PIP_CONF_FILE="" DOCKER_CONFIG_FILE=""
   NODE_IMAGE=node:24-bookworm-slim PYTHON_IMAGE=python:3.12-slim MITMPROXY_IMAGE=mitmproxy/mitmproxy:12.3.1
   JDK17_IMAGE=eclipse-temurin:17-jdk JDK21_IMAGE=eclipse-temurin:21-jdk JDK25_IMAGE=eclipse-temurin:25-jdk
   MAVEN_IMAGE=maven:3-eclipse-temurin-21 GRADLE_IMAGE=gradle:jdk21 DOCKER_CLI_IMAGE=docker:29-cli
@@ -496,7 +497,7 @@ typeset -A CHECK=(
   extensions.searxng url                extensions.fetch_max_chars int
   repository.apt_debian url
   repository.apt_security url           repository.maven_settings file        repository.npmrc file
-  repository.docker_daemon file         repository.pip_conf file
+  repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
   pi.apt_packages list                  pi.java_default 'one of:17 21 25'     pi.memory size
   pi.cpus number                        pi.pids int
   agent_docker.mode 'one of:sysbox privileged off'                            agent_docker.sysbox_deb_url url
@@ -637,7 +638,7 @@ fresh() {                                   # the generated files must be newer 
   [[ -f "$SB/.env" && -f "$SB/agent/models.json" ]] || die "nothing generated yet: run pibox setup"
   [[ ! "$CONFIG" -nt "$SB/.env" ]] || die "config.yaml changed since the last setup: run pibox setup"
   local f
-  for f in "$MAVEN_SETTINGS_FILE" "$NPMRC_FILE" "$DOCKER_DAEMON_FILE" "$PIP_CONF_FILE"; do
+  for f in "$MAVEN_SETTINGS_FILE" "$NPMRC_FILE" "$DOCKER_DAEMON_FILE" "$PIP_CONF_FILE" "$DOCKER_CONFIG_FILE"; do
     [[ -z "$f" || ! "$f" -nt "$SB/.env" ]] || die "$f changed since the last setup: run pibox setup"
   done
 }
@@ -830,14 +831,42 @@ own_pip_conf() {                            # own_pip_conf <yours> <copy> <proxy
   return 0
 }
 
+own_docker_config() {                       # own_docker_config <yours or ""> <copy>
+  # The docker CLI's config.json, e.g. ~/.docker/config.json: only the logins written in it
+  # ("auths" entries with "auth" or username/password) are kept. credsStore/credHelpers point to
+  # your Mac's keychain, which the sandbox doesn't have; everything else is about your Mac too.
+  # Sets DOCKER_LOGIN_REGS: the registries (host[:port]) with a login, except Docker Hub.
+  typeset -ga DOCKER_LOGIN_REGS=()
+  local src=${1:-} reg n
+  if [[ -n "$src" ]]; then
+    yq -p json '.' "$src" >/dev/null 2>&1 || die "$src: not valid JSON"
+    n=$(yq -p json -o yaml '[(.auths // {}) | to_entries | .[] | select((.value.auth // .value.username // "") == "")] | length' "$src")
+    (( n == 0 )) || warn "$src: $n registr(y/ies) without a login in the file (kept in the keychain via credsStore/credHelpers): not available in the sandbox; use docker login --password-stdin with a config that has no credsStore, or write the auth into the file"
+    for reg in ${(f)"$(yq -p json -o yaml '(.auths // {}) | to_entries | .[] | select((.value.auth // .value.username // "") != "") | .key' "$src")"}; do
+      reg=${${reg#*://}%%/*}
+      [[ "$reg" == (index.docker.io|docker.io|registry-1.docker.io|) ]] || DOCKER_LOGIN_REGS+=("$reg")
+    done
+  fi
+  (umask 077; SRC="${src:-/dev/null}" P="http://$SANDBOX_PROXY_IP:$PROXY_PORT" yq -n -o json '
+    (load(strenv(SRC)) // {}) as $c
+    | {"auths": (($c.auths // {}) | with_entries(select((.value.auth // .value.username // "") != "")
+                                    | .value = (.value | with_entries(select(.key == "auth" or .key == "username" or .key == "password" or .key == "identitytoken"))))),
+       "proxies": {"default": {"httpProxy": strenv(P), "httpsProxy": strenv(P), "noProxy": "localhost,127.0.0.1"}}}
+  ' > "$2") || die "can't adapt ${src:-the Docker CLI config}"
+  (( $#DOCKER_LOGIN_REGS )) && print "${src}: logins for ${(j:, :)DOCKER_LOGIN_REGS}; the agent's engine reaches them over plain HTTP"
+  return 0
+}
+
 own_daemon() {                              # own_daemon <yours> <copy> <proxy port>
   # Settings that clash with how the engine runs here out; mirrors as plain HTTP (so also insecure
   # registries); the filtering proxy, the address pool and the snapshotter of the sandbox in.
-  (umask 077; P="http://proxy:$3" POOL="$DIND_ADDRESS_POOL" yq -p json -o json '
+  # Registries you have a login for (docker_config) are plain HTTP too.
+  (umask 077; P="http://proxy:$3" POOL="$DIND_ADDRESS_POOL" REGS="${(j:,:)DOCKER_LOGIN_REGS}" yq -p json -o json '
     del(.hosts, .tls, .tlsverify, .tlscacert, .tlscert, .tlskey, .["data-root"], .["exec-root"], .pidfile)
     | .["registry-mirrors"] = ((.["registry-mirrors"] // []) | map(sub("^https://"; "http://")))
     | .["insecure-registries"] = ((.["insecure-registries"] // [])
-        + (.["registry-mirrors"] | map(sub("^https?://"; "") | sub("/.*$"; ""))) | unique)
+        + (.["registry-mirrors"] | map(sub("^https?://"; "") | sub("/.*$"; "")))
+        + (strenv(REGS) | split(",") | map(select(. != ""))) | unique)
     | .proxies = {"http-proxy": strenv(P), "https-proxy": strenv(P), "no-proxy": "localhost,127.0.0.1"}
     | .["default-address-pools"] = (.["default-address-pools"] // [{"base": strenv(POOL), "size": 24}])
     | .features["containerd-snapshotter"] |= (. // false)
@@ -982,21 +1011,14 @@ update-notifier=false"
 proxy = http://$ph:$pp" > "$dir/pip.conf"
   fi
 
-  # Docker CLI: the proxy for the containers and builds it starts.
-  print -r -- "{
-  \"proxies\": { \"default\": { \"httpProxy\": \"http://$SANDBOX_PROXY_IP:$pp\", \"httpsProxy\": \"http://$SANDBOX_PROXY_IP:$pp\",
-                             \"noProxy\": \"localhost,127.0.0.1\" } }
-}" > "$dir/docker-config.json"
+  # Docker CLI: your logins (docker_config), and the proxy for the containers and builds it starts.
+  own_docker_config "${DOCKER_CONFIG_FILE:-}" "$dir/docker-config.json"
 
-  # The agent's Docker engine: your daemon.json, or only the filtering proxy.
-  if [[ -n "$DOCKER_DAEMON_FILE" ]]; then
-    own_daemon "$DOCKER_DAEMON_FILE" "$dir/daemon.json" "$pp"; return
-  fi
-  print -r -- "{
-  \"proxies\": { \"http-proxy\": \"http://proxy:$pp\", \"https-proxy\": \"http://proxy:$pp\", \"no-proxy\": \"localhost,127.0.0.1\" },
-  \"default-address-pools\": [{ \"base\": \"$DIND_ADDRESS_POOL\", \"size\": 24 }],
-  \"features\": { \"containerd-snapshotter\": false }
-}" > "$dir/daemon.json"
+  # The agent's Docker engine: your daemon.json (or an empty one), adapted.
+  local empty="$dir/.daemon-empty.json"
+  [[ -n "$DOCKER_DAEMON_FILE" ]] || print '{}' > "$empty"
+  own_daemon "${DOCKER_DAEMON_FILE:-$empty}" "$dir/daemon.json" "$pp"
+  rm -f "$empty"
 }
 
 
