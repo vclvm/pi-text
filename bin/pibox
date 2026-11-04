@@ -62,6 +62,7 @@ Check:
                  request to each), rate-limit headers; 'probe limits': what the bridge knows now;
                  'probe thinking|history --models a,b': what changes thinking, does the model see
                  its earlier thinking
+  nettest URL    where a request hangs: from the VM directly, via your Mac's proxy, as the agent
   ps [kill PID]  the processes in Pi's container (how long each runs); kill one that hangs
   diag           live view of every request in a second terminal: rate-limit waits, router answer,
                  first token, writing speed, and where the time went (--history 0, --json)"
@@ -71,7 +72,7 @@ Check:
 # Copies the components into ~/.pi-sandbox. The agent can write to your projects, so the files that
 # hold the key and define the guard rails are copies outside its reach, never the repository itself.
 COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json agent/APPEND_SYSTEM.md)
-BRIDGE_FILES=(Dockerfile proxy.py probe.py diag.py requirements.txt pi-trace.py)
+BRIDGE_FILES=(Dockerfile proxy.py probe.py diag.py requirements.txt pi-trace.py nettest.py)
 
 cmd_init() {
   local src="${SELF:h:h}" f
@@ -1600,6 +1601,21 @@ shell)                                      # bash in the agent's container, wit
   fresh; running
   local h; h=$(here)
   compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" --entrypoint bash pi "$@"
+  ;;
+
+nettest)                                    # where a request to URL hangs: VM direct, Mac proxy, agent's path
+  running
+  [[ "${1:-}" == http*://* ]] || die "usage: pibox nettest https://host/path   (e.g. your Maven repository)"
+  compose_args; local -a c=($reply); dk; local -a d=($reply)
+  $d $c exec -T bridge python - "$1" < "$SB/bridge/nettest.py"
+  print "\nAs the agent sees it (pi container → sandbox proxy → …; an http:// URL waits for pibox approve):"
+  $d $c run --rm --no-deps -T --entrypoint bash pi -c 'curl -sS -o /dev/null -m 60 -w "  HTTP %{http_code}  connect %{time_connect}s  tls %{time_appconnect}s  total %{time_total}s\n" "$1" || echo "  ❌ curl exit $? (28 = timeout, 56 = refused by the proxy)"' _ "$1"
+  print -r -- "
+How to read it: the agent's https:// requests to a repository go through the sandbox proxy as a
+tunnel (egress.tunnel), then out like the bridge lines above (directly or through your Mac's proxy).
+  direct ✅, upstream proxy ❌ → add the host to network.upstream_no_proxy
+  direct ❌, upstream proxy ✅ → remove it from network.upstream_no_proxy
+  both ✅, the agent's line ❌ → the sandbox proxy: pibox log, and is the host in egress.tunnel?"
   ;;
 
 ps)                                         # what the agent's commands are doing; ps kill PID stops one
