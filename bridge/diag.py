@@ -378,6 +378,8 @@ class View:
             text = f"  → to Pi: finish={e.get('finish')} tool calls: {len(calls) or 'none'}"
             for call in calls:
                 text += f"\n    {call}"
+            if e.get("said"):
+                text += f"\n    the model said: {e['said']}"
             self.line(e, "info", text)
         elif k == "error":
             self.line(e, "err", f"  ✗ error {e.get('status')} to Pi: {e.get('message')}")

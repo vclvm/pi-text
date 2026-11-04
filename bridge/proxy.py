@@ -409,6 +409,12 @@ def _tail(text: str, size: int = 160) -> str:
     return text
 
 
+def _said(raw: list[str], limit: int = 400) -> str:
+    """The end of the model's answer text (without <think>), for diag when it ends the turn."""
+    text = " ".join(_THINK_RE.sub("", "".join(raw)).split())
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
 def _call_summary(call: dict, size: int = 90) -> str:
     """`bash: git status` — a tool call in one short line, for `pibox diag`."""
     name = call["function"]["name"]
@@ -2135,7 +2141,8 @@ class Bridge:
                 trace(f"-> client: finish={'tool_calls' if calls else finish or 'stop'} usage={json.dumps(usage)}")
                 trace.event("done", finish="tool_calls" if calls else (finish or "stop"),
                             calls=[c["function"]["name"] for c in calls], attempts=attempt + 1,
-                            call_args=[_call_summary(c) for c in calls])
+                            call_args=[_call_summary(c) for c in calls],
+                            said=None if calls else _said(raw))
                 yield "finish", "tool_calls" if calls else (finish or "stop")
                 return
         except BridgeError as e:
