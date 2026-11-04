@@ -49,6 +49,9 @@ Install and configure:
 Run:
   up             start the VM, build the images, start bridge, proxy and the agent's Docker engine
   run [args]     Pi in a fresh container, in the current folder (args go to pi)
+  task [new|edit [rules]]
+                 the project's task and rules, outside its repository (folders.notes/<path under ~>):
+                 new archives the current task and starts one from the template; Pi reads both
   approve        the approval console for the agent's web requests (detach: Ctrl-P Ctrl-Q)
   log            follow the web journal
   shell          a bash shell in the agent's container, without Pi
@@ -72,7 +75,7 @@ Check:
 # ---------------------------------------------------------------- init (runs from the repository)
 # Copies the components into ~/.pi-sandbox. The agent can write to your projects, so the files that
 # hold the key and define the guard rails are copies outside its reach, never the repository itself.
-COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json agent/APPEND_SYSTEM.md)
+COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json agent/APPEND_SYSTEM.md agent/prompts agent/templates)
 BRIDGE_FILES=(Dockerfile proxy.py probe.py diag.py requirements.txt pi-trace.py nettest.py)
 
 cmd_init() {
@@ -350,6 +353,10 @@ check_config() {                            # values that are certainly wrong; w
   done
   [[ "$SB/" != "$PROJECTS"/* ]] || bad folders.projects "must not contain $SB (the agent could change its own sandbox)"
   [[ "$SB/" != "$VAULT"/* ]] || bad folders.vault "must not contain $SB (the agent could change its own sandbox)"
+  [[ "$SB/" != "$NOTES"/* && "$NOTES/" != "$SB"/* ]] ||
+    bad folders.notes "must be apart from $SB (the agent writes there; $SB is read-only for it)"
+  [[ "$NOTES/" != "$PROJECTS"/* && "$NOTES/" != "$VAULT"/* && "$PROJECTS/" != "$NOTES"/* && "$VAULT/" != "$NOTES"/* ]] ||
+    bad folders.notes "must be apart from the projects and vault folders (notes inside a repository end up in git)"
   if [[ "$AGENT_DOCKER" == sysbox && -z "$SYSBOX_DEB_URL" ]]; then
     bad agent_docker.sysbox_deb_url "mode sysbox needs a sysbox-ce .deb for the VM (its URL, or the path of the file on this Mac); or use mode: privileged"
   elif [[ "$AGENT_DOCKER" == sysbox && "$SYSBOX_DEB_URL" == /* && ! -r "$SYSBOX_DEB_URL" ]]; then
@@ -387,6 +394,7 @@ check_config() {                            # values that are certainly wrong; w
 # compose.yaml and the extensions use for it.
 typeset -A SETTING=(
   folders.projects PROJECTS_DIR                  folders.vault VAULT_DIR
+  folders.notes NOTES_DIR
   network.bridge_port BRIDGE_PORT                network.proxy_port PROXY_PORT
   network.mac_proxy_port MAC_PROXY_PORT          network.upstream_no_proxy UPSTREAM_NO_PROXY
   network.sandbox_subnet SANDBOX_SUBNET          network.ca_certs CA_CERTS
@@ -430,7 +438,7 @@ load_config() {                             # defaults, then config.yaml on top
   have yq || die "yq not found: brew install yq"
   # set -a exports them, so docker compose sees the same values. The agent gets a clean environment.
   set -a
-  PROJECTS_DIR="" VAULT_DIR=""
+  PROJECTS_DIR="" VAULT_DIR="" NOTES_DIR="$HOME/.pi-workspace"
   CA_CERTS=""
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
@@ -532,7 +540,8 @@ load_config() {                             # defaults, then config.yaml on top
 
   [[ -n "$PROJECTS_DIR" ]] || bad folders "projects is missing: the absolute path of your projects folder"
   [[ -n "$VAULT_DIR" ]] || bad folders "vault is missing: the absolute path of your Obsidian vault"
-  typeset -g PROJECTS="${PROJECTS_DIR:A}" VAULT="${VAULT_DIR:A}"
+  [[ "$NOTES_DIR" == /* ]] || bad folders.notes "must be an absolute path (empty: ~/.pi-workspace)"
+  typeset -g PROJECTS="${PROJECTS_DIR:A}" VAULT="${VAULT_DIR:A}" NOTES="${NOTES_DIR:A}"
   check_models
   if (( $#CFG_ERRORS )); then
     print -rl -- "${CFG_ERRORS[@]}" | sort -t: -k2,2n >&2
@@ -694,6 +703,8 @@ mounts:
     writable: true
   - location: \"$VAULT\"
     writable: true
+  - location: \"$NOTES\"
+    writable: true
   - location: \"$SB\"
     writable: false"
   # Names only your Mac resolves (dns_hosts): network.dnsHosts, the VM's own DNS answers them.
@@ -744,6 +755,7 @@ cmd_setup() {
   dotenv "$SB/.env" $kv                                         # docker compose
   dotenv "$SB/generated/bridge.env" BRIDGE_PORT="$BRIDGE_PORT" $BRIDGE_ENV   # the bridge container only
   models "http://bridge:$BRIDGE_PORT/v1" "$SB/agent/models.json"
+  mkdir -p "$NOTES"                                             # shared with the VM: must exist
   vmfile=$(COLIMA_FILE); mkdir -p "${vmfile:h}"
   [[ -f "$SB/generated/colima.yaml" ]] && old=$(<"$SB/generated/colima.yaml")
   colima_config > "$SB/generated/colima.yaml"          # pibox's copy: Colima rewrites its file at start
@@ -1112,6 +1124,14 @@ here() {                                    # the current folder, if the agent m
   local h="${PWD:A}"
   [[ "$h/" == "$PROJECTS"/* || "$h/" == "$VAULT"/* ]] || die "start it from a folder under $PROJECTS or $VAULT"
   print -r -- "$h"
+}
+
+project_notes() {                           # the notes folder of the project in $1: folders.notes/<its path under ~>
+  local h=$1 top
+  # The repository's root, so that Pi started in a module of it uses the same notes
+  top=$(git -C "$h" rev-parse --show-toplevel 2>/dev/null) && top=${top:A} &&
+    [[ "$top/" == "$PROJECTS"/* || "$top/" == "$VAULT"/* ]] && h=$top
+  if [[ "$h/" == "$HOME"/* ]]; then print -r -- "$NOTES/${h#$HOME/}"; else print -r -- "$NOTES/${h#/}"; fi
 }
 
 sysbox_installed() {                        # is sysbox installed and running in the VM?
@@ -1595,8 +1615,36 @@ up)                                         # VM, images, bridge, proxy, the age
 
 run)                                        # Pi in a fresh container, in the current folder
   fresh; running
-  local h; h=$(here)
-  compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" pi "$@"
+  local h n; h=$(here); n=$(project_notes "$h"); mkdir -p "$n"
+  compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" -e PI_PROJECT_NOTES="$n" pi "$@"
+  ;;
+
+task)                                       # the project's task and notes, outside its repository
+  local h n t ts; h=$(here); n=$(project_notes "$h"); t="$SB/agent/templates"
+  [[ -d "$t" ]] || die "templates missing in $SB: run <path-to-pi-text>/bin/pibox init"
+  case "${1:-show}" in
+    show|path)
+      print -r -- "notes of this project: $n"
+      if [[ -f "$n/current-task.md" ]]; then print -r -- "current task: $n/current-task.md (${$(wc -l <"$n/current-task.md")// /} lines)"
+      else print -r -- "no current task yet: pibox task new"; fi
+      ;;
+    new|next)                               # archive the current task, start a new one from the template
+      mkdir -p "$n"/{designs,implemented,reviews,tests,investigations,context,history}
+      [[ -f "$n/AGENTS.md" ]] || cp "$t/AGENTS.md" "$n/AGENTS.md"
+      if [[ -f "$n/current-task.md" ]]; then
+        ts=$(date +%Y-%m-%d_%H-%M-%S); mv "$n/current-task.md" "$n/history/${ts}_task.md"
+        print -r -- "archived: $n/history/${ts}_task.md"
+      fi
+      cp "$t/current-task.md" "$n/current-task.md"
+      print -r -- "new task: $n/current-task.md (pibox task edit); project rules: $n/AGENTS.md"
+      ;;
+    edit)                                   # open the current task (or the project rules: edit rules)
+      local f="$n/current-task.md"; [[ "${2:-}" == rules ]] && f="$n/AGENTS.md"
+      [[ -f "$f" ]] || die "$f doesn't exist: pibox task new"
+      exec ${=VISUAL:-${EDITOR:-vi}} "$f"
+      ;;
+    *) die "usage: pibox task [show|new|edit [rules]]" ;;
+  esac
   ;;
 
 probe)                                      # the router's endpoints, models and limits (bridge/probe.py)
@@ -1612,8 +1660,8 @@ diag)                                       # live view of the bridge's requests
 
 shell)                                      # bash in the agent's container, without Pi
   fresh; running
-  local h; h=$(here)
-  compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" --entrypoint bash pi "$@"
+  local h n; h=$(here); n=$(project_notes "$h"); mkdir -p "$n"
+  compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" -e PI_PROJECT_NOTES="$n" --entrypoint bash pi "$@"
   ;;
 
 nettest)                                    # where a request to URL hangs: VM direct, Mac proxy, agent's path

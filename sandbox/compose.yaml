@@ -165,17 +165,22 @@ services:
       WEB_SEARCH_SEARXNG: ${WEB_SEARCH_SEARXNG:-}
       WEB_FETCH_MAX_CHARS: ${WEB_FETCH_MAX_CHARS:-20000}
       # Folders the file tools may touch (sandbox-guard.ts):
-      PI_SANDBOX_ROOTS: ${PROJECTS_DIR}:${VAULT_DIR:?run pibox setup, it generates .env from config.yaml}
+      PI_SANDBOX_ROOTS: ${PROJECTS_DIR}:${VAULT_DIR:?run pibox setup, it generates .env from config.yaml}:${NOTES_DIR:?run pibox setup, it generates .env from config.yaml}
+      # Notes, tasks and reports, outside the repositories (project-context.ts); pibox run sets
+      # PI_PROJECT_NOTES to the current project's folder in it
+      PI_NOTES_DIR: ${NOTES_DIR}
       PI_WEB_PROXY: http://proxy:${PROXY_PORT:-8080}
     volumes:
       # Same paths as on the Mac, so paths in notes, logs and Pi sessions mean the same everywhere.
       - ${PROJECTS_DIR}:${PROJECTS_DIR}
       - ${VAULT_DIR}:${VAULT_DIR}
       - ${VAULT_DIR}/.obsidian:${VAULT_DIR}/.obsidian:ro   # Obsidian config and plugins: read-only
+      - ${NOTES_DIR}:${NOTES_DIR}
       - pi-home:/home/pi/.pi/agent
       - ./agent/models.json:/home/pi/.pi/agent/models.json:ro
       - ./agent/settings.json:/home/pi/.pi/agent/settings.json:ro
       - ./agent/APPEND_SYSTEM.md:/home/pi/.pi/agent/APPEND_SYSTEM.md:ro
+      - ./agent/prompts:/home/pi/.pi/agent/prompts:ro     # /design /implement /review /test
       - ./extensions:/home/pi/.pi/agent/extensions:ro
       # Build caches (writable) and the generated tool settings on top of them (read-only):
       - pi-m2:/home/pi/.m2

@@ -347,7 +347,9 @@ You don't need Pi, Node.js or Python on the Mac: Pi runs in the agent's containe
 
 - `~/Projects`: all your projects. The agent can read a neighbouring API's sources and work on
   several repositories in one session;
-- your **Obsidian vault**: notes it reads, and research results it writes there.
+- your **Obsidian vault**: notes it reads, and research results it writes there;
+- the **notes folder** (`folders.notes`, default `~/.pi-workspace`): per project its task, rules,
+  notes and reports, outside the repository so none of it ends up in git (§7.2).
 
 Nothing else in your home folder exists for it.
 
@@ -562,6 +564,45 @@ Requests the policy refused show up as already answered (403/405) and never wait
 - `pibox run -p "…"` (one prompt, no UI) waits for input on stdin: add `</dev/null` when you script it.
 
 After a session: `pibox review` (§7.3).
+
+### 7.2 Tasks, project rules and reports outside the repository
+
+Every project has a folder in `folders.notes` (default `~/.pi-workspace`): its path under your home
+folder, at the root of its git repository, so `~/Projects/api` (or Pi started in
+`~/Projects/api/module`) → `~/.pi-workspace/Projects/api`. `pibox run` creates it and tells Pi
+(`PI_PROJECT_NOTES`). Notes, plans and reports go there: the repository gets only code, tests and
+docs you asked for, and nobody has to touch `.gitignore`.
+
+```bash
+cd ~/Projects/api
+pibox task new          # current-task.md and AGENTS.md from the templates (an old task goes to history/)
+pibox task edit         # the task: goal, expected behaviour, in/out of scope, acceptance, where to look
+pibox task edit rules   # AGENTS.md: build and test commands, conventions, an example test, what not to do
+pibox task              # where the folder is, whether a task is written
+pibox run
+```
+
+- **The task and the rules go with every request.** [sandbox/extensions/project-context.ts](../sandbox/extensions/project-context.ts)
+  reads `AGENTS.md` and `current-task.md` before every run and puts them into the system prompt
+  (section `<project_notes>`), so an edited task counts from your next message. The templates keep
+  their hints in `<!-- … -->`, which is left out; a file with only headings counts as not written.
+  Concrete beats long: "Out of scope: no database in the test" and "like `OrderControllerTest`"
+  keep a model from wandering better than general principles.
+- **The task describes the problem, the command the step.** `current-task.md` says what you want
+  (a change, a bug, a question) with its scope, acceptance criteria and context: error messages,
+  log lines, the ticket, what was tried. It is easier to write there than in Pi's input line, and
+  as part of the system prompt it doesn't fade after half an hour of work. Long logs go into
+  `context/` of the notes folder, named in the task. For a quick job skip the file and just ask.
+- **Commands for the steps**, prompt templates in [sandbox/agent/prompts](../sandbox/agent/prompts):
+  `/design [focus]`, `/implement [instructions]`, `/review [focus]`, `/test [what]` on the current
+  task, and `/investigate [question]` for a bug's cause or "how and why does this work" (without
+  a question: the current task). Each writes one report into `designs/`, `implemented/`, `reviews/`,
+  `tests/` or `investigations/` of the notes folder (named `<date>_<time>_<2-3 words>_<kind>.md`)
+  and answers with a short verdict and the file's path. `/design`, `/review` and `/investigate`
+  don't change the code; `/investigate` cites `file:line`, outputs and commits for every claim and
+  proposes a fix without applying it.
+- **A new `.md` file in a repository asks first** (sandbox-guard): allow it for docs you want in
+  the project, deny it for notes.
 
 ### 7.3 Make undo cheap, and review what could run later
 
@@ -887,10 +928,12 @@ Next to it, [sandbox/agent/APPEND_SYSTEM.md](../sandbox/agent/APPEND_SYSTEM.md) 
 system prompt. They tell the model to batch independent tool calls into one reply, to read files in
 parts, to filter command output and to avoid re-reading files. Every reply is one more rate-limited
 request that re-sends the whole conversation, so fewer and smaller turns save requests and tokens.
-For long tasks they ask for small steps, a plan with findings in `.pi-notes/<task>.md` in the
-project, and long results (reports) written into files section by section, never as one huge
+They keep the model on the task (the smallest change, the project's own patterns, isolated
+tests, sources rather than build output) and put notes and reports into the project's notes folder
+outside the repository (§7.2). For long tasks they ask for small steps, a plan with findings in
+`notes/<task>.md` there, and long results (reports) written into files section by section, never as one huge
 reply: one reply has a hard output limit (`maxTokens`, shared with thinking), and a reply that hits
-it is cut off mid-sentence. The file is ~400 tokens, sent with every request; delete the mount in
+it is cut off mid-sentence. The file is ~1300 tokens, sent with every request; delete the mount in
 `compose.yaml` if you don't want it.
 
 The image sets `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1` and `PI_TELEMETRY=0`: Pi makes no network
@@ -1207,6 +1250,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `config` | Print the settings in effect, secrets masked |
 | `up` | Start the VM (restarted when `pibox setup` changed its settings), install sysbox if needed (mode `sysbox`), build the images, start bridge, proxy and the agent's Docker engine, always as new containers (they mount files `init`/`setup` replace) (§6.7) |
 | `run [args]` | Pi in a fresh container, in the current folder; `args` go to Pi (§7.1) |
+| `task [new\|edit [rules]]` | The project's task and rules in its notes folder, outside the repository; `new` archives the current task into `history/` (§7.2) |
 | `approve` | The approval console of the proxy; detach with Ctrl-P Ctrl-Q (§7.1) |
 | `log` | Follow the web journal |
 | `shell [args]` | A bash shell in the agent's container without Pi, in the current folder: try what the agent could do |

@@ -11,10 +11,12 @@
  *    whatever words its arguments contain.
  *  - bash commands get a timeout of PI_BASH_TIMEOUT seconds (default 600) unless the model sets one,
  *    so a command that hangs (a network call that never answers) can't block the agent for ever
+ *  - a new Markdown file in a project (not in the notes folder PI_NOTES_DIR) needs approval: notes
+ *    and reports belong in the notes folder, outside the repository, or they end up in git
  *  - without a UI (pi -p), anything that would need approval is blocked
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 
@@ -24,6 +26,8 @@ const MODE = (process.env.PI_BASH_APPROVAL ?? "risky").toLowerCase();
 const TIMEOUT = Number(process.env.PI_BASH_TIMEOUT ?? "600");
 const PATH_TOOLS = new Set(["read", "write", "edit", "ls", "grep", "find"]);
 const WRITE_TOOLS = new Set(["write", "edit"]);
+const NOTES_DIR = process.env.PI_NOTES_DIR && existsSync(process.env.PI_NOTES_DIR)
+  ? realpathSync(process.env.PI_NOTES_DIR) : "";
 const PROTECTED = /(^|\/)(\.git\/(hooks|config)|\.obsidian)(\/|$)/;
 
 // ------------------------------------------------------------------ what makes a command risky
@@ -367,6 +371,16 @@ export default function (pi: ExtensionAPI) {
       }
       if (WRITE_TOOLS.has(event.toolName) && PROTECTED.test(target)) {
         return { block: true, reason: `"${path}" is protected: hooks, git config and .obsidian are edited by the user only` };
+      }
+      if (NOTES_DIR && event.toolName === "write" && /\.md$/i.test(target) && !inside(target, NOTES_DIR)
+          && !existsSync(target)) {
+        const notes = process.env.PI_PROJECT_NOTES || NOTES_DIR;
+        const reason = `Notes, plans and reports go into the project's notes folder ${notes}, not into the repository`;
+        if (!ctx.hasUI) return { block: true, reason };
+        const choice = await ctx.ui.select(
+          `New Markdown file in the repository:\n\n${target}\n\nNotes and reports belong in ${notes} (outside git).`,
+          ["Allow (it is a deliverable, e.g. docs I asked for)", "Deny"]);
+        if (!choice?.startsWith("Allow")) return { block: true, reason: `Denied by the user. ${reason}` };
       }
       return undefined;
     }
