@@ -166,6 +166,7 @@ services:
       - pi-home:/home/pi/.pi/agent
       - ./agent/models.json:/home/pi/.pi/agent/models.json:ro
       - ./agent/settings.json:/home/pi/.pi/agent/settings.json:ro
+      - ./agent/APPEND_SYSTEM.md:/home/pi/.pi/agent/APPEND_SYSTEM.md:ro
       - ./extensions:/home/pi/.pi/agent/extensions:ro
       # Build caches (writable) and the generated tool settings on top of them (read-only):
       - pi-m2:/home/pi/.m2

@@ -1,6 +1,9 @@
 import asyncio
+import email.utils
 import json
 import re
+import time
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -63,10 +66,11 @@ class FakeRouter:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        self.requests.append({"url": str(request.url), "headers": dict(request.headers), "json": body})
+        self.requests.append({"url": str(request.url), "headers": dict(request.headers), "json": body,
+                              "t": time.monotonic()})
         reply = self.replies.pop(0)
-        if isinstance(reply, tuple):
-            return httpx.Response(reply[0], json=reply[1])
+        if isinstance(reply, tuple):  # (status, body) or (status, body, headers)
+            return httpx.Response(reply[0], json=reply[1], headers=reply[2] if len(reply) > 2 else None)
         content = reply(nonce_of(body))
         usage = {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}
         if not self.stream:
@@ -262,11 +266,11 @@ def test_lenient_json_repair_for_complete_block():
 
 
 def test_upstream_error_status_and_body_pass_through():
-    router = FakeRouter((429, {"error": {"message": "slow down", "type": "rate_limit", "code": "rate_limit"}}))
+    router = FakeRouter((403, {"error": {"message": "forbidden", "type": "auth", "code": "no_access"}}))
     with make_client(router) as client:
         r = client.post("/v1/chat/completions", json=tools_payload())
-    assert r.status_code == 429
-    assert r.json()["error"] == {"message": "upstream: slow down", "type": "rate_limit", "code": "rate_limit"}
+    assert r.status_code == 403
+    assert r.json()["error"] == {"message": "upstream: forbidden", "type": "auth", "code": "no_access"}
 
     router = FakeRouter((401, {"error": "bad key"}), stream=True)
     with make_client(router) as client:
@@ -897,3 +901,138 @@ def test_idless_tag_in_code_is_text_but_outside_is_a_call_attempt():
     with make_client(router, max_retries=0, require_nonce=False) as client:
         message = client.post("/v1/chat/completions", json=tools_payload()).json()["choices"][0]["message"]
     assert message["tool_calls"][0]["function"]["name"] == "bash"
+
+
+# --------------------------------------------------------------------------- rate limits
+
+UNSUPPORTED = {"error": {"message": "the model you requested is unsupported. please edit your configuration "
+                                    "to use an authorized model", "type": "invalid_request_error"}}
+
+
+def test_parse_rate_limit_headers():
+    now = 1_800_000_000.0
+    info = proxy.parse_rate_limit({"x-ratelimit-remaining-requests": "3", "x-ratelimit-reset-requests": "6m0s",
+                                   "x-ratelimit-remaining-tokens": "1200", "x-ratelimit-reset-tokens": "20ms",
+                                   "Retry-After": "7", "content-type": "application/json"}, now=now)
+    assert (info.remaining_requests, info.reset_requests, info.remaining_tokens) == (3, 360, 1200)
+    assert info.reset_tokens == pytest.approx(0.02) and info.retry_after == 7
+    assert "content-type" not in info.headers and "retry-after" in info.headers
+
+    assert proxy.parse_rate_limit({"retry-after-ms": "1500", "retry-after": "9"}).retry_after == 1.5
+    http_date = email.utils.formatdate(now + 30, usegmt=True)
+    assert proxy.parse_rate_limit({"retry-after": http_date}, now=now).retry_after == pytest.approx(30)
+    # OpenRouter: epoch milliseconds; GitHub style: epoch seconds; IETF draft: delta seconds
+    assert proxy.parse_rate_limit({"x-ratelimit-reset": str(int((now + 12) * 1000))}, now=now).reset_requests \
+        == pytest.approx(12)
+    assert proxy.parse_rate_limit({"x-ratelimit-reset": str(int(now + 45))}, now=now).reset_requests \
+        == pytest.approx(45)
+    info = proxy.parse_rate_limit({"ratelimit": "limit=100, remaining=0, reset=5"}, now=now)
+    assert (info.remaining_requests, info.reset_requests) == (0, 5)
+
+
+@pytest.mark.parametrize("body, wait", [
+    ({"error": {"message": "Rate limit exceeded. Please try again in 1m30s."}}, 90),
+    ({"error": {"message": "Too many requests, retry after 20 seconds"}}, 20),
+    ({"error": {"message": "limit reached", "retry_after": 12}}, 12),
+    ({"error": {"message": "limit reached", "retryAfterMs": 2500}}, 2.5),
+    ({"error": {"message": "quota exceeded, resets at 2027-01-15T08:01:00Z"}}, 60),
+    ({"error": {"message": "quota exceeded", "reset_at": "2027-01-15T08:00:30+00:00"}}, 30),
+    ("Rate limit: 10 requests per minute. Try again in 42 s", 42),
+    ({"error": {"message": "slow down"}}, None),
+])
+def test_wait_from_429_body(body, wait):
+    now = datetime(2027, 1, 15, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+    raw = body if isinstance(body, str) else json.dumps(body)
+    got = proxy.parse_rate_limit({}, raw.encode(), now=now).retry_after
+    assert got == (None if wait is None else pytest.approx(wait))
+
+
+def test_429_is_waited_out_and_retried():
+    ok = lambda nonce: "Done."
+    router = FakeRouter((429, {"error": {"message": "slow down"}}, {"retry-after": "0.3"}), ok)
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+        assert r.status_code == 200 and r.json()["choices"][0]["message"]["content"] == "Done."
+        limits = client.get("/bridge/limits").json()
+    assert len(router.requests) == 2
+    assert router.requests[1]["t"] - router.requests[0]["t"] >= 0.3
+    assert limits["rate_limited_total"] == 1 and limits["last_response"]["status"] == 200
+
+
+def test_long_429_wait_happens_inside_the_stream():
+    router = FakeRouter((429, {"error": {"message": "slow down"}}, {"retry-after": "0.4"}),
+                        lambda nonce: "Hello there.", stream=True)
+    with make_client(router, ping_interval=0.1) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert r.status_code == 200 and ": ping" in r.text
+    assert deltas(sse_events(r), "content").strip() == "Hello there."
+    assert len(router.requests) == 2
+
+
+def test_429_gives_up_with_retry_after_and_a_retryable_message():
+    body = {"error": {"message": "Quota exceeded for this minute"}}
+    router = FakeRouter((429, body, {"retry-after": "30"}))
+    with make_client(router, rate_limit_max_wait=1) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 429 and int(r.headers["retry-after"]) >= 30
+    error = r.json()["error"]
+    assert error["message"].startswith("rate limit (429)") and "quota" not in error["message"].lower()
+    assert "Quota exceeded" in error["upstream_message"]
+    assert len(router.requests) == 1
+
+    router = FakeRouter(*[(429, body, {"retry-after": "0.05"})] * 2)
+    with make_client(router, rate_limit_retries=1) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 429 and len(router.requests) == 2
+
+
+def test_hard_quota_429_is_not_retried():
+    router = FakeRouter((429, {"error": {"message": "You exceeded your current quota", "code": "insufficient_quota"}}))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 429 and "current quota" in r.json()["error"]["message"]
+    assert len(router.requests) == 1
+
+
+def test_min_request_interval_spaces_requests():
+    router = FakeRouter(lambda n: "a", lambda n: "b")
+    with make_client(router, min_request_interval=0.3) as client:
+        client.post("/v1/chat/completions", json=tools_payload())
+        client.post("/v1/chat/completions", json=tools_payload())
+    assert router.requests[1]["t"] - router.requests[0]["t"] >= 0.3
+
+
+def test_exhausted_request_window_blocks_before_the_429():
+    class Router(FakeRouter):
+        def __call__(self, request):
+            response = super().__call__(request)
+            if len(self.requests) == 1:
+                response.headers.update({"x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "300ms"})
+            return response
+
+    router = Router(lambda n: "a", lambda n: "b")
+    with make_client(router) as client:
+        client.post("/v1/chat/completions", json=tools_payload())
+        client.post("/v1/chat/completions", json=tools_payload())
+    assert router.requests[1]["t"] - router.requests[0]["t"] >= 0.3
+
+
+def test_unsupported_model_falls_back_and_is_remembered():
+    router = FakeRouter((404, UNSUPPORTED), lambda n: "from fallback", lambda n: "again")
+    with make_client(router, model_fallbacks={"qwen-actual-id": "backup-model"}) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+        assert r.status_code == 200 and r.json()["model"] == "qwen-actual-id"
+        client.post("/v1/chat/completions", json=tools_payload())
+        refused = client.get("/bridge/limits").json()["refused_models"]
+    assert [q["json"]["model"] for q in router.requests] == ["qwen-actual-id", "backup-model", "backup-model"]
+    assert "qwen-actual-id" in refused
+
+    router = FakeRouter((404, UNSUPPORTED))  # no fallback configured: the error passes through
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 404 and "unsupported" in r.json()["error"]["message"]
+
+
+def test_model_fallbacks_are_validated():
+    with pytest.raises(ValueError):
+        proxy.Settings(model_fallbacks={"a": 1})

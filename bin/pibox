@@ -57,14 +57,16 @@ Run:
 
 Check:
   verify         try everything the agent must not be able to do
-  review         git hooks, risky git config, recent .obsidian changes in your folders"
+  review         git hooks, risky git config, recent .obsidian changes in your folders
+  probe [what]   what your router really offers, asked from the bridge: endpoints, models (a tiny
+                 request to each), rate-limit headers; 'probe limits': what the bridge knows now"
 }
 
 # ---------------------------------------------------------------- init (runs from the repository)
 # Copies the components into ~/.pi-sandbox. The agent can write to your projects, so the files that
 # hold the key and define the guard rails are copies outside its reach, never the repository itself.
-COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json)
-BRIDGE_FILES=(Dockerfile proxy.py requirements.txt pi-trace.py)
+COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json agent/APPEND_SYSTEM.md)
+BRIDGE_FILES=(Dockerfile proxy.py probe.py requirements.txt pi-trace.py)
 
 cmd_init() {
   local src="${SELF:h:h}" f
@@ -1573,6 +1575,11 @@ run)                                        # Pi in a fresh container, in the cu
   fresh; running
   local h; h=$(here)
   compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" pi "$@"
+  ;;
+
+probe)                                      # the router's endpoints, models and limits (bridge/probe.py)
+  running
+  compose_args; local -a c=($reply); dk; exec $reply $c exec -T bridge python probe.py "$@"
   ;;
 
 shell)                                      # bash in the agent's container, without Pi

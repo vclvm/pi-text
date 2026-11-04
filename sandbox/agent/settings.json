@@ -3,5 +3,12 @@
   "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
   "enableInstallTelemetry": false,
   "extensions": ["-builtin:mcp", "-builtin:llama.cpp"],
-  "quietStartup": "header"
+  "quietStartup": "header",
+  "retry": {
+    "enabled": true,
+    "maxRetries": 6,
+    "baseDelayMs": 5000,
+    "maxAgentDelayMs": 60000,
+    "provider": { "maxRetries": 2, "maxRetryDelayMs": 300000 }
+  }
 }

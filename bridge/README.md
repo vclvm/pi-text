@@ -279,6 +279,8 @@ with the existing keys):
 | `Connection refused` / fetch failed | Bridge not running, or `baseUrl` port is wrong |
 | `Set PI_TEXT_URL` (500) | Bridge started without `PI_TEXT_URL` |
 | `upstream: …` with 401/403/404 | Wrong `PI_TEXT_KEY`, wrong URL, or a model `id` the router does not know |
+| `upstream: the model you requested is unsupported…` (404) for a model that should exist | The key may not use that model, whatever the docs say. `probe.py models` shows which models really answer. Use one of them, or set `MODEL_FALLBACKS` |
+| Pi stops with a 429 / "rate limit" | `GET /bridge/limits` and the `!! upstream 429` trace lines show what the router said. Raise `RATE_LIMIT_MAX_WAIT` or `MIN_REQUEST_INTERVAL`. If the bridge can't find a reset time, send the 429 body from the trace to the maintainer |
 | `upstream returned 400` mentioning `stream_options` | `UPSTREAM_STREAM_USAGE=false` |
 | `upstream …` mentioning `reasoning_effort` | `compat.supportsReasoningEffort: false` for that model |
 | `bridge_protocol_error` … `id=None` | The model writes the block (often `<tool_call>`) without the id (common for Qwen/Hermes-style models): `REQUIRE_NONCE=false` |
@@ -364,6 +366,80 @@ The trace and dumps contain your prompts, code and command output: keep them loc
 | `TRACE_MAX` | `4000` | Truncate long trace entries to N characters; `0` = never |
 | `DEBUG_DUMP_DIR` | empty (off) | Write every exchange (requests, raw replies, errors) as JSON. Contains your code and prompts |
 | `LOG_LEVEL` | `INFO` | Invalid model replies are logged at `WARNING` with the raw text |
+| `MIN_REQUEST_INTERVAL` | `1` | Seconds between the starts of two upstream requests (all clients, corrective retries included); `0` = off |
+| `RATE_LIMIT_MAX_WAIT` | `180` | Most seconds one client request may wait for rate limits; after that the client gets the 429 |
+| `RATE_LIMIT_RETRIES` | `5` | Upstream 429s waited out and retried per client request |
+| `RATE_LIMIT_LOW` | `1` | When the router reports this many remaining requests or fewer, the rest are spread evenly until the reset |
+| `MODEL_FALLBACKS` | empty | JSON `{"model": ["fallback", …], "*": […]}`: models to use when the router refuses one as unsupported/unauthorized |
+
+## Rate limits and refused models
+
+Pi itself retries a 429 only 3 times with 2 s, 4 s and 8 s pauses, and gives up at once when the
+error says "quota exceeded". A limit that resets in a minute therefore ends the agent's run. The
+bridge handles it instead:
+
+- **Pacing.** Upstream requests start at least `MIN_REQUEST_INTERVAL` seconds apart, in arrival order.
+- **Before the limit.** The bridge reads the router's limit headers on every response: `Retry-After`,
+  `retry-after-ms`, `x-ratelimit-remaining-requests`/`-tokens` and `x-ratelimit-reset-requests`/`-tokens`
+  (`"1s"`, `"6m0s"`), `x-ratelimit-remaining`/`-reset` (delta, epoch seconds or epoch ms),
+  `ratelimit-*`. When no requests remain, it waits for the reset instead of collecting a 429. When
+  `RATE_LIMIT_LOW` or fewer remain, it spreads them out until the reset. When fewer tokens remain
+  than a request needs (estimated at characters / 4), that request waits for the token reset.
+- **After a 429.** The wait comes from the headers or from the error body: `retry_after`- or
+  `reset_at`-style fields, "try again in 1m30s", an ISO timestamp. Without any of these the bridge
+  backs off 5, 10, 20… s, up to 60 s. Then the same request is sent again, for up to
+  `RATE_LIMIT_RETRIES` times and `RATE_LIMIT_MAX_WAIT` seconds. One 429 pauses every request,
+  not only the one that got it.
+- **Pi stays connected.** A wait of up to `PING_INTERVAL` seconds happens before the response
+  starts. A longer wait happens inside the SSE stream, where `: ping` comments keep Pi's connection
+  alive.
+- **Giving up.** The client gets a 429 with `Retry-After` and the message
+  `rate limit (429): …, retry in Ns`. The message is worded so that Pi retries. The router's own
+  text is in `error.upstream_message`. A 429 that mentions billing or `insufficient_quota` and
+  names no reset time is passed through at once, because waiting won't help.
+- **Refused models.** When the router answers 400/403/404 with something like "the model you
+  requested is unsupported… authorized model" and `MODEL_FALLBACKS` names an alternative, the bridge
+  sends the request to the alternative instead. It also skips the refused model for 10 minutes.
+  Pi keeps showing the model it asked for; the trace and the log name the substitution.
+
+Outside the sandbox, give Pi the same retry settings as [sandbox/agent/settings.json](../sandbox/agent/settings.json)
+in `~/.pi/agent/settings.json`. Merge them with your keys:
+
+```json
+{ "retry": { "maxRetries": 6, "baseDelayMs": 5000, "maxAgentDelayMs": 60000,
+             "provider": { "maxRetries": 2, "maxRetryDelayMs": 300000 } } }
+```
+
+`GET /bridge/limits` shows the current state: the last limit headers, the current wait, the number
+of 429s, the total time waited and the refused models. `TRACE` lines starting with `~~` are waits,
+and `!! upstream 429` lines are rate-limit errors.
+
+## Probing the router: `probe.py`
+
+Router documentation often lags behind the deployment. `probe.py` asks the router directly. It
+reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
+
+```bash
+.venv/bin/python probe.py                 # endpoints + models
+.venv/bin/python probe.py endpoints -v    # which endpoints answer, with the start of each answer
+.venv/bin/python probe.py models --stream --include some-model-missing-from-the-list --yaml
+.venv/bin/python probe.py limits          # GET /bridge/limits of a running bridge (--bridge URL)
+```
+
+- `endpoints` tries the usual discovery and management routes. Relative to the API base:
+  `/models`; OpenRouter's `/key`, `/auth/key`, `/credits`; LiteLLM's `/model/info`,
+  `/model_group/info`, `/key/info`; billing routes. Relative to the server root: `/openapi.json`,
+  `/docs`, `/health…`, `/metrics`. If an OpenAPI description answers (LiteLLM and other FastAPI
+  gateways publish one), it prints every route the router really has.
+- `models` sends each model a tiny request ("Reply with OK", `max_tokens` 16). It reports what works,
+  which models are listed but refused, the context size if `/models` reports one (`context_length`,
+  `max_model_len`, …) and the rate-limit headers the router sends. `--yaml` prints `models:`
+  entries for `config.yaml`; `--json` prints machine-readable output.
+- Requests are `--interval` seconds apart (default `MIN_REQUEST_INTERVAL` or 1.5), and a 429 is
+  waited out once. Each model test costs a few tokens.
+
+In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`. The probe runs
+in the bridge container, with the router key and the same network path as the bridge.
 
 ## Tests
 

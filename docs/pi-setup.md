@@ -857,7 +857,14 @@ the extensions, and these settings, [sandbox/agent/settings.json](../sandbox/age
   "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
   "enableInstallTelemetry": false,
   "extensions": ["-builtin:mcp", "-builtin:llama.cpp"],
-  "quietStartup": "header"
+  "quietStartup": "header",
+  "retry": {
+    "enabled": true,
+    "maxRetries": 6,
+    "baseDelayMs": 5000,
+    "maxAgentDelayMs": 60000,
+    "provider": { "maxRetries": 2, "maxRetryDelayMs": 300000 }
+  }
 }
 ```
 
@@ -872,6 +879,14 @@ the extensions, and these settings, [sandbox/agent/settings.json](../sandbox/age
 | `defaultTools` | Tools available at start | The standard set; drop `bash`, `edit`, `write` for read-only reviews (`--tools read,grep,find,ls`) |
 | `enableInstallTelemetry: false` | No install/update reporting | Fewer outbound connections, important behind an approving proxy |
 | `"-builtin:mcp"`, `"-builtin:llama.cpp"` | Disable built-in MCP support and the local llama.cpp provider | MCP servers are extra processes outside Pi's tool hooks. Add them deliberately, if at all |
+| `retry` | Agent retries: 6 instead of 3, pauses 5 s, 10 s, 20 s, 40 s, 60 s, 60 s instead of 2 s, 4 s, 8 s. Provider retries: 2, honouring a `Retry-After` of up to 5 minutes | The bridge waits out short rate limits itself (`RATE_LIMIT_MAX_WAIT`). When it gives up, it answers 429 with `Retry-After`, and this keeps Pi from giving up after 14 s |
+
+Next to it, [sandbox/agent/APPEND_SYSTEM.md](../sandbox/agent/APPEND_SYSTEM.md) adds a few lines to Pi's
+system prompt. They tell the model to batch independent tool calls into one reply, to read files in
+parts, to filter command output and to avoid re-reading files. Every reply is one more rate-limited
+request that re-sends the whole conversation, so fewer and smaller turns save requests and tokens.
+The file is ~150 tokens, sent with every request; delete the mount in `compose.yaml` if you don't
+want it.
 
 The image sets `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1` and `PI_TELEMETRY=0`: Pi makes no network
 calls of its own (version checks, model catalogs), so the only traffic is what the agent does.
@@ -1163,6 +1178,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `down [--vm]` | Stop the containers; with `--vm` the Colima VM too |
 | `verify` | Try everything the agent must not be able to do (§6.7) |
 | `review` | After a session: git hooks, risky git config, recent `.obsidian` changes (§7.3) |
+| `probe [what]` | Ask your router what it really offers: endpoints (including `/openapi.json`), which models answer a tiny request, its rate-limit headers; `probe limits` shows the bridge's current rate-limit state ([bridge/README.md](../bridge/README.md#probing-the-router-probepy)) |
 
 How it works:
 
@@ -1236,6 +1252,8 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: … not found: brew install …`, `docker compose`: unknown command | A prerequisite is missing: `pibox check` lists what and how to install it (§6.1) |
 | `pibox: config.yaml changed since the last setup` | Run `pibox setup`, then `pibox up` |
 | `pibox: the sandbox isn't running` | `pibox up` |
+| `the model you requested is unsupported` for a model that should exist | `pibox probe models` lists the models that really answer; use one, or set `MODEL_FALLBACKS` in `bridge` |
+| Pi stops on `429` / "rate limit" | The bridge waits out 429s itself (up to `RATE_LIMIT_MAX_WAIT`, 180 s). `pibox probe limits` and the bridge log (`!! upstream 429`) show what the router answered ([bridge/README.md](../bridge/README.md#rate-limits-and-refused-models)) |
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
 | `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected for the web: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself. Your repositories are the exception: if one is refused, it isn't in `repository` (check `EGRESS_TUNNEL` in `pibox config`) |
 | `Temporary failure resolving '<host>'` / `no such host` for a host your Mac resolves | The VM has its own DNS. `pibox setup` resolves every host it uses (repositories, Debian sources, image registry, router) on the Mac and puts those with an internal address into `colima.yaml` as `dnsHosts`; `pibox up` restarts the VM to apply it. Check what `setup` printed ("the VM resolves these…"); a host missing there isn't in any of your files |
