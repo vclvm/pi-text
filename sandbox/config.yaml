@@ -49,6 +49,7 @@ bridge:
   # RATE_LIMIT_MAX_RESET: 3600     # a 429 whose reset is further away is a quota: Pi gets it at once
   # RATE_LIMIT_RETRY_MAX: 20       # after a 429 the bridge tries again at least every 20 s, until it passes
   # REASONING_BUDGET: auto       # thinking without an answer near max_tokens: stopped, the model asked to save it and act
+  # ANNOUNCED_RETRIES: 1        # a reply that promises an action ("Now let me write the test:") but calls no tool: asked once to act
   # Request fields per model: the key is a model id or a glob (glm* = every id starting with glm), a
   # later entry wins. Sent unless Pi sets the field itself. The defaults are the sampling values the
   # model makers recommend for thinking mode. A field the router refuses (a 400 naming it) is left

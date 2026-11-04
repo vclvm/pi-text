@@ -197,6 +197,45 @@ def test_retry_text_not_duplicated_in_stream():
     assert deltas(events, "content").strip() == "Looking."
 
 
+def test_announced_action_without_call_is_asked_again():
+    router = FakeRouter(lambda n: "Now let me write the test:",
+                        lambda n: call_block(n, "bash", {"command": "ls"}), stream=True)
+    with make_client(router) as client:
+        events = sse_events(client.post("/v1/chat/completions", json=tools_payload(stream=True)))
+    assert len(router.requests) == 2
+    assert router.requests[1]["json"]["messages"][-1]["content"].startswith("[bridge] Your reply says")
+    assert deltas(events, "content").strip() == "Now let me write the test:"
+    assert any(c["function"]["name"] == "bash" for e in events for ch in e.get("choices", [])
+               for c in (ch.get("delta") or {}).get("tool_calls") or [] if c.get("function", {}).get("name"))
+
+
+def test_announced_action_done_keeps_first_answer():
+    router = FakeRouter(lambda n: "Сейчас запущу тесты", lambda n: "DONE", stream=True)
+    with make_client(router) as client:
+        events = sse_events(client.post("/v1/chat/completions", json=tools_payload(stream=True)))
+    assert len(router.requests) == 2
+    assert deltas(events, "content").strip() == "Сейчас запущу тесты"
+
+
+def test_announced_action_off_and_final_answers_not_asked_again():
+    for text, kwargs in [("Let me know if you need anything else?", {}),
+                         ("I'll fix it.\n\nAll tests pass; the change is complete.", {}),
+                         ("Now let me run it:", {"announced_retries": 0})]:
+        router = FakeRouter(lambda n, t=text: t)
+        with make_client(router, **kwargs) as client:
+            r = client.post("/v1/chat/completions", json=tools_payload())
+        assert r.status_code == 200 and len(router.requests) == 1, text
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Now let me write the test:", True), ("I'll create the test now.", True),
+    ("Теперь напишу тест", True), ("Running it…", True),
+    ("Done. All 12 tests pass.", False), ("Should I also update the docs?", False), ("", False),
+])
+def test_announces_action(text, expected):
+    assert proxy.announces_action(text) is expected
+
+
 def test_retries_exhausted_gives_openai_error():
     router = FakeRouter(*[lambda n: call_block(n, "nope", {})] * 3)
     with make_client(router, max_retries=2) as client:

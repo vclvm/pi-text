@@ -128,6 +128,7 @@ class Settings:
     upstream_stream: bool = True      # use streaming towards the upstream router
     upstream_stream_usage: bool = True  # send stream_options.include_usage upstream
     max_retries: int = 2              # corrective re-asks after a malformed tool call
+    announced_retries: int = 1        # re-asks when a reply promises an action but calls no tool; 0 = off
     upstream_resends: int = 2         # replies requested again after a cut-off stream or an empty reply
     reasoning_budget: int = 0         # chars of thinking without any answer after which the bridge stops
                                       # the reply and asks again; 0 = never, -1 = auto (70% of max_tokens)
@@ -194,6 +195,7 @@ class Settings:
             upstream_stream=_env_bool("UPSTREAM_STREAM", True),
             upstream_stream_usage=_env_bool("UPSTREAM_STREAM_USAGE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "2")),
+            announced_retries=int(os.environ.get("ANNOUNCED_RETRIES", "1")),
             upstream_resends=int(os.environ.get("UPSTREAM_RESENDS", "2")),
             reasoning_budget=_env_budget("REASONING_BUDGET", "auto"),
             require_nonce=_env_bool("REQUIRE_NONCE", True),
@@ -1469,6 +1471,33 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
 
 
 THOUGHT_CARRY = 48000  # characters of cut-off thinking given back to the model when asking again
+ANNOUNCED_MESSAGE = (
+    "[bridge] Your reply says what you are about to do, but it has no tool call, so your turn ended and "
+    "nothing was done. If you meant to act, make the tool call now (only the call; do not repeat the text). "
+    "If you have really finished or need the user's answer, reply with only the word DONE.")
+
+# The last paragraph of a reply that ends the turn while promising to act ("Now let me write the test:").
+_ANNOUNCE_RE = re.compile(
+    r"(?:\b(?:let me|let's|i'll|i will|i'm going to|i am going to|i need to|now i|next,? i|going to|"
+    r"proceed(?:ing)? to|start(?:ing)? (?:by|with))\b"
+    r"|(?:^|\s)(?:сейчас|теперь|давай(?:те)?|далее|приступаю|начну|займусь|"
+    r"(?:я )?(?:создам|напишу|запущу|проверю|добавлю|исправлю|посмотрю|изменю|обновлю))(?:\s|$))",
+    re.I)
+
+
+def announces_action(text: str) -> bool:
+    """True if the answer ends with a promise to act (and no question): the model meant to call a
+    tool but stopped. Only the last paragraph counts, so a final summary with "next I'd …" in the
+    middle does not."""
+    text = _THINK_RE.sub("", text).strip()
+    if not text:
+        return False
+    last = re.split(r"\n\s*\n", text)[-1].strip()[-400:]
+    if last.endswith("?"):
+        return False
+    return last.rstrip("`*_ ").endswith((":", "…", "...")) or bool(_ANNOUNCE_RE.search(last))
+
+
 THOUGHT_CUT_MESSAGE = (
     "[bridge] Your previous reply was only thinking and was cut off before any answer or tool call, because "
     "one reply cannot be longer than the output limit. That thinking is above, so your analysis is not lost. "
@@ -1963,6 +1992,7 @@ class Bridge:
         messages = list(prep.upstream["messages"])
         streamed_text = False
         usage = None
+        nudged = 0  # re-asks after a reply that promised an action without a tool call
         attempts = record.setdefault("attempts", []) if record is not None else []
         try:
             for attempt in range(self.s.max_retries + 1):
@@ -2125,6 +2155,19 @@ class Bridge:
                     # model usually gets it right on a fresh try.
                     raise BridgeError(502, f"upstream model error 502: its reply violates the tool protocol "
                                            f"after {attempt + 1} tries: {e}", "bridge_protocol_error") from e
+                said = _THINK_RE.sub("", "".join(raw)).strip()
+                if not calls and prep.tools and finish == "stop" and announces_action(said) \
+                        and nudged < self.s.announced_retries and attempt < self.s.max_retries:
+                    nudged += 1
+                    info["error"] = f'the reply promises an action but calls no tool: "{_said(raw, 160)}"'
+                    log.warning("attempt %d: %s; asking again", attempt + 1, info["error"])
+                    trace(f"!! {info['error']}; asking again")
+                    messages = messages + [{"role": "assistant", "content": said},
+                                           {"role": "user", "content": ANNOUNCED_MESSAGE}]
+                    continue
+                if nudged and not calls:
+                    # The model confirmed it is done: its first answer is what Pi shows; drop "DONE".
+                    held = [] if streamed_text or said.strip(" .!`*").upper() == "DONE" else held
                 if held and not (calls and streamed_text):
                     yield "text", "".join(held)
                 if stray:
