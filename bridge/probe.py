@@ -274,19 +274,23 @@ class Probe:
     # ------------------------------------------------------------------ history
     SECRET = "PELICAN-7342"
     HISTORY_VARIANTS = (
-        ("off: thinking not sent back (control)", "off"),
-        ("field: reasoning_content of the assistant message", "field"),
-        ("text: <think>…</think> before the assistant's text", "text"),
+        ("off: thinking not sent back (control)", "off", None),
+        ("field: reasoning_content of the assistant message", "field", None),
+        ("field + chat_template_kwargs.clear_thinking=false", "field",
+         {"chat_template_kwargs": {"clear_thinking": False}}),
+        ("field + thinking.clear_thinking=false (Z.ai API)", "field",
+         {"thinking": {"type": "enabled", "clear_thinking": False}}),
+        ("text: <think>…</think> before the assistant's text", "text", None),
     )
 
-    def history_body(self, model: str, mode: str) -> dict:
+    def history_body(self, model: str, mode: str, extra: dict | None = None) -> dict:
         thought = f"The user wants a short reply. I also note the secret code word {self.SECRET} for later."
         assistant = {"role": "assistant", "content": "OK."}
         if mode == "field":
             assistant["reasoning_content"] = thought
         elif mode == "text":
             assistant["content"] = f"<think>\n{thought}\n</think>\nOK."
-        return {"model": model, "max_tokens": 2048, "stream": False, "messages": [
+        return {**(extra or {}), "model": model, "max_tokens": 2048, "stream": False, "messages": [
             {"role": "user", "content": "Reply with OK."}, assistant,
             {"role": "user", "content": "Which secret code word did you note in your previous thinking? "
                                         "Answer with the code word only, or NONE if there was none."}]}
@@ -301,8 +305,8 @@ class Probe:
             return 1
         for name in names:
             out(f"{name}: an earlier reply whose thinking holds a code word; does the model know it?")
-            for label, mode in self.HISTORY_VARIANTS:
-                r = self.request("POST", self.endpoint, json=self.history_body(name, mode))
+            for label, mode, extra in self.HISTORY_VARIANTS:
+                r = self.request("POST", self.endpoint, json=self.history_body(name, mode, extra))
                 if r is None:
                     continue
                 if r.status_code >= 400:
@@ -317,6 +321,9 @@ class Probe:
             out("")
         out("What to do with the result (config.yaml, bridge:):\n"
             "  field sees it            → KEEP_THINKING: field (the default)\n"
+            "  only field + clear_thinking sees it → that field into MODEL_PARAMS of the model, and\n"
+            "                             keep_thinking: field, e.g. { glm*: { chat_template_kwargs: { clear_thinking: false },\n"
+            "                             keep_thinking: field } } (the model's \"preserved thinking\")\n"
             "  only text sees it        → MODEL_PARAMS: { <model>: { keep_thinking: text } }\n"
             "  neither                  → keep_thinking: off for that model (it would only cost tokens)")
         return 0

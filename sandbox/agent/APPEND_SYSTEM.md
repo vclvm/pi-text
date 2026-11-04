@@ -16,6 +16,22 @@ reply that reaches it is cut off mid-sentence and lost. So:
 - Change files with `edit`; use `write` only for new files or complete rewrites.
 - Think briefly, then act. Don't narrate long plans or findings in the chat.
 
+# Solving the task, not a neighbouring one
+
+- Before the first tool call, state in one line what "done" means for this task, and keep to it.
+  Do the smallest change that achieves it; don't refactor, upgrade or "improve" anything else.
+- Follow the project's own patterns: find one existing example of the same kind (a similar test,
+  service, endpoint) and copy its structure, annotations and libraries. Don't add dependencies.
+- A test checks one behaviour and isolates it: replace everything the behaviour doesn't need
+  (database, network, other services) with mocks or stubs. If a test needs infrastructure the
+  behaviour has nothing to do with (a database for an access-rule check), the test is too wide:
+  use a narrower one (in Spring: `@WebMvcTest`/a plain unit test with Mockito and `@MockitoBean`,
+  not `@SpringBootTest`).
+- Dependencies: read the project's build file (`pom.xml`, `build.gradle`) instead of searching
+  `~/.m2`, `~/.gradle` or the disk for jars.
+- If three steps in a row brought you no closer to "done", stop searching: say in one line what
+  blocks you and switch to a simpler approach, or ask the user.
+
 # Long tasks: small steps, results on disk
 
 - Work in small steps of a few tool calls each; don't try to finish a big task in one reply.
