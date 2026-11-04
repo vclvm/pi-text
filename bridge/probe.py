@@ -6,8 +6,10 @@
                              LiteLLM /model/info, /openapi.json with the full list of routes, …)
     probe.py models          send a tiny chat request to every model: which ones really work
     probe.py limits          what the running bridge knows about the rate limits (GET /bridge/limits)
-    probe.py thinking --models M   which request field limits the model's thinking (reasoning_effort,
+    probe.py thinking --models M   which request field changes the model's thinking (reasoning_effort,
                              thinking.type, enable_thinking …): the same question with each
+    probe.py history --models M    does the model see its own earlier thinking when it is sent back
+                             (KEEP_THINKING: field = reasoning_content, text = <think> in the content)
 
 Reads PI_TEXT_URL and PI_TEXT_KEY like the bridge (or --url/--key). Requests are spaced by
 --interval seconds and a 429 is waited out, so probing doesn't burn the rate limit itself.
@@ -214,11 +216,14 @@ class Probe:
     # ------------------------------------------------------------------ thinking
     THINKING_VARIANTS = (
         ("(nothing: the model's default)", {}),
+        ('reasoning_effort: "high"', {"reasoning_effort": "high"}),
+        ('reasoning_effort: "medium"', {"reasoning_effort": "medium"}),
         ('reasoning_effort: "low"', {"reasoning_effort": "low"}),
         ('reasoning_effort: "minimal"', {"reasoning_effort": "minimal"}),
         ('thinking: {type: "disabled"}', {"thinking": {"type": "disabled"}}),
         ("chat_template_kwargs: {enable_thinking: false}", {"chat_template_kwargs": {"enable_thinking": False}}),
         ("enable_thinking: false", {"enable_thinking": False}),
+        ("chat_template_kwargs: {enable_thinking: true}", {"chat_template_kwargs": {"enable_thinking": True}}),
     )
     THINKING_PROMPT = ("A train leaves at 9:40 and arrives at 13:05. How many minutes is the trip? "
                        "Answer with the number only.")
@@ -253,7 +258,8 @@ class Probe:
                 size = rt if rt is not None else len(thought) // 4
                 if base is None:
                     base = size
-                effect = ("" if not extra else "   ← no effect" if base and size >= base * 0.8
+                effect = ("" if not extra else "   ← more thinking" if size > max(base, 50) * 1.5
+                          else "   ← no effect" if base and size >= base * 0.8
                           else "   ← less thinking" if size else "   ← no thinking")
                 out(f"  ✅ {label:<48} thinking ~{size} tokens, completion {usage.get('completion_tokens', '?')}, "
                     f"{ms} ms, answer {cut((message.get('content') or '').strip() or '(empty)', 12)!r}{effect}")
@@ -261,8 +267,58 @@ class Probe:
         out("What to do with the result (config.yaml):\n"
             "  reasoning_effort works  → the model's entry: reasoning: true and\n"
             "                            compat: { supportsReasoningEffort: true }; then Shift+Tab in Pi sets the level\n"
-            "  another field works     → bridge: UPSTREAM_EXTRA_BODY with that field (for every model of the router)\n"
+            "  another field works     → bridge: MODEL_PARAMS of that model, e.g. { glm*: { reasoning_effort: high } }\n"
             "Small differences are noise: the model thinks a little differently each time.")
+        return 0
+
+    # ------------------------------------------------------------------ history
+    SECRET = "PELICAN-7342"
+    HISTORY_VARIANTS = (
+        ("off: thinking not sent back (control)", "off"),
+        ("field: reasoning_content of the assistant message", "field"),
+        ("text: <think>…</think> before the assistant's text", "text"),
+    )
+
+    def history_body(self, model: str, mode: str) -> dict:
+        thought = f"The user wants a short reply. I also note the secret code word {self.SECRET} for later."
+        assistant = {"role": "assistant", "content": "OK."}
+        if mode == "field":
+            assistant["reasoning_content"] = thought
+        elif mode == "text":
+            assistant["content"] = f"<think>\n{thought}\n</think>\nOK."
+        return {"model": model, "max_tokens": 2048, "stream": False, "messages": [
+            {"role": "user", "content": "Reply with OK."}, assistant,
+            {"role": "user", "content": "Which secret code word did you note in your previous thinking? "
+                                        "Answer with the code word only, or NONE if there was none."}]}
+
+    def history(self, names: list[str]) -> int:
+        """Does the router pass the model's earlier thinking back to it (for KEEP_THINKING)?"""
+        if self.api != "chat":
+            out("probe history supports Chat Completions routers only")
+            return 1
+        if not names:
+            out("Name the models: probe.py history --models glm-latest,qwen-latest")
+            return 1
+        for name in names:
+            out(f"{name}: an earlier reply whose thinking holds a code word; does the model know it?")
+            for label, mode in self.HISTORY_VARIANTS:
+                r = self.request("POST", self.endpoint, json=self.history_body(name, mode))
+                if r is None:
+                    continue
+                if r.status_code >= 400:
+                    out(f"  ❌ {label:<52} {r.status_code} {cut(error_text(r), 70)}")
+                    continue
+                message = ((json_or_none(r) or {}).get("choices") or [{}])[0].get("message") or {}
+                answer = (message.get("content") or "").strip()
+                seen = self.SECRET.lower() in answer.lower()
+                verdict = ("sees it" if seen else "doesn't see it") if mode != "off" else \
+                    ("knows it anyway?! (the test is unreliable)" if seen else "doesn't know it (as expected)")
+                out(f"  {'✅' if seen == (mode != 'off') else '·'} {label:<52} {verdict}: {cut(answer or '(empty)', 30)!r}")
+            out("")
+        out("What to do with the result (config.yaml, bridge:):\n"
+            "  field sees it            → KEEP_THINKING: field (the default)\n"
+            "  only text sees it        → MODEL_PARAMS: { <model>: { keep_thinking: text } }\n"
+            "  neither                  → keep_thinking: off for that model (it would only cost tokens)")
         return 0
 
     def print_limit_headers(self) -> None:
@@ -345,12 +401,19 @@ def limits(bridge: str) -> int:
         out(f"bridge at {bridge}: {e!r}")
         return 1
     print(json.dumps(r.json(), indent=2, ensure_ascii=False))
+    try:
+        info = httpx.get(bridge.rstrip("/") + "/bridge/info", timeout=10)
+        if info.status_code == 200:
+            print("\nWhat the bridge sends with every request (GET /bridge/info):")
+            print(json.dumps(info.json(), indent=2, ensure_ascii=False))
+    except httpx.HTTPError:
+        pass
     return 0
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("what", nargs="?", default="all", choices=["all", "endpoints", "models", "limits", "thinking"])
+    p.add_argument("what", nargs="?", default="all", choices=["all", "endpoints", "models", "limits", "thinking", "history"])
     p.add_argument("--url", default=os.environ.get("PI_TEXT_URL", ""), help="router URL (default: $PI_TEXT_URL)")
     p.add_argument("--key", default=os.environ.get("PI_TEXT_KEY", ""), help="router key (default: $PI_TEXT_KEY)")
     p.add_argument("--models", default="", help="comma-separated: test only these models")
@@ -374,6 +437,8 @@ def main() -> int:
     status = 0
     if a.what == "thinking":
         return probe.thinking(split(a.models))
+    if a.what == "history":
+        return probe.history(split(a.models))
     if a.what in ("all", "endpoints") and not a.json:
         probe.endpoints()
     if a.what in ("all", "models"):

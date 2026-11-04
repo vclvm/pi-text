@@ -372,6 +372,9 @@ The trace and dumps contain your prompts, code and command output: keep them loc
 | `RATE_LIMIT_MAX_RESET` | `3600` | A 429 whose named reset is further away than this many seconds is a quota: the client gets it at once. Nearer resets are always waited out |
 | `RATE_LIMIT_RETRY_MAX` | `20` | After a 429 the bridge tries again at the named reset or after 5, 10, 20… s, but at least this often, until the request passes. Many routers name "now + window" of a sliding window as the reset, which frees up earlier |
 | `RATE_LIMIT_LOW` | `1` | When the router reports this many remaining requests or fewer, the rest are spread evenly until the reset |
+| `MODEL_PARAMS` | empty (`config.yaml`: per-model defaults) | JSON `{"model id or glob": {field: value}}`: request fields per model, e.g. `{"glm*": {"temperature": 1.0, "reasoning_effort": "high"}}`; a later matching entry wins. They fill in what the client doesn't send itself (a client field wins; `UPSTREAM_EXTRA_BODY` doesn't). A field the router refuses with a 400/422 that names it is left out for that model until the bridge restarts (`params_dropped` in diag). `keep_thinking` sets `KEEP_THINKING` for that model |
+| `KEEP_THINKING` | `field` | The model's own earlier thinking of the current agent loop (assistant messages since the last user message) goes back with the history, so it doesn't redo its analysis at every step: `field` as `reasoning_content` of the assistant message (what Pi sends back; how chat templates of thinking models read it), `text` as `<think>…</think>` before its text, `off` dropped. `probe.py history` shows which one the model sees |
+| `KEEP_THINKING_CHARS` | `60000` | At most this many characters of it per request, the newest first; an older one that doesn't fit is cut at its start |
 | `MODEL_FALLBACKS` | empty | JSON `{"model": ["fallback", …], "*": […]}`: models to use when the router refuses one as unsupported/unauthorized |
 
 ## Rate limits and refused models
@@ -413,7 +416,8 @@ in `~/.pi/agent/settings.json`. Merge them with your keys:
              "provider": { "maxRetries": 2, "maxRetryDelayMs": 300000 } } }
 ```
 
-`GET /bridge/limits` shows the current state: the last limit headers, the current wait, the number
+`GET /bridge/info` shows what the bridge sends besides the conversation (`?models=a,b`: per model)
+and the last limit headers per model. `GET /bridge/limits` shows the current state: the last limit headers, the current wait, the number
 of 429s, the total time waited and the refused models. `TRACE` lines starting with `~~` are waits,
 and `!! upstream 429` lines are rate-limit errors.
 
@@ -427,7 +431,8 @@ reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
 .venv/bin/python probe.py endpoints -v    # which endpoints answer, with the start of each answer
 .venv/bin/python probe.py models --stream --include some-model-missing-from-the-list --yaml
 .venv/bin/python probe.py limits          # GET /bridge/limits of a running bridge (--bridge URL)
-.venv/bin/python probe.py thinking --models glm-latest   # which field limits its thinking
+.venv/bin/python probe.py thinking --models glm-latest   # which field changes its thinking
+.venv/bin/python probe.py history --models glm-latest,qwen-latest   # does it see its earlier thinking
 ```
 
 - `endpoints` tries the usual discovery and management routes. Relative to the API base:
@@ -442,24 +447,33 @@ reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
 - Requests are `--interval` seconds apart (default `MIN_REQUEST_INTERVAL` or 1.5), and a 429 is
   waited out once. Each model test costs a few tokens.
 
-`thinking` sends one small question with each known way of limiting a model's thinking
-(`reasoning_effort`, `thinking: {type: disabled}`, `chat_template_kwargs.enable_thinking`,
-`enable_thinking`) and shows how many thinking tokens each answer used. If `reasoning_effort`
-works, give the model `reasoning: true` and `compat: { supportsReasoningEffort: true }` in
-`config.yaml`: Pi's thinking level (Shift+Tab) then reaches the model.
+`thinking` sends one small question with each known way of changing a model's thinking
+(`reasoning_effort` high/medium/low/minimal, `thinking: {type: disabled}`,
+`chat_template_kwargs.enable_thinking` false/true, `enable_thinking`) and shows how many thinking
+tokens each answer used. Put a field that works into `MODEL_PARAMS` of that model. Or, for
+`reasoning_effort`, give the model `reasoning: true` and `compat: { supportsReasoningEffort: true }`
+in `config.yaml`: Pi's thinking level (Shift+Tab) then reaches the model and wins over `MODEL_PARAMS`.
+
+`history` checks `KEEP_THINKING`: an earlier reply whose thinking holds a code word, sent back
+with nothing (the control), as `reasoning_content`, and as `<think>…</think>` text, then the
+question "which code word did you note?". The way in which the model knows the word is the one to use.
 
 When a reply is nothing but thinking cut off at `max_tokens`, the bridge asks again (counted
-in `MAX_RETRIES`), handing back the last 6000 characters of that thinking and telling the model
-to act in small steps. Pi would otherwise stop with "response was truncated".
+in `MAX_RETRIES`), handing back that thinking (up to 48000 characters) and asking the model to save
+its findings and act in small steps. Pi would otherwise stop with "response was truncated".
 
-In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`, `pibox probe thinking --models ID`. The probe runs
+In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`, `pibox probe thinking --models ID`,
+`pibox probe history --models ID,ID`. The probe runs
 in the bridge container, with the router key and the same network path as the bridge.
 
 ## Watching requests live: `diag.py`
 
 When an answer takes minutes, `diag.py` shows where the time goes. Run it in a second terminal
-(in the sandbox: `pibox diag`). It follows `GET /bridge/events`, which streams one JSON event per
-step of every request, and prints:
+(in the sandbox: `pibox diag`). On connecting it prints what the bridge sends to each model the
+router lists besides the conversation (`GET /bridge/info`: `MODEL_PARAMS`, fields the router refused,
+`KEEP_THINKING`, budgets) and the last token limit seen per model. The router itself publishes no
+model settings (`/model/info` is closed), so this is what is known. Then it follows
+`GET /bridge/events`, which streams one JSON event per step of every request, and prints:
 
 ```
 09:13:35 4ad715 ▶ request model=m stream messages=1 tools=7 ~5.1k tokens
@@ -472,6 +486,12 @@ step of every request, and prints:
                   8 keep-alive ping(s) sent to Pi while it waited
                   → most of it (97%, 124.0s): the router answered, but the model sent nothing yet …
 ```
+
+Also per request: the `MODEL_PARAMS` sent (when they change), how much earlier thinking went back
+with the history, LiteLLM's per-model token limit (`2.3M of 8M tokens left for this model (−115k
+since its previous request; this prompt ~40k, max_tokens 32.8k)`: the router's own count, compare
+it with prompt and `max_tokens` to see whether it reserves `max_tokens`), the share of the prompt
+the router served from its cache (`cached_tokens`), and fields the router refused.
 
 The time of each request is split into phases:
 

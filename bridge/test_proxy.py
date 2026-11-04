@@ -1296,3 +1296,120 @@ def test_auto_reasoning_budget_follows_max_tokens():
     assert bridge.thinking_budget({"max_tokens": 16384}) == int(16384 * 4 * 0.7)
     assert bridge.thinking_budget({}) == 0
     assert proxy.Bridge(proxy.Settings(reasoning_budget=500), None).thinking_budget({"max_tokens": 9}) == 500
+
+
+# --------------------------------------------------------------------------- per-model params, kept thinking
+
+def loop_with_thinking():
+    payload = tools_payload()
+    payload["messages"] = [
+        {"role": "system", "content": "You are an agent."},
+        {"role": "user", "content": "first task"},
+        {"role": "assistant", "content": "done", "reasoning_content": "OLD THOUGHT"},
+        {"role": "user", "content": "second task"},
+        {"role": "assistant", "content": None, "reasoning_content": "FIRST STEP THOUGHT", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+        {"role": "assistant", "content": "Reading it.", "reasoning_content": "SECOND STEP THOUGHT", "tool_calls": [
+            {"id": "c2", "type": "function", "function": {"name": "bash", "arguments": '{"command": "cat a.txt"}'}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "hello"},
+    ]
+    return payload
+
+
+def test_kept_thinking_as_field_only_for_the_current_loop():
+    prep = proxy.prepare_request(loop_with_thinking(), proxy.Settings(keep_thinking="field"))
+    assistants = [m for m in prep.upstream["messages"] if m["role"] == "assistant"]
+    assert "reasoning_content" not in assistants[0]  # before the last user message
+    assert [m.get("reasoning_content") for m in assistants[1:]] == ["FIRST STEP THOUGHT", "SECOND STEP THOUGHT"]
+    assert "THOUGHT" not in all_text([m["content"] for m in prep.upstream["messages"]])
+    assert prep.kept_thinking == len("FIRST STEP THOUGHT") + len("SECOND STEP THOUGHT")
+
+
+def test_kept_thinking_as_text_and_off():
+    prep = proxy.prepare_request(loop_with_thinking(), proxy.Settings(keep_thinking="text"))
+    last = [m for m in prep.upstream["messages"] if m["role"] == "assistant"][-1]
+    assert last["content"].startswith("<think>\nSECOND STEP THOUGHT\n</think>\nReading it.")
+    assert "reasoning_content" not in last and prep.kept_thinking > 0
+    off = proxy.prepare_request(loop_with_thinking(), proxy.Settings())
+    assert "THOUGHT" not in json.dumps(off.upstream) and off.kept_thinking == 0
+
+
+def test_kept_thinking_newest_first_within_the_limit():
+    kept = proxy.kept_thoughts(loop_with_thinking()["messages"], 300)
+    assert kept == {4: "FIRST STEP THOUGHT", 6: "SECOND STEP THOUGHT"}
+    payload = loop_with_thinking()
+    payload["messages"][4]["reasoning_content"] = "x" * 1000
+    kept = proxy.kept_thoughts(payload["messages"], 400)
+    assert kept[6] == "SECOND STEP THOUGHT" and kept[4].startswith("…") and len(kept[4]) == 400 - 19
+
+
+def test_model_params_per_model_and_keep_thinking_override():
+    s = proxy.Settings(model_params={"glm*": {"temperature": 1.0, "reasoning_effort": "high"},
+                                     "glm-latest": {"top_p": 0.95, "keep_thinking": "text"}},
+                       keep_thinking="field")
+    assert proxy.model_params(s, "glm-latest") == {"temperature": 1.0, "reasoning_effort": "high",
+                                                   "top_p": 0.95, "keep_thinking": "text"}
+    assert proxy.model_params(s, "qwen-latest") == {}
+    assert proxy.keep_thinking_mode(s, "glm-latest") == "text" and proxy.keep_thinking_mode(s, "qwen") == "field"
+    with pytest.raises(ValueError, match="must not set: messages"):
+        proxy.Settings(model_params={"*": {"messages": []}})
+    with pytest.raises(ValueError, match="keep_thinking"):
+        proxy.Settings(model_params={"*": {"keep_thinking": "maybe"}})
+
+
+def test_model_params_sent_and_client_wins():
+    router = FakeRouter(lambda n: "hi", lambda n: "hi", lambda n: "hi")
+    params = {"glm*": {"temperature": 1.0, "reasoning_effort": "high", "chat_template_kwargs": {"x": 1},
+                       "keep_thinking": "off"}}
+    with make_client(router, model_params=params, extra_body={"temperature": 0.2}) as client:
+        client.post("/v1/chat/completions", json=tools_payload(model="glm-latest"))
+        client.post("/v1/chat/completions", json=tools_payload(model="glm-latest", reasoning_effort="low"))
+        client.post("/v1/chat/completions", json=tools_payload(model="qwen-latest"))
+    first, second, other = (r["json"] for r in router.requests)
+    assert first["temperature"] == 1.0 and first["reasoning_effort"] == "high"
+    assert first["chat_template_kwargs"] == {"x": 1} and "keep_thinking" not in first
+    assert second["reasoning_effort"] == "low"           # sent by the client (Pi's thinking level)
+    assert other["temperature"] == 0.2 and "reasoning_effort" not in other
+
+
+def test_refused_model_param_is_dropped_and_stays_off():
+    refusal = (400, {"error": {"message": "litellm.UnsupportedParamsError: openai does not support "
+                                          "parameters: ['reasoning_effort'], for model=glm"}})
+    router = FakeRouter(lambda n: "hi", refusal, lambda n: "hi", lambda n: "hi")
+    params = {"glm*": {"temperature": 1.0, "reasoning_effort": "high"}}
+    with make_client(router, model_params=params) as client:
+        assert client.post("/v1/chat/completions", json=tools_payload(model="other")).status_code == 200
+        assert client.post("/v1/chat/completions", json=tools_payload(model="glm-latest")).status_code == 200
+        assert client.post("/v1/chat/completions", json=tools_payload(model="glm-latest")).status_code == 200
+        info = client.get("/bridge/info", params={"models": "glm-latest"}).json()
+    sent = [r["json"] for r in router.requests]
+    assert "reasoning_effort" in sent[1] and "reasoning_effort" not in sent[2] and "reasoning_effort" not in sent[3]
+    assert sent[2]["temperature"] == 1.0
+    assert info["dropped_params"] == {"glm-latest": ["reasoning_effort"]}
+    assert info["models"]["glm-latest"]["params"] == {"temperature": 1.0}
+
+
+def test_error_not_naming_a_param_is_passed_on():
+    router = FakeRouter((400, {"error": {"message": "context length exceeded"}}))
+    with make_client(router, model_params={"*": {"temperature": 1.0}}) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 400 and len(router.requests) == 1
+
+
+def test_litellm_limit_headers_parsed():
+    info = proxy.parse_rate_limit({"x-ratelimit-model_per_key-limit-tokens": "8000000",
+                                   "x-ratelimit-model_per_key-remaining-tokens": "2414691",
+                                   "x-litellm-key-spend": "441569.7"})
+    assert info.model_limit_tokens == 8000000 and info.model_remaining_tokens == 2414691
+    assert info.key_spend == 441569.7 and info.remaining_tokens is None  # display only
+
+
+def test_keep_thinking_settings_from_env(monkeypatch):
+    monkeypatch.setenv("MODEL_PARAMS", '{"glm*": {"reasoning_effort": "high"}}')
+    s = proxy.Settings.from_env()
+    assert s.keep_thinking == "field" and s.keep_thinking_chars == 60000
+    assert s.model_params == {"glm*": {"reasoning_effort": "high"}}
+    monkeypatch.setenv("KEEP_THINKING", "nope")
+    with pytest.raises(ValueError, match="KEEP_THINKING"):
+        proxy.Settings.from_env()

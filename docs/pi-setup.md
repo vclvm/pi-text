@@ -1183,8 +1183,8 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `down [--vm]` | Stop the containers; with `--vm` the Colima VM too |
 | `verify` | Try everything the agent must not be able to do (§6.7) |
 | `review` | After a session: git hooks, risky git config, recent `.obsidian` changes (§7.3) |
-| `probe [what]` | Ask your router what it really offers: endpoints (including `/openapi.json`), which models answer a tiny request, its rate-limit headers; `probe limits` shows the bridge's current rate-limit state ([bridge/README.md](../bridge/README.md#probing-the-router-probepy)) |
-| `diag` | Live view of every request in a second terminal: rate-limit waits, when the router answered, when the first token came, writing speed, and which phase took the time ([bridge/README.md](../bridge/README.md#watching-requests-live-diagpy)) |
+| `probe [what]` | Ask your router what it really offers: endpoints (including `/openapi.json`), which models answer a tiny request, its rate-limit headers; `probe limits` shows the bridge's current rate-limit state and what it sends to each model; `probe thinking|history --models a,b`: which field changes a model's thinking, whether it sees its earlier thinking ([bridge/README.md](../bridge/README.md#probing-the-router-probepy)) |
+| `diag` | Live view of every request in a second terminal: on start the per-model request fields (`MODEL_PARAMS`), then rate-limit waits and tokens left, when the router answered, when the first token came, writing speed, and which phase took the time ([bridge/README.md](../bridge/README.md#watching-requests-live-diagpy)) |
 
 How it works:
 

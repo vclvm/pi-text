@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 import math
+import fnmatch
 import os
 import re
 import secrets
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -144,6 +146,9 @@ class Settings:
     rate_limit_retry_max: float = 20.0  # after a 429, try again at least this often (named reset or not)
     rate_limit_low: int = 1             # remaining requests <= this: spread the rest until the reset
     model_fallbacks: dict = field(default_factory=dict)  # {"model": ["fallback", ...]} on "unsupported model"
+    model_params: dict = field(default_factory=dict)  # {"model id or glob": {field: value}}: request fields per model
+    keep_thinking: str = "off"        # earlier thinking in the history: "field" (reasoning_content), "text", "off"
+    keep_thinking_chars: int = 60000  # at most this much of it (the newest), since the last user message
     nonce_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     api: str = field(init=False, default="")       # resolved API kind
     endpoint: str = field(init=False, default="")  # resolved full endpoint URL
@@ -166,6 +171,17 @@ class Settings:
                 alternatives = self.model_fallbacks[model] = [alternatives]
             if not isinstance(alternatives, list) or not all(isinstance(a, str) for a in alternatives):
                 raise ValueError(f"MODEL_FALLBACKS[{model!r}] must be a model id or a list of model ids")
+        if self.keep_thinking not in KEEP_THINKING_MODES:
+            raise ValueError(f"KEEP_THINKING must be one of {', '.join(KEEP_THINKING_MODES)} (got {self.keep_thinking!r})")
+        for pattern, params in self.model_params.items():
+            if not isinstance(params, dict):
+                raise ValueError(f"MODEL_PARAMS[{pattern!r}] must be a map of request fields")
+            reserved = sorted(set(params) & set(RESERVED_EXTRA_FIELDS + ("model",)))
+            if reserved:
+                raise ValueError(f"MODEL_PARAMS[{pattern!r}] must not set: {', '.join(reserved)}")
+            if params.get("keep_thinking", "off") not in KEEP_THINKING_MODES:
+                raise ValueError(f"MODEL_PARAMS[{pattern!r}].keep_thinking must be one of "
+                                 f"{', '.join(KEEP_THINKING_MODES)}")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -194,7 +210,28 @@ class Settings:
             rate_limit_retry_max=float(os.environ.get("RATE_LIMIT_RETRY_MAX", "20")),
             rate_limit_low=int(os.environ.get("RATE_LIMIT_LOW", "1")),
             model_fallbacks=_env_json("MODEL_FALLBACKS"),
+            model_params=_env_json("MODEL_PARAMS"),
+            keep_thinking=os.environ.get("KEEP_THINKING", "field").strip().lower() or "off",
+            keep_thinking_chars=int(os.environ.get("KEEP_THINKING_CHARS", "60000")),
         )
+
+
+KEEP_THINKING_MODES = ("field", "text", "off")
+BRIDGE_PARAMS = ("keep_thinking",)  # MODEL_PARAMS keys the bridge itself uses (never sent upstream)
+
+
+def model_params(settings: Settings, model: str) -> dict:
+    """MODEL_PARAMS for `model`: every entry whose key is the id or a glob matching it, in order
+    (a later entry wins)."""
+    merged: dict = {}
+    for pattern, params in settings.model_params.items():
+        if pattern == model or fnmatch.fnmatchcase(model, pattern):
+            merged.update(params)
+    return merged
+
+
+def keep_thinking_mode(settings: Settings, model: str) -> str:
+    return model_params(settings, model).get("keep_thinking", settings.keep_thinking)
 
 
 # --------------------------------------------------------------------------- trace
@@ -589,6 +626,11 @@ class RateInfo:
     remaining_tokens: float | None = None
     reset_requests: float | None = None      # seconds until the request window resets
     reset_tokens: float | None = None        # seconds until the token window resets
+    # LiteLLM's per-model limits (x-ratelimit-model_per_key-*) and key spend: shown, not acted upon
+    # (the limiter is shared by all models).
+    model_limit_tokens: float | None = None
+    model_remaining_tokens: float | None = None
+    key_spend: float | None = None
     headers: dict = field(default_factory=dict)  # every limit-related header as received
 
     def as_dict(self) -> dict:
@@ -624,6 +666,13 @@ def parse_rate_limit(headers: Any, body: Any = None, now: float | None = None) -
     info.reset_requests = seconds_until(reset, now) if reset is not None else None
     reset_tokens = first("x-ratelimit-reset-tokens", "x-ratelimit-tokens-reset")
     info.reset_tokens = seconds_until(reset_tokens, now) if reset_tokens is not None else None
+    for name, value in h.items():
+        if re.fullmatch(r"x-ratelimit-.+-limit-tokens", name):
+            info.model_limit_tokens = _number(value)
+        elif re.fullmatch(r"x-ratelimit-.+-remaining-tokens", name) and name != "x-ratelimit-remaining-tokens":
+            info.model_remaining_tokens = _number(value)
+    if h.get("x-litellm-key-spend"):
+        info.key_spend = _number(h["x-litellm-key-spend"])
     if body is not None and info.retry_after is None:
         info.retry_after = _body_wait(body, now)
     return info
@@ -631,7 +680,8 @@ def parse_rate_limit(headers: Any, body: Any = None, now: float | None = None) -
 
 def estimate_tokens(payload: dict) -> int:
     """Rough prompt size of a chat-shaped payload (characters / 4), for token-per-minute limits."""
-    chars = sum(len(m.get("content") or "") for m in payload.get("messages") or [] if isinstance(m, dict))
+    chars = sum(len(m.get("content") or "") + len(m.get("reasoning_content") or "")
+                for m in payload.get("messages") or [] if isinstance(m, dict))
     return chars // 4
 
 
@@ -806,20 +856,60 @@ def _decode_arguments(arguments: Any) -> Any:
     return {} if arguments is None else arguments
 
 
-def build_messages(messages: list, nonce: str, tag: str = DEFAULT_TAG) -> list[dict[str, str]]:
+def _reasoning_of(message: dict) -> str:
+    """The thinking a client sent back with an earlier assistant message (Pi: reasoning_content)."""
+    for key in ("reasoning_content", "reasoning", "reasoning_text"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def kept_thoughts(messages: list, chars: int) -> dict[int, str]:
+    """Index -> thinking of the assistant messages since the last user message (the current agent
+    loop), newest first until `chars` are used up; an older one that doesn't fit is cut at its start."""
+    kept: dict[int, str] = {}
+    last_user = max((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"),
+                    default=-1)
+    left = chars
+    for i in range(len(messages) - 1, last_user, -1):
+        m = messages[i]
+        if left < 200:
+            break
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        thought = _reasoning_of(m)
+        if thought:
+            if len(thought) > left:
+                thought = "…" + thought[-(left - 1):]
+            kept[i] = thought
+            left -= len(thought)
+    return kept
+
+
+def build_messages(messages: list, nonce: str, tag: str = DEFAULT_TAG, *, keep_thinking: str = "off",
+                   thinking_chars: int = 0) -> list[dict[str, str]]:
     """Rewrite an agent transcript into plain system/user/assistant text messages.
 
     Past tool calls are rendered in exactly the protocol format (with the current
     nonce) so the model sees consistent examples; tool results become user turns.
-    Consecutive messages with the same role are merged."""
+    Consecutive messages with the same role are merged.
+
+    keep_thinking: the model's own earlier thinking of the current agent loop goes back to it,
+    as `reasoning_content` of the assistant message ("field", how chat templates of thinking models
+    read it) or as <think>…</think> before its text ("text"); "off" drops it."""
     out: list[dict[str, str]] = []
     call_names: dict[Any, Any] = {}
-    for message in messages:
+    thoughts = kept_thoughts(messages, thinking_chars) if keep_thinking != "off" and thinking_chars > 0 else {}
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise ValueError("Each message must be an object")
         role = message.get("role")
+        thought = thoughts.get(index, "") if role == "assistant" else ""
         if role == "assistant":
             parts = []
+            if thought and keep_thinking == "text":
+                parts.append(f"{THINK_OPEN}\n{thought}\n{THINK_CLOSE}")
             text = _text(message.get("content"), placeholder=True).strip()
             if text:
                 parts.append(text)
@@ -846,6 +936,9 @@ def build_messages(messages: list, nonce: str, tag: str = DEFAULT_TAG) -> list[d
             out[-1]["content"] += "\n\n" + content
         else:
             out.append({"role": role, "content": content})
+        if thought and keep_thinking == "field":
+            previous = out[-1].get("reasoning_content")
+            out[-1]["reasoning_content"] = previous + "\n\n" + thought if previous else thought
     return out
 
 
@@ -941,6 +1034,7 @@ class Prepared:
     must_call: bool
     model: str
     tag: str = DEFAULT_TAG
+    kept_thinking: int = 0  # characters of earlier thinking put back into the history
 
 
 def prepare_request(payload: dict, settings: Settings) -> Prepared:
@@ -953,7 +1047,12 @@ def prepare_request(payload: dict, settings: Settings) -> Prepared:
     choice = payload.get("tool_choice")
     nonce = session_nonce(raw_messages, settings.nonce_secret)
     tag = settings.protocol_tag
-    messages = build_messages(raw_messages, nonce, tag)
+    mode = keep_thinking_mode(settings, payload["model"])
+    messages = build_messages(raw_messages, nonce, tag, keep_thinking=mode,
+                              thinking_chars=settings.keep_thinking_chars)
+    kept = (sum(len(m.get("reasoning_content", "")) for m in messages) if mode == "field" else
+            sum(len(t) for t in kept_thoughts(raw_messages, settings.keep_thinking_chars).values())
+            if mode == "text" and settings.keep_thinking_chars > 0 else 0)
     if tools:
         instruction = build_instruction(tools, nonce, choice, tag)
         if settings.injection_role == "system":
@@ -970,7 +1069,7 @@ def prepare_request(payload: dict, settings: Settings) -> Prepared:
     upstream = {**settings.extra_body, **{k: payload[k] for k in PASSTHROUGH_FIELDS if k in payload}}
     upstream["messages"] = messages  # chat-shaped; converted per upstream API in Bridge.open()
     must_call = bool(tools) and (choice == "required" or isinstance(choice, dict))
-    return Prepared(upstream, tools, nonce, must_call, payload["model"], tag)
+    return Prepared(upstream, tools, nonce, must_call, payload["model"], tag, kept)
 
 
 # --------------------------------------------------------------------------- reply side
@@ -1467,7 +1566,24 @@ class Bridge:
         self.client = client
         self.limiter = RateLimiter(settings)
         self.unsupported: dict[str, float] = {}  # model -> monotonic time until which it is skipped
+        self.dropped_params: dict[str, set] = {}  # model -> MODEL_PARAMS fields the router refused
+        self.last_limits: dict[str, dict] = {}    # model -> limit headers of its last response
         self.monitor = Monitor()
+
+    def upstream_params(self, model: str) -> dict:
+        """MODEL_PARAMS fields sent upstream for `model` (without the bridge's own and refused ones)."""
+        dropped = self.dropped_params.get(model, set())
+        return {k: v for k, v in model_params(self.s, model).items() if k not in BRIDGE_PARAMS and k not in dropped}
+
+    def body_for(self, payload: dict, model: str) -> tuple[dict, dict]:
+        """The request for `model`: MODEL_PARAMS fill in what the client didn't set itself
+        (UPSTREAM_EXTRA_BODY counts as not set). Returns (body, the MODEL_PARAMS fields used)."""
+        body = {**payload, "model": model}
+        used = {}
+        for key, value in self.upstream_params(model).items():
+            if key not in payload or (key in self.s.extra_body and payload[key] == self.s.extra_body[key]):
+                body[key] = used[key] = value
+        return body, used
 
     def _headers(self) -> dict:
         headers = {**self.s.extra_headers, "Content-Type": "application/json"}
@@ -1537,10 +1653,12 @@ class Bridge:
         while True:
             model = models[index]
             waited += await self.limiter.wait(tokens, limit - waited, trace)
-            trace.event("send", model=model, tokens=tokens, streaming=self.s.upstream_stream)
+            body, used = self.body_for(payload, model)
+            trace.event("send", model=model, tokens=tokens, streaming=self.s.upstream_stream, params=used,
+                        reasoning_effort=body.get("reasoning_effort"))
             sent = time.monotonic()
             try:
-                response = await self._send(url, convert({**payload, "model": model}, self.s))
+                response = await self._send(url, convert(body, self.s))
             except BridgeError as e:
                 trace.event("upstream_error", status=e.status, message=e.message[:300],
                             seconds=round(time.monotonic() - sent, 2))
@@ -1549,6 +1667,7 @@ class Bridge:
             if status < 400:
                 info = parse_rate_limit(response.headers)
                 self.limiter.observe(info, status)
+                self._remember_limits(model, info)
                 trace.event("headers", status=status, seconds=round(time.monotonic() - sent, 2),
                             streaming=self.s.upstream_stream,
                             limits={k: v for k, v in info.as_dict().items() if v is not None and k != "headers"})
@@ -1579,6 +1698,15 @@ class Bridge:
                     raise RateLimitWait(delay, "upstream returned 429", error.message)
                 continue
             self.limiter.observe(parse_rate_limit(response.headers), status)
+            refused = self._refused_params(status, raw, used)
+            if refused:
+                self.dropped_params.setdefault(model, set()).update(refused)
+                text = _upstream_error(status, raw).message
+                log.warning("router refused %s for %s (%d); sending without: %.300s",
+                            ", ".join(refused), model, status, text)
+                trace(f"!! router refused {', '.join(refused)} for {model}; sending again without")
+                trace.event("params_dropped", model=model, params=refused, status=status, message=text[:300])
+                continue
             if index + 1 < len(models) and is_unsupported_model(status, raw):
                 self.unsupported[model] = time.monotonic() + UNSUPPORTED_MODEL_TTL
                 log.warning("model %s refused upstream (%d); falling back to %s: %.300s",
@@ -1588,6 +1716,45 @@ class Bridge:
                 index += 1
                 continue
             raise _upstream_error(status, raw)
+
+    @staticmethod
+    def _refused_params(status: int, raw: bytes, used: dict) -> list[str]:
+        """MODEL_PARAMS fields a 400/422 names (e.g. LiteLLM's "does not support parameters:
+        ['reasoning_effort']"): the request is sent again without them, and they stay off for that
+        model until the bridge restarts. An error that names none of them is a real error."""
+        if status not in (400, 422) or not used:
+            return []
+        text = raw.decode("utf-8", "replace")
+        return [k for k in used if re.search(rf"(?<![\w-]){re.escape(k)}(?![\w-])", text)]
+
+    def _remember_limits(self, model: str, info: RateInfo) -> None:
+        shown = {k: v for k, v in info.as_dict().items() if k != "headers"}
+        if shown:
+            self.last_limits[model] = {"at": time.strftime("%H:%M:%S"), **shown}
+
+    def info(self) -> dict:
+        """The bridge's settings that shape every request, for `pibox diag` and `probe limits`."""
+        return {
+            "upstream": urlsplit(self.s.endpoint).netloc if self.s.endpoint else "",
+            "api": self.s.api,
+            "model_params": self.s.model_params,
+            "extra_body": self.s.extra_body,
+            "dropped_params": {m: sorted(v) for m, v in self.dropped_params.items() if v},
+            "keep_thinking": self.s.keep_thinking,
+            "keep_thinking_chars": self.s.keep_thinking_chars,
+            "reasoning_budget": "auto" if self.s.reasoning_budget < 0 else self.s.reasoning_budget,
+            "max_retries": self.s.max_retries,
+            "upstream_resends": self.s.upstream_resends,
+            "rate_limit_retry_max": self.s.rate_limit_retry_max,
+            "min_request_interval": self.s.min_request_interval,
+            "last_limits": self.last_limits,
+        }
+
+    def model_info(self, model: str) -> dict:
+        """What the bridge sends for `model` besides the conversation."""
+        return {"params": {**self.s.extra_body, **self.upstream_params(model)},
+                "keep_thinking": keep_thinking_mode(self.s, model),
+                "dropped": sorted(self.dropped_params.get(model, ()))}
 
     async def events(self, response: httpx.Response, sink: list | None = None) -> AsyncIterator[tuple[str, Any]]:
         """`sink`, if given, receives every raw upstream chunk/body (for DEBUG_DUMP_DIR)."""
@@ -2038,6 +2205,14 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "refused_models": {m: round(t - now) for m, t in bridge.unsupported.items() if t > now},
                 "model_fallbacks": settings.model_fallbacks}
 
+    @app.get("/bridge/info")
+    async def info(request: Request, models: str = ""):
+        """The settings that shape requests, and per model (comma-separated ids) what is sent."""
+        bridge: Bridge = request.app.state.bridge
+        result = bridge.info()
+        result["models"] = {m: bridge.model_info(m) for m in models.split(",") if m.strip()}
+        return result
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         bridge: Bridge = request.app.state.bridge
@@ -2059,6 +2234,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             trace.event("request", model=prep.model, stream=bool(payload.get("stream")),
                         messages=len(messages), tools=len(prep.tools), tokens=estimate_tokens(prep.upstream),
                         max_tokens=payload.get("max_completion_tokens", payload.get("max_tokens")),
+                        kept_thinking=prep.kept_thinking, keep_thinking=keep_thinking_mode(settings, prep.model),
                         last=_last_user_text(messages), messages_hash=_messages_hash(messages),
                         client=request.headers.get("user-agent", "")[:60])
             handed_over = False

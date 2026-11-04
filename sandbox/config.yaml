@@ -49,6 +49,27 @@ bridge:
   # RATE_LIMIT_MAX_RESET: 3600     # a 429 whose reset is further away is a quota: Pi gets it at once
   # RATE_LIMIT_RETRY_MAX: 20       # after a 429 the bridge tries again at least every 20 s, until it passes
   # REASONING_BUDGET: auto       # thinking without an answer near max_tokens: stopped, the model asked to save it and act
+  # Request fields per model: the key is a model id or a glob (glm* = every id starting with glm), a
+  # later entry wins. Sent unless Pi sets the field itself. The defaults are the sampling values the
+  # model makers recommend for thinking mode. A field the router refuses (a 400 naming it) is left
+  # out automatically and `pibox diag` says so. `pibox probe thinking --models …` shows which fields
+  # change a model's thinking.
+  #   glm: reasoning_effort low|high|max, max if not sent; max is meant for replies of up to 128k
+  #        tokens, high fits maxTokens 32768
+  #   gemma: thinking is off unless asked for; add chat_template_kwargs: { enable_thinking: true }
+  #        once `pibox probe thinking --models <gemma>` shows "more thinking" with a clean answer
+  #   keep_thinking: KEEP_THINKING for this model only
+  MODEL_PARAMS:
+    "glm*": { temperature: 1.0, top_p: 0.95, reasoning_effort: high }
+    "qwen*": { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 }
+    "gemma*": { temperature: 1.0, top_p: 0.95, top_k: 64 }
+  # The model's own thinking of the current task (since your last message) goes back to it with
+  # the history, so it doesn't redo its analysis at every step: field = as reasoning_content (how
+  # thinking models expect it), text = as <think>…</think> before the reply, off = dropped.
+  # `pibox probe history --models …` shows which way the model really sees it
+  KEEP_THINKING: field
+  # At most this many characters of it per request (the newest; ~4 characters per token)
+  KEEP_THINKING_CHARS: 60000
   # Models the router refuses as "unsupported": use these instead. `pibox probe` shows which work
   # MODEL_FALLBACKS: { YOUR_MODEL_ID: [ANOTHER_MODEL_ID] }
 

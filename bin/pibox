@@ -59,7 +59,9 @@ Check:
   verify         try everything the agent must not be able to do
   review         git hooks, risky git config, recent .obsidian changes in your folders
   probe [what]   what your router really offers, asked from the bridge: endpoints, models (a tiny
-                 request to each), rate-limit headers; 'probe limits': what the bridge knows now
+                 request to each), rate-limit headers; 'probe limits': what the bridge knows now;
+                 'probe thinking|history --models a,b': what changes thinking, does the model see
+                 its earlier thinking
   diag           live view of every request in a second terminal: rate-limit waits, router answer,
                  first token, writing speed, and where the time went (--history 0, --json)"
 }

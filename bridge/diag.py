@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Live view of what the bridge is doing with every request: `pibox diag` in a second terminal.
 
-For each request from Pi it shows when it arrived, how long the bridge waited for rate limits,
+On connecting it shows what the bridge sends to each model of the router besides the conversation
+(MODEL_PARAMS, kept thinking, budgets) and the last rate-limit numbers. For each request from Pi it
+shows when it arrived, how long the bridge waited for rate limits,
 when the router answered (headers), when the first token came, how fast the model wrote, and at
 the end where the time went:
 
@@ -26,6 +28,7 @@ import sys
 import threading
 import time
 import unicodedata
+import urllib.parse
 import urllib.request
 
 PHASES = {  # phase -> (label in the summary, what it means when it dominates)
@@ -98,6 +101,19 @@ def kchars(n) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
+def tokens(n) -> str:
+    n = float(n or 0)
+    for size, unit in ((1e6, "M"), (1e3, "k")):
+        if abs(n) >= size:
+            return f"{n / size:.{2 if abs(n) < 10 * size else 1}f}".rstrip("0").rstrip(".") + unit
+    return f"{n:.0f}"
+
+
+def params_text(params: dict) -> str:
+    return " ".join(f"{k}={json.dumps(v, ensure_ascii=False, separators=(',', ':'))}" for k, v in params.items()) \
+        or "(none: the router's defaults)"
+
+
 class View:
     def __init__(self, color: bool, tty: bool):
         self.color, self.tty = color, tty
@@ -111,6 +127,9 @@ class View:
         self.active: dict[str, dict] = {}    # rid -> model, start, phase, since (epoch seconds)
         self.outcome: dict[str, dict] = {}   # rid -> what the request ended with (done/error)
         self.last: dict | None = None        # the last finished request
+        self.shown_params: dict[str, str] = {}   # model -> params last shown for it
+        self.remaining: dict[str, float] = {}    # model -> tokens left after its last answer
+        self.request_model: dict[str, str] = {}  # rid -> model
 
     def c(self, kind: str, text: str) -> str:
         return f"\033[{COLORS[kind]}m{text}\033[0m" if self.color and COLORS[kind] else text
@@ -240,6 +259,9 @@ class View:
             text = (f"▶ request{replay} model={e.get('model')} {'stream' if e.get('stream') else 'no-stream'} "
                     f"messages={e.get('messages')} tools={e.get('tools')} ~{kchars(e.get('tokens'))} tokens"
                     + (f" max_tokens={e['max_tokens']}" if e.get("max_tokens") else ""))
+            if e.get("kept_thinking"):
+                text += (f"\n  + {kchars(e['kept_thinking'])} chars of its own earlier thinking sent back "
+                         f"(KEEP_THINKING {e.get('keep_thinking')})")
             if e.get("last"):
                 text += f'\n  last input: "{e["last"]}"'
             if extra:
@@ -253,13 +275,18 @@ class View:
                                  f"already answered Pi and keeps it connected with pings while it waits")
         elif k == "send":
             self.sent_tokens[rid] = e.get("tokens") or 0
-            self.line(e, "info", f"  → sent to the router: model={e.get('model')} ~{kchars(e.get('tokens'))} tokens "
-                                 f"(+{e['elapsed']:.1f}s)")
+            model = e.get("model") or ""
+            self.request_model[rid] = model
+            text = f"  → sent to the router: model={model} ~{kchars(e.get('tokens'))} tokens (+{e['elapsed']:.1f}s)"
+            params = params_text(e.get("params") or {})
+            if "params" in e and self.shown_params.get(model) != params:  # only when they change
+                self.shown_params[model] = params
+                text += f"\n    MODEL_PARAMS: {params}"
+            self.line(e, "info", text)
         elif k == "headers":
             status = e.get("status", 0)
             if status < 400:
-                limits = e.get("limits") or {}
-                lim = " ".join(f"{a}={b}" for a, b in limits.items())
+                lim = self.limits_text(rid, dict(e.get("limits") or {}))
                 what = "headers" if e.get("streaming") else "full answer (non-streaming)"
                 slow = "  ← slow router" if e.get("seconds", 0) >= 10 else ""
                 self.line(e, "info", f"  ← router {status}: {what} after {e['seconds']:.2f}s{slow}"
@@ -280,6 +307,11 @@ class View:
                     text += (f"\n    the router says {kchars(remaining)} tokens remain, less than this prompt "
                              f"(~{kchars(prompt)}): the key's limit is used up")
             self.line(e, "warn", text)
+        elif k == "params_dropped":
+            self.shown_params.pop(e.get("model") or "", None)
+            self.line(e, "warn", f"  ⚠ the router refused {', '.join(e.get('params') or [])} for {e.get('model')}: "
+                                 f"sent again without, and left out until the bridge restarts. Fix MODEL_PARAMS "
+                                 f"in config.yaml\n    {e.get('message', '')}")
         elif k == "fallback":
             self.line(e, "warn", f"  ⚠ model {e.get('model')} refused ({e.get('status')}), trying {e.get('to')}")
         elif k == "upstream_error":
@@ -307,6 +339,10 @@ class View:
             details = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
             if details:
                 u += f" reasoning_tokens={details}"
+            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            if cached is not None:
+                u += f" cached_tokens={cached}" + (f" ({100 * cached / usage['prompt_tokens']:.0f}% of the prompt)"
+                                                   if usage.get("prompt_tokens") else "")
             secs = max(e.get("seconds") or 0, 0.1)
             total = (e.get("chars") or 0) + (e.get("reasoning_chars") or 0)
             text = (f"  ✓ model done (finish={e.get('finish')}): text {kchars(e.get('chars'))}, reasoning "
@@ -348,6 +384,55 @@ class View:
         else:
             self.line(e, "dim", f"  {k}: {json.dumps(e, ensure_ascii=False)}")
 
+    def limits_text(self, rid: str, limits: dict) -> str:
+        """The router's limit headers, readable; for LiteLLM's per-model token limit also how much
+        it went down since this model's previous answer (the router's real count of a request)."""
+        parts = []
+        left, limit = limits.pop("model_remaining_tokens", None), limits.pop("model_limit_tokens", None)
+        spend = limits.pop("key_spend", None)
+        model = self.request_model.get(rid, "")
+        if left is not None:
+            text = f"{tokens(left)}" + (f" of {tokens(limit)}" if limit else "") + " tokens left for this model"
+            before = self.remaining.get(model)
+            if before is not None:
+                used = before - left
+                prompt, out = self.sent_tokens.get(rid, 0), self.max_tokens.get(rid, 0)
+                text += (f" ({'−' if used >= 0 else '+'}{tokens(abs(used))} since its previous request; "
+                         f"this prompt ~{tokens(prompt)}" + (f", max_tokens {tokens(out)}" if out else "") + ")")
+            self.remaining[model] = left
+            parts.append(text)
+        if spend is not None:
+            parts.append(f"key spend {spend:.2f}")
+        parts += [f"{a}={b}" for a, b in limits.items()]
+        return " · ".join(parts)
+
+    def header(self, info: dict) -> None:
+        """What the bridge sends besides the conversation, per model of the router."""
+        lines = [f"bridge → {info.get('upstream') or '?'} ({info.get('api') or '?'} API)"]
+        models = info.get("models") or {}
+        width = max((len(m) for m in models), default=0)
+        for model, m in models.items():
+            params = params_text(m.get("params") or {})
+            self.shown_params[model] = params_text({k: v for k, v in (m.get("params") or {}).items()
+                                                    if k not in (info.get("extra_body") or {})})
+            dropped = f" · refused by the router: {', '.join(m['dropped'])}" if m.get("dropped") else ""
+            lines.append(f"  {model:<{width}}  {params} · earlier thinking: {m.get('keep_thinking')}{dropped}")
+        if not models:
+            lines.append("  (the router's model list is not available)")
+        lines.append(f"  REASONING_BUDGET {info.get('reasoning_budget')} · KEEP_THINKING_CHARS "
+                     f"{info.get('keep_thinking_chars')} · re-asks {info.get('max_retries')} · resends "
+                     f"{info.get('upstream_resends')} · after a 429 retry every ≤{info.get('rate_limit_retry_max')}s")
+        for model, lim in (info.get("last_limits") or {}).items():
+            left = lim.get("model_remaining_tokens")
+            if left is not None:
+                self.remaining[model] = left
+                lines.append(f"  {model}: {tokens(left)}" + (f" of {tokens(lim['model_limit_tokens'])}"
+                                                            if lim.get("model_limit_tokens") else "")
+                             + f" tokens left at {lim.get('at')}")
+        lines.append("  Per request the model's thinking level comes from Pi (Shift+Tab) if it sends one; "
+                     "otherwise MODEL_PARAMS")
+        self.line({}, "verdict", "\n".join(lines))
+
     def summary(self, e: dict) -> None:
         rid = e.get("rid", "")
         spent = e.get("spent") or {}
@@ -368,6 +453,7 @@ class View:
         self.max_tokens.pop(rid, None)
         self.last_tail.pop(rid, None)
         self.sent_tokens.pop(rid, None)
+        self.request_model.pop(rid, None)
         self.line(e, "end_ok" if ok else "end_bad", text)
 
 
@@ -381,6 +467,10 @@ def read_events(url: str, history: int, raw: bool, events: queue.Queue) -> None:
             with opener.open(f"{url}/bridge/events?history={history if first else 0}", timeout=30) as response:
                 if not first:
                     events.put(("note", "reconnected to the bridge"))
+                if not raw:
+                    info = bridge_info(opener, url)
+                    if info:
+                        events.put(("info", info))
                 first = False
                 for line in response:
                     if not line.strip():
@@ -400,6 +490,20 @@ def read_events(url: str, history: int, raw: bool, events: queue.Queue) -> None:
             time.sleep(3)
 
 
+def bridge_info(opener, url: str) -> dict | None:
+    """GET /bridge/info for the models the router lists (no tokens spent); None from an old bridge."""
+    try:
+        with opener.open(f"{url}/v1/models", timeout=15) as r:
+            ids = [m.get("id") for m in json.load(r).get("data") or [] if isinstance(m, dict) and m.get("id")]
+    except Exception:  # noqa: BLE001  (router unreachable: the settings are still worth showing)
+        ids = []
+    try:
+        with opener.open(f"{url}/bridge/info?models={urllib.parse.quote(','.join(ids))}", timeout=15) as r:
+            return json.load(r)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def follow(url: str, history: int, raw: bool, view: View) -> None:
     events: queue.Queue = queue.Queue()
     threading.Thread(target=read_events, args=(url, history, raw, events), daemon=True).start()
@@ -412,6 +516,9 @@ def follow(url: str, history: int, raw: bool, view: View) -> None:
             continue
         if kind == "fatal":
             sys.exit(item)
+        if kind == "info":
+            view.header(item)
+            continue
         if kind in ("note", "error"):
             view.line({}, "dim" if kind == "note" else "err", item)
             continue
