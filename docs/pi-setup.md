@@ -1062,9 +1062,11 @@ Public default registries (registry.npmjs.org, pypi.org) are not added.
   (`repository.apt_sources`). The public npm and PyPI registries only if your own `.npmrc` / `pip.conf`
   names them. `pibox setup` prints the list. Add a host to `network.upstream_no_proxy` if it is reached
   directly rather than through the proxy on your Mac; `pibox nettest https://host/…` shows which way works.
-- **A repository that hangs**: `pibox log` shows each tunnel: `TUNNEL host` (asked), then `TUNNEL CONNECTED
-  … directly / via the upstream proxy` or `CONNECT FAILED`, and `TUNNEL CLOSED after Ns`. A `TUNNEL`
-  without `CONNECTED` is a connection that never got through (VPN, route, the proxy on your Mac).
+- **A repository that hangs**: `pibox log` shows each tunnel: `TUNNEL host` (asked), then `TUNNEL CONNECTED`
+  (directly, or: connected to the proxy on your Mac, which was asked to CONNECT to the host) or
+  `CONNECT FAILED` with the reason, and `TUNNEL CLOSED after Ns`. What happens inside a tunnel can't be
+  seen; `pibox nettest https://host/…` makes the same request from the bridge container, directly and
+  through the proxy on your Mac, the way the model router is reached, and from the agent's container.
   Maven gives up after 20 s without a connection and 120 s without data (`MAVEN_ARGS`), and a bash
   command of the agent after `extensions.bash_timeout`.
 - **Deploy, publish, push** (POST/PUT) are refused by the proxy: the agent builds and tests, you publish.

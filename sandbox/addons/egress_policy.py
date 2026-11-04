@@ -114,6 +114,7 @@ def http_connect(flow: http.HTTPFlow) -> None:
         return _block(flow, 403, f"{req.host} is denied")
     flow.metadata["egress"] = "tunnel"
     _route(flow, req.host)
+    _tunnels[flow.client_conn.peername] = {"host": req.host, "port": req.port, "asked": time.time(), "connected": 0.0}
     _audit(logging.INFO, f"TUNNEL {req.host}:{req.port}")
 
 
@@ -147,36 +148,60 @@ def error(flow: http.HTTPFlow) -> None:
     _audit(logging.INFO, f"FAILED {flow.request.method} {flow.request.pretty_url}: {flow.error}")
 
 
+# Tunnels are opaque, so the journal says how each went. With an upstream proxy the server
+# connection is the one to that proxy (which is then asked to CONNECT to the repository), so each
+# tunnel is matched to its connection by the client's address.
+_tunnels: dict = {}  # client address -> {"host", "port", "asked", "connected"}
+
+
+def _tunnel_of(data):
+    return _tunnels.get(getattr(data.client, "peername", None))
+
+
 def _how(server) -> str:
-    via = getattr(getattr(server, "via", None), "address", None)
+    """ "directly" or "via the upstream proxy host:port" (server specs are (scheme, (host, port)))."""
+    via = server.via[1] if getattr(server, "via", None) else None
+    if not via and UPSTREAM and tuple(server.address or ()) == tuple(UPSTREAM[1]):
+        via = UPSTREAM[1]
     return f"via the upstream proxy {via[0]}:{via[1]}" if via else "directly"
 
 
-def _hostport(server) -> tuple[str, int]:
-    return tuple(server.address) if server.address else ("", 0)
-
-
-# Tunnels are opaque, so the journal says how each went: "TUNNEL host" (asked), then CONNECTED
-# (directly or via the upstream proxy, and how long that took) or CONNECT FAILED, and CLOSED with how
-# long it was open. "TUNNEL" without either, or a CLOSED right when the client gave up, is a
-# connection that hung behind the proxy (VPN, route, upstream proxy).
 def server_connected(data) -> None:
-    host, port = _hostport(data.server)
-    if _matches(host, TUNNEL):
-        took = (data.server.timestamp_tcp_setup or 0) - (data.server.timestamp_start or 0)
-        _audit(logging.INFO, f"TUNNEL CONNECTED {host}:{port} {_how(data.server)} in {max(took, 0):.1f}s")
+    t = _tunnel_of(data)
+    if t:
+        t["connected"] = time.time()
+        how = _how(data.server)
+        what = (f"connected to the upstream proxy {how.split()[-1]}, which was asked to CONNECT to "
+                f"{t['host']}:{t['port']}" if how != "directly" else f"{t['host']}:{t['port']} directly")
+        _audit(logging.INFO, f"TUNNEL CONNECTED {t['host']}:{t['port']}: {what}, after {t['connected'] - t['asked']:.1f}s")
 
 
 def server_connect_error(data) -> None:
-    host, port = _hostport(data.server)
-    _audit(logging.WARNING, f"CONNECT FAILED {host}:{port} {_how(data.server)}: {data.server.error}")
+    t = _tunnels.pop(getattr(data.client, "peername", None), None)
+    target = f"{t['host']}:{t['port']}" if t else ":".join(map(str, data.server.address or ()))
+    _audit(logging.WARNING, f"CONNECT FAILED {target} {_how(data.server)}: {data.server.error}")
+
+
+def _closed(t: dict, by: str) -> None:
+    now = time.time()
+    if t["connected"]:
+        _audit(logging.INFO, f"TUNNEL CLOSED {t['host']}:{t['port']} after {now - t['asked']:.1f}s")
+    else:
+        _audit(logging.WARNING, f"TUNNEL ABANDONED {t['host']}:{t['port']} after {now - t['asked']:.1f}s: the "
+                                f"{by} gave up while the connection {'to the upstream proxy ' if UPSTREAM else ''}"
+                                f"was still being made")
 
 
 def server_disconnected(data) -> None:
-    host, port = _hostport(data.server)
-    if _matches(host, TUNNEL) and data.server.timestamp_start:
-        took = (data.server.timestamp_end or time.time()) - data.server.timestamp_start
-        _audit(logging.INFO, f"TUNNEL CLOSED {host}:{port} after {took:.1f}s")
+    t = _tunnels.pop(getattr(data.client, "peername", None), None)
+    if t:
+        _closed(t, "server")
+
+
+def client_disconnected(client) -> None:
+    t = _tunnels.pop(getattr(client, "peername", None), None)
+    if t:
+        _closed(t, "client")
 
 
 def tcp_start(flow: tcp.TCPFlow) -> None:
