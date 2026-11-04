@@ -36,8 +36,10 @@ PHASES = {  # phase -> (label in the summary, what it means when it dominates)
 WAITING = {"bridge": "in the bridge", "rate_limit": "waiting for the rate limit",
            "upstream_headers": "waiting for the router to answer", "first_token": "waiting for the first token",
            "generating": "model is writing"}
-COLORS = {"request": "1;36", "end_ok": "1;32", "end_bad": "1;31", "warn": "33", "err": "31", "dim": "90",
-          "info": "0", "verdict": "35"}
+# Only normal colours on the default background: "bright black" (90) and faint (2) are the
+# background colour in many dark themes (Solarized Dark, …), so secondary text is left uncoloured.
+COLORS = {"request": "1;36", "end_ok": "1;32", "end_bad": "1;31", "warn": "33", "err": "31", "dim": "",
+          "info": "", "verdict": "35"}
 
 
 def kchars(n) -> str:
@@ -54,7 +56,7 @@ class View:
         self.last_note: dict[str, float] = {}
 
     def c(self, kind: str, text: str) -> str:
-        return f"\033[{COLORS[kind]}m{text}\033[0m" if self.color else text
+        return f"\033[{COLORS[kind]}m{text}\033[0m" if self.color and COLORS[kind] else text
 
     def line(self, event: dict, kind: str, text: str) -> None:
         stamp = time.strftime("%H:%M:%S", time.localtime(event.get("t", time.time())))

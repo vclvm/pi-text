@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-COLORS = {"user": "36", "assistant": "32", "thinking": "90", "call": "33", "ok": "34", "err": "31", "meta": "35"}
+COLORS = {"user": "36", "assistant": "32", "thinking": "3", "call": "33", "ok": "34", "err": "31", "meta": "35"}
 
 
 def sessions_dir() -> Path:

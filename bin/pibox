@@ -1078,7 +1078,8 @@ fresh() {                                   # the generated files must be newer 
 
 # ---------------------------------------------------------------- helpers
 compose_args() {                            # docker compose, with compose.override.yaml if present
-  reply=(compose --project-directory "$SB" -f "$SB/compose.yaml")
+  # --ansi never: compose's grey/faint progress text is invisible in many dark terminal themes.
+  reply=(compose --ansi never --project-directory "$SB" -f "$SB/compose.yaml")
   [[ -f "$SB/generated/compose.hosts.yaml" ]] && reply+=(-f "$SB/generated/compose.hosts.yaml")
   [[ -f "$SB/compose.override.yaml" ]] && reply+=(-f "$SB/compose.override.yaml")
   return 0
@@ -1547,12 +1548,12 @@ up)                                         # VM, images, bridge, proxy, the age
   local applied="$SB/generated/colima.applied.yaml"   # pibox's colima.yaml the running VM was started with
   if vm_running && ! cmp -s "$SB/generated/colima.yaml" "$applied"; then
     print "the VM settings changed since it was started (pibox setup): restarting the Colima VM $VM_PROFILE"
-    colima stop "$VM_PROFILE"
+    colima stop "$VM_PROFILE" 2>&1 | cat   # through a pipe: no colours (grey is invisible on dark themes)
   fi
   if ! vm_running; then
     print "starting the Colima VM $VM_PROFILE"
     cp "$SB/generated/colima.yaml" "$(COLIMA_FILE)"   # Colima may have rewritten it
-    colima start "$VM_PROFILE" ${VM_DISK_IMAGE:+--disk-image "$VM_DISK_IMAGE"}
+    colima start "$VM_PROFILE" ${VM_DISK_IMAGE:+--disk-image "$VM_DISK_IMAGE"} 2>&1 | cat
     cp "$SB/generated/colima.yaml" "$applied"
   fi
   colima ssh -p "$VM_PROFILE" -- sh -c 'mount | grep -E "virtiofs|9p|sshfs"' | sed 's/^/shared with the VM: /'
@@ -1613,7 +1614,7 @@ status)                                     # the VM and the containers
 
 down)                                       # stop the containers; --vm: the VM too
   vm_running && compose down
-  [[ "${1:-}" != --vm ]] || colima stop "$VM_PROFILE"
+  [[ "${1:-}" != --vm ]] || colima stop "$VM_PROFILE" 2>&1 | cat
   ;;
 
 verify)                                     # try everything the agent must not be able to do
