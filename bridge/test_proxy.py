@@ -1036,3 +1036,64 @@ def test_unsupported_model_falls_back_and_is_remembered():
 def test_model_fallbacks_are_validated():
     with pytest.raises(ValueError):
         proxy.Settings(model_fallbacks={"a": 1})
+
+
+# --------------------------------------------------------------------------- live events (pibox diag)
+
+def monitor_events(client):
+    return list(client.app.state.bridge.monitor.recent)
+
+
+def test_events_show_where_the_time_went():
+    router = FakeRouter((429, {"error": {"message": "slow down"}}, {"retry-after": "0.3"}),
+                        lambda nonce: "Hello there.", stream=True, reasoning="hmm")
+    with make_client(router, ping_interval=5) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+        events = monitor_events(client)
+    assert r.status_code == 200
+    kinds = [e["kind"] for e in events]
+    assert kinds[0] == "request" and kinds[-1] == "end"
+    for k in ("send", "headers", "rate_limited", "wait", "first_token", "reply", "done"):
+        assert k in kinds, kinds
+    assert len({e["rid"] for e in events}) == 1
+    statuses = [e["status"] for e in events if e["kind"] == "headers"]
+    assert statuses == [429, 200]
+    first = next(e for e in events if e["kind"] == "first_token")
+    assert first["token"] == "reasoning"
+    reply = next(e for e in events if e["kind"] == "reply")
+    assert reply["chars"] == len("Hello there.") and reply["reasoning_chars"] == 3
+    end = events[-1]
+    assert end["outcome"] == "ok" and end["spent"]["rate_limit"] >= 0.3
+    assert events[0]["last"] == "List the files in this directory." and events[0]["tools"] == 2
+
+
+def test_events_report_errors_and_pi_retries():
+    router = FakeRouter((403, {"error": {"message": "forbidden"}}), lambda nonce: "ok")
+    with make_client(router) as client:
+        assert client.post("/v1/chat/completions", json=tools_payload()).status_code == 403
+        assert client.post("/v1/chat/completions", json=tools_payload()).status_code == 200
+        events = monitor_events(client)
+    ends = [e for e in events if e["kind"] == "end"]
+    assert [e["outcome"] for e in ends] == ["error", "ok"]
+    requests = [e for e in events if e["kind"] == "request"]
+    assert requests[1]["repeat_of_failed"] == requests[0]["rid"] and requests[1]["idle"] >= 0
+    assert "messages_hash" not in requests[0]
+
+
+def test_event_stream_replays_history_then_ticks():
+    monitor = proxy.Monitor()
+    monitor.emit("abc", "request", model="m", messages_hash="h")
+    monitor.emit("abc", "send", model="m")
+
+    async def take(n):
+        lines, stream = [], monitor.stream(history=10)
+        async for line in stream:
+            lines.append(json.loads(line))
+            if len(lines) == n:
+                await stream.aclose()
+                return lines
+
+    lines = asyncio.run(take(3))
+    assert [l["kind"] for l in lines] == ["request", "send", "tick"]
+    assert lines[0]["replay"] and lines[2]["active"][0]["phase"] == "upstream_headers"
+    assert not monitor.subscribers

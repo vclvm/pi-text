@@ -16,6 +16,6 @@ RUN --mount=type=bind,source=.,target=/ctx --mount=type=cache,target=/root/.cach
     if [ -f /ctx/build/pip.conf ]; then export PIP_CONFIG_FILE=/ctx/build/pip.conf; fi; \
     pip install -r requirements.txt
 # The code last: changing it doesn't reinstall the dependencies.
-COPY proxy.py probe.py ./
+COPY proxy.py probe.py diag.py ./
 USER nobody
 CMD ["sh", "-c", "exec uvicorn proxy:app --host 0.0.0.0 --port \"${BRIDGE_PORT:-8789}\""]

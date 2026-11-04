@@ -441,6 +441,44 @@ reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
 In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`. The probe runs
 in the bridge container, with the router key and the same network path as the bridge.
 
+## Watching requests live: `diag.py`
+
+When an answer takes minutes, `diag.py` shows where the time goes. Run it in a second terminal
+(in the sandbox: `pibox diag`). It follows `GET /bridge/events`, which streams one JSON event per
+step of every request, and prints:
+
+```
+09:13:35 4ad715 ▶ request model=m stream messages=1 tools=7 ~5.1k tokens
+                  last input: "hi"
+09:13:35 4ad715   → sent to the router: model=m ~5.1k tokens (+0.0s)
+09:13:35 4ad715   ← router 200: headers after 0.01s
+09:15:39 4ad715   ← first reasoning token 124.00s after the headers  ← model was silent this long
+09:15:43 4ad715   ✓ model done (finish=stop): text 19, reasoning 2.1k chars in 3.9s (~540 chars/s)
+09:15:43 4ad715 ■ end ok in 128.0s: first token 124.0s · writing 3.9s
+                  8 keep-alive ping(s) sent to Pi while it waited
+                  → most of it (97%, 124.0s): the router answered, but the model sent nothing yet …
+```
+
+The time of each request is split into phases:
+
+| Phase | Meaning when it is long |
+|---|---|
+| `rate limit` | the bridge waited: request pacing (`MIN_REQUEST_INTERVAL`), the router's limit headers, or a 429 |
+| `router headers` | the router has not answered at all: its queue or overload. With `UPSTREAM_STREAM=false` this is the whole generation |
+| `first token` | the router answered, but the model has sent nothing yet: a queue at the provider, a long prompt being processed, or thinking the router hides |
+| `writing` | the model is writing; the speed and the share of reasoning characters are shown |
+| `bridge` | the bridge itself; should be near zero |
+
+A request that ends with `client disconnected` was closed by Pi (Esc, or its own timeout). The next
+request shows how long after the previous one it came. If it repeats the messages of a failed
+request, Pi is retrying, and that gap was Pi's own back-off. While no request is in flight the
+status line says `idle`: Pi is running a tool or waiting for you.
+
+Options: `--history N` (recent events shown first, default 40), `--json` (the raw events),
+`--bridge URL`. It reconnects when the bridge restarts and needs only the Python standard library.
+`/bridge/events` contains the first 120 characters of each new prompt or tool result, and the bridge
+port must stay private, as it already must for `/v1/chat/completions`.
+
 ## Tests
 
 ```bash

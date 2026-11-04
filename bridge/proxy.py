@@ -21,6 +21,7 @@ import re
 import secrets
 import sys
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -192,9 +193,19 @@ class Tracer:
     (new prompts, tool results = what the client actually executed), every upstream
     attempt (raw reply, reasoning, parse result) and what was returned."""
 
-    def __init__(self, settings: "Settings"):
+    def __init__(self, settings: "Settings", monitor: "Monitor | None" = None):
         self.target, self.max = settings.trace, settings.trace_max
         self.rid = uuid4().hex[:6]
+        self.monitor = monitor
+
+    def event(self, kind: str, **fields: Any) -> None:
+        """A live event for GET /bridge/events (pibox diag), independent of TRACE."""
+        if self.monitor is not None:
+            self.monitor.emit(self.rid, kind, **fields)
+
+    def end(self) -> None:
+        if self.monitor is not None:
+            self.monitor.end(self.rid)
 
     def __bool__(self) -> bool:
         return bool(self.target)
@@ -241,6 +252,108 @@ class Tracer:
         tools = [t["name"] for t in _allowed_tools(payload)]
         self(f"   request: model={payload.get('model')} stream={bool(payload.get('stream'))} "
              f"messages={len(messages)} tools={','.join(tools) or '-'} tool_choice={payload.get('tool_choice')}")
+
+
+# --------------------------------------------------------------------------- live events
+
+# Phase a request enters with each event; the time spent in every phase is summed up for "end".
+PHASE_AFTER = {"request": "bridge", "wait": "rate_limit", "send": "upstream_headers",
+               "first_token": "generating", "reply": "bridge", "retry": "bridge"}
+PROGRESS_EVERY = 2.0  # seconds between "progress" events while the model is writing
+
+
+class Monitor:
+    """What every client request is doing right now, as a stream of events for `pibox diag`.
+
+    Each event: {"t": epoch, "rid", "kind", "phase", "elapsed", ...}. Subscribers get the recent
+    history first and a "tick" with the requests in flight every second."""
+
+    def __init__(self, history: int = 300):
+        self.recent: deque = deque(maxlen=history)
+        self.active: dict[str, dict] = {}
+        self.subscribers: set[asyncio.Queue] = set()
+        self.last_end: dict | None = None   # time, outcome and messages hash of the last finished request
+
+    def emit(self, rid: str, kind: str, **fields: Any) -> None:
+        now = time.time()
+        state = self.active.get(rid)
+        if state is None:
+            if kind != "request":
+                return  # an event after "end" (e.g. a late close): ignore
+            state = self.active[rid] = {"start": now, "phase": "bridge", "since": now, "spent": {},
+                                        "model": fields.get("model"), "messages_hash": fields.pop("messages_hash", None)}
+            if self.last_end:
+                fields["idle"] = round(now - self.last_end["t"], 1)
+                if self.last_end["outcome"] != "ok" and self.last_end["hash"] == state["messages_hash"]:
+                    fields["repeat_of_failed"] = self.last_end["rid"]
+        phase = PHASE_AFTER.get(kind)
+        if kind == "headers":
+            ok = fields.get("status", 0) < 400
+            phase = ("first_token" if fields.get("streaming") else "bridge") if ok else "bridge"
+        if kind in ("done", "error"):
+            state["outcome"] = "ok" if kind == "done" else "error"
+        if phase and phase != state["phase"]:
+            self._switch(state, phase, now)
+        event = {"t": round(now, 3), "rid": rid, "kind": kind, "phase": state["phase"],
+                 "elapsed": round(now - state["start"], 2), **fields}
+        self._publish(event)
+
+    def _switch(self, state: dict, phase: str, now: float) -> None:
+        spent = state["spent"]
+        spent[state["phase"]] = round(spent.get(state["phase"], 0) + now - state["since"], 2)
+        state["phase"], state["since"] = phase, now
+
+    def end(self, rid: str) -> None:
+        state = self.active.pop(rid, None)
+        if state is None:
+            return
+        now = time.time()
+        self._switch(state, "ended", now)
+        outcome = state.get("outcome", "client disconnected")
+        self.last_end = {"t": now, "rid": rid, "outcome": outcome, "hash": state["messages_hash"]}
+        self._publish({"t": round(now, 3), "rid": rid, "kind": "end", "phase": "ended", "outcome": outcome,
+                       "elapsed": round(now - state["start"], 2),
+                       "spent": {k: v for k, v in state["spent"].items() if v >= 0.05}})
+
+    def snapshot(self) -> list[dict]:
+        now = time.time()
+        return [{"rid": rid, "model": s["model"], "phase": s["phase"], "phase_for": round(now - s["since"], 1),
+                 "elapsed": round(now - s["start"], 1)} for rid, s in self.active.items()]
+
+    def _publish(self, event: dict) -> None:
+        self.recent.append(event)
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:  # a stalled viewer must not slow the bridge down
+                pass
+
+    async def stream(self, history: int) -> AsyncIterator[str]:
+        """NDJSON lines: up to `history` recent events, then live events and a tick every second."""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        self.subscribers.add(queue)
+        try:
+            for event in list(self.recent)[-history:] if history > 0 else []:
+                yield json.dumps({**event, "replay": True}, ensure_ascii=False) + "\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    event = {"t": round(time.time(), 3), "kind": "tick", "active": self.snapshot()}
+                yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
+        finally:
+            self.subscribers.discard(queue)
+
+
+def _last_user_text(messages: list) -> str:
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") in ("user", "tool"):
+            return " ".join(_text(m.get("content"), placeholder=True).split())[:120]
+    return ""
+
+
+def _messages_hash(messages: list) -> str:
+    return hashlib.sha256(json.dumps(messages, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- errors
@@ -536,6 +649,8 @@ class RateLimiter:
             self.next_start = time.monotonic() + delay + self.min_interval
             if delay <= 0:
                 return waited
+            if trace is not None:
+                trace.event("wait", seconds=round(delay, 2), reason=reason)
             if delay >= 1:
                 log.info("rate limit: waiting %.1fs (%s)", delay, reason)
                 if trace:
@@ -1229,6 +1344,7 @@ class Bridge:
         self.client = client
         self.limiter = RateLimiter(settings)
         self.unsupported: dict[str, float] = {}  # model -> monotonic time until which it is skipped
+        self.monitor = Monitor()
 
     def _headers(self) -> dict:
         headers = {**self.s.extra_headers, "Content-Type": "application/json"}
@@ -1282,7 +1398,7 @@ class Bridge:
         Rate limits: waits for a free slot and, after a 429, until the reset, then sends again, for
         at most `budget` seconds in all (default RATE_LIMIT_MAX_WAIT). Raises RateLimitWait when
         that is not enough. A model the router refuses as unsupported is replaced by its fallback."""
-        trace = trace or Tracer(Settings())
+        trace = trace if trace is not None else Tracer(Settings())
         url = self.s.endpoint
         convert = to_responses_payload if self.s.api == "responses" else to_chat_payload
         budget = self.s.rate_limit_max_wait if budget is None else budget
@@ -1294,13 +1410,26 @@ class Bridge:
         while True:
             model = models[index]
             waited += await self.limiter.wait(tokens, budget - waited, trace)
-            response = await self._send(url, convert({**payload, "model": model}, self.s))
+            trace.event("send", model=model, tokens=tokens, streaming=self.s.upstream_stream)
+            sent = time.monotonic()
+            try:
+                response = await self._send(url, convert({**payload, "model": model}, self.s))
+            except BridgeError as e:
+                trace.event("upstream_error", status=e.status, message=e.message[:300],
+                            seconds=round(time.monotonic() - sent, 2))
+                raise
             status = response.status_code
             if status < 400:
-                self.limiter.observe(parse_rate_limit(response.headers), status)
+                info = parse_rate_limit(response.headers)
+                self.limiter.observe(info, status)
+                trace.event("headers", status=status, seconds=round(time.monotonic() - sent, 2),
+                            streaming=self.s.upstream_stream,
+                            limits={k: v for k, v in info.as_dict().items() if v is not None and k != "headers"})
                 return response
             raw = await response.aread()
             await response.aclose()
+            trace.event("headers", status=status, seconds=round(time.monotonic() - sent, 2),
+                        message=_upstream_error(status, raw).message[:300])
             if status == 429:
                 info = parse_rate_limit(response.headers, raw)
                 delay = self.limiter.observe(info, status)
@@ -1313,6 +1442,8 @@ class Bridge:
                 no_reset = info.retry_after is None and info.reset_requests is None and info.reset_tokens is None
                 if no_reset and _HARD_QUOTA.search(raw.decode("utf-8", "replace")):
                     raise error  # a plan/billing limit: waiting a minute won't help
+                trace.event("rate_limited", delay=round(delay, 1), attempt=limited,
+                            of=self.s.rate_limit_retries, budget_left=round(budget - waited, 1))
                 if limited > self.s.rate_limit_retries:
                     raise RateLimitWait(delay, f"still limited after {limited - 1} retries", error.message)
                 if waited + delay > budget:
@@ -1324,6 +1455,7 @@ class Bridge:
                 log.warning("model %s refused upstream (%d); falling back to %s: %.300s",
                             model, status, models[index + 1], raw.decode("utf-8", "replace"))
                 trace(f"!! model {model} refused upstream ({status}); falling back to {models[index + 1]}")
+                trace.event("fallback", model=model, to=models[index + 1], status=status)
                 index += 1
                 continue
             raise _upstream_error(status, raw)
@@ -1381,7 +1513,7 @@ class Bridge:
     async def run(self, prep: Prepared, first: httpx.Response | None = None,
                   record: dict | None = None, trace: Tracer | None = None) -> AsyncIterator[tuple[str, Any]]:
         """Yields ("text"|"reasoning", str), ("tool_calls", list), ("usage", dict), ("finish", str)."""
-        trace = trace or Tracer(Settings())
+        trace = trace if trace is not None else Tracer(Settings())
         messages = list(prep.upstream["messages"])
         streamed_text = False
         usage = None
@@ -1393,6 +1525,7 @@ class Bridge:
                 attempts.append(info)
                 if attempt:
                     trace(f"-> upstream retry {attempt}/{self.s.max_retries}", messages[-1]["content"])
+                    trace.event("retry", attempt=attempt, of=self.s.max_retries, reason=attempts[-2].get("error"))
                 started = time.monotonic()
                 response = first if attempt == 0 and first is not None else await self.open(payload, trace=trace)
                 scanner = ReplyScanner(detect_calls=bool(prep.tools), tag=prep.tag, nonce=prep.nonce)
@@ -1414,7 +1547,21 @@ class Bridge:
                             held.append(value)
 
                 chunks = info.setdefault("upstream_chunks", []) if record is not None else None
+                body_started = time.monotonic()
+                sizes = {"text": 0, "reasoning": 0}
+                first_at = next_progress = None
                 async for kind, value in self.events(response, chunks):
+                    if kind in ("content", "reasoning") and value:
+                        sizes["text" if kind == "content" else "reasoning"] += len(value)
+                        now = time.monotonic()
+                        if first_at is None:
+                            first_at, next_progress = now, now + PROGRESS_EVERY
+                            trace.event("first_token", token="text" if kind == "content" else "reasoning",
+                                        seconds=round(now - body_started, 2))
+                        elif now >= next_progress:
+                            next_progress = now + PROGRESS_EVERY
+                            trace.event("progress", chars=sizes["text"], reasoning_chars=sizes["reasoning"],
+                                        seconds=round(now - first_at, 1))
                     if kind == "content":
                         raw.append(value)
                         for event in route(scanner.feed(value)):
@@ -1458,6 +1605,10 @@ class Bridge:
                 for event in route(tail):
                     yield event
                 info.update(raw="".join(raw), finish_reason=finish)
+                now = time.monotonic()
+                trace.event("reply", finish=finish, chars=sizes["text"], reasoning_chars=sizes["reasoning"],
+                            seconds=round(now - (first_at or now), 1), usage=usage,
+                            empty=not sizes["text"] and not native)
                 if trace:
                     if thoughts:
                         trace("   model reasoning", "".join(thoughts))
@@ -1501,10 +1652,13 @@ class Bridge:
                 if stray:
                     trace("-> client: extra text", stray)
                 trace(f"-> client: finish={'tool_calls' if calls else finish or 'stop'} usage={json.dumps(usage)}")
+                trace.event("done", finish="tool_calls" if calls else (finish or "stop"),
+                            calls=[c["function"]["name"] for c in calls], attempts=attempt + 1)
                 yield "finish", "tool_calls" if calls else (finish or "stop")
                 return
         except BridgeError as e:
             trace(f"!! error {e.status}: {e.message}")
+            trace.event("error", status=e.status, message=e.message[:300])
             if record is not None:
                 record["error"] = e.to_dict()
             raise
@@ -1561,7 +1715,17 @@ def _chunk(meta: dict, delta: dict, finish_reason: str | None = None) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 
-async def sse(events: AsyncIterator, model: str, ping_interval: float) -> AsyncIterator[str]:
+async def _ending(chunks: AsyncIterator[str], trace: Tracer) -> AsyncIterator[str]:
+    """Re-yield a response stream and report its end (also when the client went away)."""
+    try:
+        async for chunk in chunks:
+            yield chunk
+    finally:
+        trace.end()
+
+
+async def sse(events: AsyncIterator, model: str, ping_interval: float,
+              trace: Tracer | None = None) -> AsyncIterator[str]:
     meta = {"id": "chatcmpl-" + uuid4().hex, "object": "chat.completion.chunk",
             "created": int(time.time()), "model": model}
     usage = None
@@ -1569,6 +1733,8 @@ async def sse(events: AsyncIterator, model: str, ping_interval: float) -> AsyncI
     try:
         async for event in with_pings(events, ping_interval):
             if event is None:
+                if trace is not None:
+                    trace.event("ping")
                 yield ": ping\n\n"
                 continue
             kind, value = event
@@ -1669,27 +1835,47 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             except (ValueError, KeyError, TypeError, AttributeError) as e:
                 raise BridgeError(400, f"Invalid request: {e}", "invalid_request_error") from e
             record = {"request": payload, "upstream": prep.upstream} if settings.debug_dump_dir else None
-            trace = Tracer(settings)
+            trace = Tracer(settings, bridge.monitor)
             trace.incoming(payload)
-            if payload.get("stream", False):
-                # Open upstream before answering so HTTP errors keep their status code. A longer
-                # rate-limit wait happens inside the stream instead, where pings keep the client
-                # connected; run() then opens the upstream request itself.
-                first = None
-                try:
-                    first = await bridge.open(prep.upstream, budget=settings.ping_interval, trace=trace)
-                except RateLimitWait as e:
-                    trace(f"~~ rate limited for ~{e.delay:.0f}s: waiting inside the stream")
-                except BridgeError as e:
-                    trace(f"!! upstream error {e.status}: {e.message}")
-                    raise
-                return StreamingResponse(sse(bridge.run(prep, first, record, trace), prep.model,
-                                             settings.ping_interval),
-                                         media_type="text/event-stream",
-                                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-            return JSONResponse(await collect(bridge.run(prep, None, record, trace), prep.model))
+            messages = payload.get("messages") or []
+            trace.event("request", model=prep.model, stream=bool(payload.get("stream")),
+                        messages=len(messages), tools=len(prep.tools), tokens=estimate_tokens(prep.upstream),
+                        last=_last_user_text(messages), messages_hash=_messages_hash(messages),
+                        client=request.headers.get("user-agent", "")[:60])
+            handed_over = False
+            try:
+                if payload.get("stream", False):
+                    # Open upstream before answering so HTTP errors keep their status code. A longer
+                    # rate-limit wait happens inside the stream instead, where pings keep the client
+                    # connected; run() then opens the upstream request itself.
+                    first = None
+                    try:
+                        first = await bridge.open(prep.upstream, budget=settings.ping_interval, trace=trace)
+                    except RateLimitWait as e:
+                        trace(f"~~ rate limited for ~{e.delay:.0f}s: waiting inside the stream")
+                        trace.event("wait_in_stream", seconds=round(e.delay, 1), reason=e.reason)
+                    except BridgeError as e:
+                        trace(f"!! upstream error {e.status}: {e.message}")
+                        trace.event("error", status=e.status, message=e.message[:300])
+                        raise
+                    handed_over = True
+                    return StreamingResponse(_ending(sse(bridge.run(prep, first, record, trace), prep.model,
+                                                         settings.ping_interval, trace), trace),
+                                             media_type="text/event-stream",
+                                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                return JSONResponse(await collect(bridge.run(prep, None, record, trace), prep.model))
+            finally:
+                if not handed_over:
+                    trace.end()
         except BridgeError as e:
             return JSONResponse(e.to_dict(), status_code=e.status, headers=e.headers)
+
+    @app.get("/bridge/events")
+    async def events(request: Request, history: int = 50):
+        """Live NDJSON events of every request (what `pibox diag` shows)."""
+        bridge: Bridge = request.app.state.bridge
+        return StreamingResponse(bridge.monitor.stream(history), media_type="application/x-ndjson",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     return app
 

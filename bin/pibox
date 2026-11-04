@@ -59,14 +59,16 @@ Check:
   verify         try everything the agent must not be able to do
   review         git hooks, risky git config, recent .obsidian changes in your folders
   probe [what]   what your router really offers, asked from the bridge: endpoints, models (a tiny
-                 request to each), rate-limit headers; 'probe limits': what the bridge knows now"
+                 request to each), rate-limit headers; 'probe limits': what the bridge knows now
+  diag           live view of every request in a second terminal: rate-limit waits, router answer,
+                 first token, writing speed, and where the time went (--history 0, --json)"
 }
 
 # ---------------------------------------------------------------- init (runs from the repository)
 # Copies the components into ~/.pi-sandbox. The agent can write to your projects, so the files that
 # hold the key and define the guard rails are copies outside its reach, never the repository itself.
 COMPONENTS=(compose.yaml Dockerfile.pi addons extensions agent/settings.json agent/APPEND_SYSTEM.md)
-BRIDGE_FILES=(Dockerfile proxy.py probe.py requirements.txt pi-trace.py)
+BRIDGE_FILES=(Dockerfile proxy.py probe.py diag.py requirements.txt pi-trace.py)
 
 cmd_init() {
   local src="${SELF:h:h}" f
@@ -1580,6 +1582,12 @@ run)                                        # Pi in a fresh container, in the cu
 probe)                                      # the router's endpoints, models and limits (bridge/probe.py)
   running
   compose_args; local -a c=($reply); dk; exec $reply $c exec -T bridge python probe.py "$@"
+  ;;
+
+diag)                                       # live view of the bridge's requests (bridge/diag.py)
+  running
+  local -a t; [[ -t 1 ]] || t=(-T)          # a terminal: live status line and colours
+  compose_args; local -a c=($reply); dk; exec $reply $c exec $t bridge python diag.py "$@"
   ;;
 
 shell)                                      # bash in the agent's container, without Pi

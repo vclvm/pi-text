@@ -1179,6 +1179,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `verify` | Try everything the agent must not be able to do (§6.7) |
 | `review` | After a session: git hooks, risky git config, recent `.obsidian` changes (§7.3) |
 | `probe [what]` | Ask your router what it really offers: endpoints (including `/openapi.json`), which models answer a tiny request, its rate-limit headers; `probe limits` shows the bridge's current rate-limit state ([bridge/README.md](../bridge/README.md#probing-the-router-probepy)) |
+| `diag` | Live view of every request in a second terminal: rate-limit waits, when the router answered, when the first token came, writing speed, and which phase took the time ([bridge/README.md](../bridge/README.md#watching-requests-live-diagpy)) |
 
 How it works:
 
@@ -1253,6 +1254,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: config.yaml changed since the last setup` | Run `pibox setup`, then `pibox up` |
 | `pibox: the sandbox isn't running` | `pibox up` |
 | `the model you requested is unsupported` for a model that should exist | `pibox probe models` lists the models that really answer; use one, or set `MODEL_FALLBACKS` in `bridge` |
+| An answer takes minutes and it is unclear why | Run `pibox diag` in a second terminal and repeat: each request ends with a split into rate limit / router headers / first token / writing |
 | Pi stops on `429` / "rate limit" | The bridge waits out 429s itself (up to `RATE_LIMIT_MAX_WAIT`, 180 s). `pibox probe limits` and the bridge log (`!! upstream 429`) show what the router answered ([bridge/README.md](../bridge/README.md#rate-limits-and-refused-models)) |
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
 | `CONNECT tunnel failed, response 403`, or every `https://` URL fails inside the sandbox | Expected for the web: only plain HTTP leaves the sandbox (§4.6). Use `http://` URLs; `web_fetch` converts them itself. Your repositories are the exception: if one is refused, it isn't in `repository` (check `EGRESS_TUNNEL` in `pibox config`) |
