@@ -175,7 +175,7 @@ def test_code_containing_closing_tag_and_fences():
 
 
 def test_retry_after_schema_mismatch():
-    router = FakeRouter(lambda n: call_block(n, "bash", {"cmd": "ls"}),
+    router = FakeRouter(lambda n: call_block(n, "bash", {"command": ["ls"]}),
                         lambda n: call_block(n, "bash", {"command": "ls"}))
     with make_client(router) as client:
         r = client.post("/v1/chat/completions", json=tools_payload())
@@ -183,8 +183,10 @@ def test_retry_after_schema_mismatch():
     assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
     assert len(router.requests) == 2
     retry_messages = router.requests[1]["json"]["messages"]
-    assert retry_messages[-2]["role"] == "assistant" and '"cmd"' in retry_messages[-2]["content"]
-    assert retry_messages[-1]["role"] == "user" and retry_messages[-1]["content"].startswith("[bridge]")
+    assert retry_messages[-2]["role"] == "assistant" and '["ls"]' in retry_messages[-2]["content"]
+    correction = retry_messages[-1]["content"]
+    assert retry_messages[-1]["role"] == "user" and correction.startswith("[bridge]")
+    assert 'bash(command: string)  e.g. {"name": "bash", "arguments": {"command": "..."}}' in correction
 
 
 def test_retry_text_not_duplicated_in_stream():
@@ -1428,3 +1430,53 @@ def test_arguments_split_between_name_and_arguments_are_joined():
     body = json.dumps({"name": "ls \npath \nsrc</arg_value>", "arguments": {"limit": 5}})
     calls, _ = proxy.parse_tool_calls(f'<pi_tool_call id="{nonce}">\n{body}\n</pi_tool_call>', LS_TOOLS, nonce)
     assert json.loads(calls[0]["function"]["arguments"]) == {"path": "src", "limit": 5}
+
+
+@pytest.mark.parametrize("body", [
+    {"tool": "bash", "args": {"command": "ls"}},
+    {"tool_name": "bash", "input": {"command": "ls"}},
+    {"type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}},
+    {"bash": {"command": "ls"}},
+    {"name": "functions.bash", "arguments": {"command": "ls"}},
+    {"name": "bash", "command": "ls"},
+    {"command": "ls"},                                   # only bash has exactly this parameter
+    {"arguments": {"command": "ls"}},
+    {"name": "bash", "arguments": {"cmd": "ls"}},        # one alias for the one missing parameter
+])
+def test_other_call_shapes_are_understood(body):
+    nonce = "0123456789abcdef"
+    raw = f'<pi_tool_call id="{nonce}">\n{json.dumps(body)}\n</pi_tool_call>'
+    calls, _ = proxy.parse_tool_calls(raw, LS_TOOLS, nonce)
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [("bash", {"command": "ls"})]
+
+
+def test_bare_arguments_that_fit_one_tool_name_it():
+    nonce = "0123456789abcdef"
+    raw = f'<pi_tool_call id="{nonce}">\n{json.dumps({"path": "src"})}\n</pi_tool_call>'
+    calls, _ = proxy.parse_tool_calls(raw, LS_TOOLS, nonce)
+    assert calls[0]["function"]["name"] == "ls"
+
+
+@pytest.mark.parametrize("body, error", [
+    ({"name": "rm", "arguments": {"path": "/"}}, "Unknown tool 'rm'"),
+    ({"name": "bash", "arguments": {"cmd": "ls", "x": 1}}, "required property"),   # two unknown keys: no guess
+    ({"limit": 3, "command": "ls"}, "Unknown tool None"),                          # fits no tool
+])
+def test_unclear_shapes_still_ask_again(body, error):
+    nonce = "0123456789abcdef"
+    raw = f'<pi_tool_call id="{nonce}">\n{json.dumps(body)}\n</pi_tool_call>'
+    with pytest.raises(proxy.ProtocolError, match=error):
+        proxy.parse_tool_calls(raw, LS_TOOLS, nonce)
+
+
+def test_correction_lists_every_tool_when_the_name_was_wrong():
+    text = proxy.correction_message("Unknown tool None. Available tools: ls, bash.", "n", "pi_tool_call", LS_TOOLS)
+    assert "ls(path?: string, limit?: integer)" in text and "bash(command: string)" in text
+
+
+def test_protocol_failure_tells_pi_to_retry():
+    router = FakeRouter(*([lambda n: call_block(n, "nope", {})] * 3))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    message = r.json()["error"]["message"]
+    assert r.status_code == 502 and "502" in message and "after 3 tries" in message

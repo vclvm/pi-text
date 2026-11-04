@@ -59,10 +59,13 @@ bridge:
   #   gemma: thinking is off unless asked for; add chat_template_kwargs: { enable_thinking: true }
   #        once `pibox probe thinking --models <gemma>` shows "more thinking" with a clean answer
   #   keep_thinking: KEEP_THINKING for this model only
+  #   keep_thinking measured with `pibox probe history` on a LiteLLM router: GLM sees its earlier
+  #        thinking only as text (the router drops reasoning_content), Qwen sees the field, Gemma
+  #        neither (sending it would only cost tokens)
   MODEL_PARAMS:
-    "glm*": { temperature: 1.0, top_p: 0.95, reasoning_effort: high }
-    "qwen*": { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 }
-    "gemma*": { temperature: 1.0, top_p: 0.95, top_k: 64 }
+    "glm*": { temperature: 1.0, top_p: 0.95, reasoning_effort: high, keep_thinking: text }
+    "qwen*": { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0, keep_thinking: field }
+    "gemma*": { temperature: 1.0, top_p: 0.95, top_k: 64, keep_thinking: off }
   # The model's own thinking of the current task (since your last message) goes back to it with
   # the history, so it doesn't redo its analysis at every step: field = as reasoning_content (how
   # thinking models expect it), text = as <think>…</think> before the reply, off = dropped.

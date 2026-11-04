@@ -1234,7 +1234,62 @@ def _skip_ws_fence(s: str, i: int) -> int:
     return _FENCE_RE.match(s, i).end()
 
 
+NAME_KEYS = ("name", "tool", "tool_name", "function", "function_name", "recipient_name")
+ARG_KEYS = ("arguments", "parameters", "args", "input", "params", "tool_input", "kwargs")
+
+
+def _fits(args: dict, tool: dict) -> bool:
+    """Do these arguments fit the tool's schema by their keys (all required, nothing unknown)?"""
+    schema = tool.get("parameters") or {}
+    props = schema.get("properties") or {}
+    return bool(args) and set(schema.get("required") or []) <= set(args) and (not props or set(args) <= set(props))
+
+
+def normalize_call(obj: Any, by_name: dict) -> Any:
+    """Other shapes models write for one call, turned into {"name", "arguments"} when unambiguous:
+    {"tool"|"tool_name"|"function": "grep", "args"|"input"|"params": {...}}, the OpenAI shape
+    {"type": "function", "function": {"name", "arguments"}}, {"grep": {...}}, "functions.grep",
+    flat {"name": "grep", "pattern": "x"}, and bare arguments that fit exactly one tool."""
+    if not isinstance(obj, dict):
+        return obj
+    if isinstance(obj.get("function"), dict) and "name" in obj["function"]:
+        return normalize_call(obj["function"], by_name)
+    name = next((obj[k] for k in NAME_KEYS if isinstance(obj.get(k), str)), None)
+    args_key = next((k for k in ARG_KEYS if k in obj), None)
+    args = obj.get(args_key) if args_key else None
+    if name is None:
+        if len(obj) == 1:
+            (key, value), = obj.items()
+            if key in by_name and isinstance(value, dict):
+                return {"name": key, "arguments": value}
+        bare = args if isinstance(args, dict) else ({k: v for k, v in obj.items() if k != "type"} if args_key is None else None)
+        if isinstance(bare, dict):
+            fits = [n for n, t in by_name.items() if _fits(bare, t)]
+            if len(fits) == 1:
+                return {"name": fits[0], "arguments": bare}
+        return obj
+    name = re.sub(r"^(?:functions?|tools?)[.:]", "", name.strip()).removesuffix("()")
+    if args_key is None:  # flat: the arguments next to the name
+        args = {k: v for k, v in obj.items() if k not in NAME_KEYS and k not in ("type", "id")}
+    return {"name": name, "arguments": args}
+
+
+def _rename_single_alias(name: str, args: dict, tool: dict) -> dict:
+    """One required parameter missing and one unknown key given ({"query": …} for grep's "pattern"):
+    the model named it differently; use it."""
+    schema = tool.get("parameters") or {}
+    props = schema.get("properties") or {}
+    missing = [r for r in schema.get("required") or [] if r not in args]
+    unknown = [k for k in args if props and k not in props]
+    if len(missing) == 1 and len(unknown) == 1 and not isinstance(args[unknown[0]], (dict, list)):
+        log.info("tool %s: argument %r taken as the required %r", name, unknown[0], missing[0])
+        args = dict(args)
+        args[missing[0]] = args.pop(unknown[0])
+    return args
+
+
 def _make_call(obj: Any, by_name: dict, schema_mismatch: str) -> dict:
+    obj = normalize_call(obj, by_name)
     if not isinstance(obj, dict):
         raise ProtocolError('A tool call body must be a JSON object {"name": ..., "arguments": {...}}.')
     name = obj.get("name")
@@ -1248,6 +1303,7 @@ def _make_call(obj: Any, by_name: dict, schema_mismatch: str) -> dict:
         raise ProtocolError(f"Unknown tool {name!r}. Available tools: {', '.join(by_name)}.")
     if not isinstance(args, dict):
         raise ProtocolError(f"`arguments` of {name!r} must be a JSON object.")
+    args = _rename_single_alias(name, args, by_name[name])
     try:
         validate(instance=args, schema=by_name[name].get("parameters") or {"type": "object"})
     except ValidationError as e:
@@ -1415,10 +1471,28 @@ THOUGHT_CUT_MESSAGE = (
     "goes into its file section by section. Keep the thinking of each step short.")
 
 
-def correction_message(error: str, nonce: str, tag: str = DEFAULT_TAG) -> str:
-    return (f"[bridge] Your previous reply could not be processed: {error}\n"
-            "Send the reply again. Tool calls must use exactly this format, with nothing after the last block:\n"
-            f'<{tag} id="{nonce}">\n{{"name": "TOOL_NAME", "arguments": {{...}}}}\n</{tag}>')
+def _placeholder(schema: dict) -> Any:
+    kind = schema.get("type")
+    return {"integer": 0, "number": 0, "boolean": False, "array": [], "object": {}}.get(kind, "...")
+
+
+def correction_message(error: str, nonce: str, tag: str = DEFAULT_TAG, tools: list[dict] | None = None) -> str:
+    """What went wrong, the exact format, and for the tool the error names (or every tool, when
+    the name was the problem) its parameters with a filled-in example."""
+    by_name = {t["name"]: t for t in tools or []}
+    named = [n for n in re.findall(r"'([\w.-]+)'", error) if n in by_name]
+    lines = [f"[bridge] Your previous reply could not be processed: {error}",
+             "Send the reply again. Each tool call is one block in exactly this format, with the tool's "
+             "name in \"name\" and its parameters inside \"arguments\", and nothing after the last block:",
+             f'<{tag} id="{nonce}">\n{{"name": "TOOL_NAME", "arguments": {{...}}}}\n</{tag}>']
+    for name in named[:1] or ([] if not by_name else list(by_name)):
+        schema = by_name[name].get("parameters") or {}
+        props = schema.get("properties") or {}
+        required = schema.get("required") or []
+        example = {k: _placeholder(props.get(k) or {}) for k in (required or list(props)[:1])}
+        params = ", ".join(f"{k}{'' if k in required else '?'}: {(v or {}).get('type', 'any')}" for k, v in props.items())
+        lines.append(f'{name}({params})  e.g. {{"name": "{name}", "arguments": {json.dumps(example, ensure_ascii=False)}}}')
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- upstream + engine
@@ -2038,11 +2112,13 @@ class Bridge:
                     if e.retryable and attempt < self.s.max_retries:
                         messages = messages + [
                             {"role": "assistant", "content": _THINK_RE.sub("", "".join(raw)).strip() or "(empty)"},
-                            {"role": "user", "content": correction_message(str(e), prep.nonce, prep.tag)},
+                            {"role": "user", "content": correction_message(str(e), prep.nonce, prep.tag, prep.tools)},
                         ]
                         continue
-                    raise BridgeError(502, f"Model reply violates the tool protocol: {e}",
-                                      "bridge_protocol_error") from e
+                    # "502" makes Pi retry the request (its own back-off), instead of stopping: the
+                    # model usually gets it right on a fresh try.
+                    raise BridgeError(502, f"upstream model error 502: its reply violates the tool protocol "
+                                           f"after {attempt + 1} tries: {e}", "bridge_protocol_error") from e
                 if held and not (calls and streamed_text):
                     yield "text", "".join(held)
                 if stray:
