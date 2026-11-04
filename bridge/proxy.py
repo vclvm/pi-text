@@ -134,7 +134,7 @@ class Settings:
     # Rate limits. The dataclass defaults are "off" (tests); from_env() turns pacing on.
     min_request_interval: float = 0.0  # seconds between the starts of two upstream requests (all clients)
     rate_limit_max_reset: float = 3600.0  # a named reset further away is a quota: the client gets the 429
-    rate_limit_backoff_max: float = 20.0  # 429s that name no reset: retry every 5, 10, 20… s, at most this
+    rate_limit_retry_max: float = 20.0  # after a 429, try again at least this often (named reset or not)
     rate_limit_low: int = 1             # remaining requests <= this: spread the rest until the reset
     model_fallbacks: dict = field(default_factory=dict)  # {"model": ["fallback", ...]} on "unsupported model"
     nonce_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
@@ -183,7 +183,7 @@ class Settings:
             trace_max=int(os.environ.get("TRACE_MAX", "4000")),
             min_request_interval=float(os.environ.get("MIN_REQUEST_INTERVAL", "1")),
             rate_limit_max_reset=float(os.environ.get("RATE_LIMIT_MAX_RESET", "3600")),
-            rate_limit_backoff_max=float(os.environ.get("RATE_LIMIT_BACKOFF_MAX", "20")),
+            rate_limit_retry_max=float(os.environ.get("RATE_LIMIT_RETRY_MAX", "20")),
             rate_limit_low=int(os.environ.get("RATE_LIMIT_LOW", "1")),
             model_fallbacks=_env_json("MODEL_FALLBACKS"),
         )
@@ -362,6 +362,21 @@ def _tail(text: str, size: int = 160) -> str:
         text = text[-size:]
         text = text[text.find(" ") + 1:] if " " in text[:30] else text
     return text
+
+
+def _call_summary(call: dict, size: int = 90) -> str:
+    """`bash: git status` — a tool call in one short line, for `pibox diag`."""
+    name = call["function"]["name"]
+    try:
+        args = json.loads(call["function"]["arguments"])
+    except ValueError:
+        args = {}
+    if isinstance(args, dict):
+        main = next((args[k] for k in ("command", "path", "file_path", "pattern", "url", "query") if k in args), None)
+        text = str(main) if main is not None else json.dumps(args, ensure_ascii=False)
+    else:
+        text = str(args)
+    return f"{name}: {_tail(text[:size * 2], size) if len(text) > size else ' '.join(text.split())}"
 
 
 def _messages_hash(messages: list) -> str:
@@ -625,7 +640,7 @@ class RateLimiter:
 
     def __init__(self, settings: Settings):
         self.min_interval = max(0.0, settings.min_request_interval)
-        self.backoff_max = max(self.BACKOFF_START, settings.rate_limit_backoff_max)
+        self.retry_max = max(0.1, settings.rate_limit_retry_max)
         self.low = settings.rate_limit_low
         self.next_start = 0.0          # monotonic time of the next free slot
         self.blocked_until = 0.0       # monotonic; set by 429s and exhausted request windows
@@ -696,8 +711,10 @@ class RateLimiter:
             elif info.reset_requests and 0 < info.reset_requests <= MAX_PLAUSIBLE_WAIT:
                 delay = info.reset_requests + 0.5
             else:  # nothing said: back off, doubling
-                delay = min(self.BACKOFF_START * 2 ** min(self.consecutive_429 - 1, 20), self.backoff_max)
-            self._block(now + delay, "upstream returned 429")
+                delay = self.BACKOFF_START * 2 ** min(self.consecutive_429 - 1, 20)
+            # The next try comes after at most `retry_max`: a "reset" is often just "now + window" of
+            # a sliding window, which frees up earlier. The full delay is returned (to spot quotas).
+            self._block(now + min(delay, self.retry_max), "upstream returned 429")
             return delay
         if status < 400:
             self.consecutive_429 = 0
@@ -854,6 +871,20 @@ def _allowed_tools(payload: dict) -> list[dict]:
     return tools
 
 
+def _example(tools: list[dict], nonce: str, tag: str) -> list[str]:
+    """A filled-in call of a real tool: models copy concrete examples far more reliably."""
+    tool = next((t for t in tools if t["name"] == "bash"), tools[0] if tools else None)
+    if tool is None:
+        return []
+    props = (tool.get("parameters") or {}).get("properties") or {}
+    key = next(iter((tool.get("parameters") or {}).get("required") or props), None)
+    if key is None or (props.get(key) or {}).get("type") not in (None, "string"):
+        return []
+    value = "ls -la" if tool["name"] == "bash" else "..."
+    call = json.dumps({"name": tool["name"], "arguments": {key: value}}, ensure_ascii=False)
+    return ["For example:", f'<{tag} id="{nonce}">', call, f"</{tag}>"]
+
+
 def build_instruction(tools: list[dict], nonce: str, choice: Any, tag: str = DEFAULT_TAG) -> str:
     if isinstance(choice, dict):
         obligation = f"In this reply you MUST call the tool `{tools[0]['name']}`."
@@ -868,6 +899,7 @@ def build_instruction(tools: list[dict], nonce: str, choice: Any, tag: str = DEF
         f'<{tag} id="{nonce}">',
         '{"name": "TOOL_NAME", "arguments": {"param": "value"}}',
         f"</{tag}>",
+        *_example(tools, nonce, tag),
         "Rules:",
         f'- The id attribute must be exactly "{nonce}".',
         "- The body is one JSON object with \"name\" and \"arguments\"; arguments must match the tool's JSON Schema."
@@ -997,7 +1029,8 @@ def classify_open(s: str, i: int, tags: tuple[str, ...], nonce: str | None,
                 k += 1
         if k >= len(s) or "```".startswith(s[k:]):
             return "partial", tag
-        return ("match" if s[k] == "{" else "no"), tag
+        own = bool(match) and nonce is not None and match.group(1) == nonce  # surely meant as a call
+        return ("match" if s[k] == "{" or own else "no"), tag
     return "no", None
 
 
@@ -1120,6 +1153,61 @@ def _make_call(obj: Any, by_name: dict, schema_mismatch: str) -> dict:
             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
 
 
+_ARG_PAIR = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
+_ARG_TAGS = re.compile(r"</?arg_(?:key|value)>")
+_KV_LINE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:=]\s*(.*?)\s*$")
+
+
+def _typed(value: str, schema: dict) -> Any:
+    """A loosely written argument value: kept as text for string parameters, else JSON if it parses."""
+    if schema.get("type") != "string":
+        try:
+            return json.loads(value)
+        except ValueError:
+            pass
+    v = value.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        try:
+            return json.loads(v) if v[0] == '"' else v[1:-1]
+        except ValueError:
+            return v[1:-1]
+    return v
+
+
+def lenient_call(body: str, by_name: dict) -> dict | None:
+    """A tool call written in another model-native style instead of the JSON body, accepted when it is
+    unambiguous: the tool name first, then a JSON object, GLM-style <arg_key>/<arg_value> pairs, or
+    one `key: value` / `key=value` line per parameter, every key a parameter of that tool."""
+    m = re.match(r"\s*([A-Za-z_][\w.-]*)", body)
+    if not m or m.group(1) not in by_name:
+        return None
+    name, rest = m.group(1), re.sub(r"</?[\w-]*tool_call[^>]*>", "", body[m.end():]).strip()
+    props = (by_name[name].get("parameters") or {}).get("properties") or {}
+    if rest.startswith("{"):
+        try:
+            obj, end = json.JSONDecoder().raw_decode(rest)
+            if isinstance(obj, dict) and not rest[end:].strip():
+                return {"name": name, "arguments": obj}
+        except ValueError:
+            return None
+    pairs = _ARG_PAIR.findall(rest)
+    if pairs and not _ARG_PAIR.sub("", rest).strip():
+        args = {k: v.strip("\n") if (props.get(k) or {}).get("type") == "string" else _typed(v, props.get(k) or {})
+                for k, v in pairs}
+    else:
+        args = {}
+        for line in _ARG_TAGS.sub("", rest).splitlines():
+            if not line.strip():
+                continue
+            kv = _KV_LINE.match(line)
+            if not kv or kv.group(1) in args:
+                return None
+            args[kv.group(1)] = _typed(kv.group(2), props.get(kv.group(1)) or {})
+    if not args or not set(args) <= set(props):
+        return None
+    return {"name": name, "arguments": args}
+
+
 def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: bool = True,
                      truncated: bool = False, schema_mismatch: str = "retry",
                      tag: str = DEFAULT_TAG, prefix: str = "") -> tuple[list[dict], str]:
@@ -1161,8 +1249,10 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
                     raise ProtocolError("The reply was cut off (max tokens) inside a tool call.",
                                         retryable=False) from e
                 raise ProtocolError(f"Tool call body is not valid JSON ({e.msg}) and {close_tag} is missing.") from e
-            obj = None
-            if json_repair is not None:  # only for complete blocks: never "repair" truncated output
+            obj = lenient_call(raw[i:close].rstrip().removesuffix("```"), by_name)
+            if obj is not None:
+                log.info("accepted a tool call written without the JSON body: %s", obj["name"])
+            elif json_repair is not None:  # only for complete blocks: never "repair" truncated output
                 body = raw[i:close].rstrip().removesuffix("```")
                 try:
                     obj = json_repair.loads(body)
@@ -1174,6 +1264,9 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
             end = close
         j = _skip_ws_fence(raw, end)
         pos = scan = j + len(close_tag) if raw.startswith(close_tag, j) else j
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str) and obj["name"] not in by_name \
+                and not obj.get("arguments"):  # {"name": "ls\n path: ..."}: the arguments ended up in the name
+            obj = lenient_call(obj["name"], by_name) or obj
         calls.append(_make_call(obj, by_name, schema_mismatch))
     text = "".join(stray)
     fake = _FAKE_RESULT_RE.search(text)
@@ -1182,6 +1275,14 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
         text = text[:fake.start()]
     text = "\n".join(line for line in text.splitlines() if not line.strip().startswith("```")).strip()
     return calls, text
+
+
+THOUGHT_CARRY = 6000  # characters of cut-off thinking given back to the model when asking again
+THOUGHT_CUT_MESSAGE = (
+    "[bridge] Your previous reply spent the whole output limit on thinking and was cut off before any answer "
+    "or tool call, so nothing of it was used. Do not plan everything again. Think briefly, then act now in a "
+    "small step: for a long result, create its file with the headings and fill it in section by section; "
+    "otherwise call the next tool or answer.")
 
 
 def correction_message(error: str, nonce: str, tag: str = DEFAULT_TAG) -> str:
@@ -1410,8 +1511,8 @@ class Bridge:
 
         Rate limits: waits for a free slot and, after a 429, until the reset, then sends again.
         This goes on until the request passes or the client goes away (pings keep it connected,
-        Esc in Pi cancels): a named reset is waited for, without one the bridge retries every
-        5, 10, 20… s up to RATE_LIMIT_BACKOFF_MAX. Only a reset more than RATE_LIMIT_MAX_RESET away
+        Esc in Pi cancels): the bridge tries again at the named reset, or after 5, 10… s without
+        one, but at least every RATE_LIMIT_RETRY_MAX seconds. Only a reset more than RATE_LIMIT_MAX_RESET away
         (a quota, not a throttle) or a billing/quota error goes to the client. With `budget` (before
         a stream has started) any longer wait raises RateLimitWait at once, so it happens inside it.
         A model the router refuses as unsupported is replaced by its fallback."""
@@ -1449,20 +1550,22 @@ class Bridge:
                         message=_upstream_error(status, raw).message[:300])
             if status == 429:
                 info = parse_rate_limit(response.headers, raw)
-                delay = self.limiter.observe(info, status)
+                reset = self.limiter.observe(info, status)
+                delay = min(reset, self.limiter.retry_max)
                 error = _upstream_error(status, raw)
                 limited += 1
-                log.warning("upstream 429 (#%d), next try in %.1fs: %s | %s", limited,
-                            delay, error.message, info.as_dict())
-                trace(f"!! upstream 429 (#{limited}), next try in {delay:.1f}s: "
+                log.warning("upstream 429 (#%d), next try in %.1fs (reset in %.1fs): %s | %s", limited,
+                            delay, reset, error.message, info.as_dict())
+                trace(f"!! upstream 429 (#{limited}), next try in {delay:.1f}s (reset in {reset:.1f}s): "
                       f"{error.message}", info.as_dict())
                 no_reset = info.retry_after is None and info.reset_requests is None and info.reset_tokens is None
                 if no_reset and _HARD_QUOTA.search(raw.decode("utf-8", "replace")):
                     raise error  # a plan/billing limit: waiting a minute won't help
                 trace.event("rate_limited", delay=round(delay, 1), attempt=limited,
-                            reset="named by the router" if not no_reset else "unknown, backing off")
-                if not no_reset and delay > self.s.rate_limit_max_reset:
-                    raise RateLimitWait(delay, f"the limit resets only in {delay / 60:.0f} min", error.message)
+                            reset=f"named by the router: in {reset:.0f}s" if not no_reset else "not named",
+                            message=error.message[:500])
+                if not no_reset and reset > self.s.rate_limit_max_reset:
+                    raise RateLimitWait(reset, f"the limit resets only in {reset / 60:.0f} min", error.message)
                 if waited + delay > limit:
                     raise RateLimitWait(delay, "upstream returned 429", error.message)
                 continue
@@ -1669,6 +1772,21 @@ class Bridge:
                         trace("   model reasoning", "".join(thoughts))
                     trace(f"   model reply (attempt {attempt + 1}, finish={finish}, "
                           f"{time.monotonic() - started:.1f}s)", "".join(raw) or "(empty)")
+                if finish == "length" and thoughts and not native and not _THINK_RE.sub("", "".join(raw)).strip() \
+                        and attempt < self.s.max_retries:
+                    # All of max_tokens went into thinking: Pi would stop with "truncated". Ask again,
+                    # with the end of that thinking (it is not sent back otherwise) and a push to act.
+                    thought = "".join(thoughts)
+                    info["error"] = (f"the whole reply ({len(thought)} chars) was thinking, cut off at max_tokens "
+                                     "before any answer")
+                    log.warning("attempt %d: %s; asking again", attempt + 1, info["error"])
+                    trace(f"!! {info['error']}; asking again")
+                    messages = messages + [
+                        {"role": "assistant", "content": "(My thinking was cut off by the output limit. Its end:)\n…"
+                                                         + thought[-THOUGHT_CARRY:]},
+                        {"role": "user", "content": THOUGHT_CUT_MESSAGE},
+                    ]
+                    continue
                 try:
                     if calls_raw is None:
                         if prep.must_call:
@@ -1708,7 +1826,8 @@ class Bridge:
                     trace("-> client: extra text", stray)
                 trace(f"-> client: finish={'tool_calls' if calls else finish or 'stop'} usage={json.dumps(usage)}")
                 trace.event("done", finish="tool_calls" if calls else (finish or "stop"),
-                            calls=[c["function"]["name"] for c in calls], attempts=attempt + 1)
+                            calls=[c["function"]["name"] for c in calls], attempts=attempt + 1,
+                            call_args=[_call_summary(c) for c in calls])
                 yield "finish", "tool_calls" if calls else (finish or "stop")
                 return
         except BridgeError as e:
@@ -1872,7 +1991,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         now = time.monotonic()
         return {**bridge.limiter.status(),
                 "max_reset_seconds": settings.rate_limit_max_reset,
-                "max_backoff_seconds": settings.rate_limit_backoff_max,
+                "retry_max_seconds": settings.rate_limit_retry_max,
                 "refused_models": {m: round(t - now) for m, t in bridge.unsupported.items() if t > now},
                 "model_fallbacks": settings.model_fallbacks}
 

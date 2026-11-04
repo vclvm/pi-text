@@ -20,8 +20,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import re
 import sys
+import threading
 import time
+import unicodedata
 import urllib.request
 
 PHASES = {  # phase -> (label in the summary, what it means when it dominates)
@@ -45,6 +49,31 @@ COLORS = {"request": "1;36", "end_ok": "1;32", "end_bad": "1;31", "warn": "33", 
 TAIL_EVERY = 20  # seconds between "what the model is writing now" lines in the log
 
 
+def cells(text: str) -> int:
+    """Terminal columns `text` takes: wide (CJK, most emoji) characters take two."""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 0 if unicodedata.combining(ch) else 1
+               for ch in text)
+
+
+def fit(text: str, width: int) -> str:
+    """Cut `text` to at most `width` terminal columns (a wrapped status line can't be redrawn)."""
+    if cells(text) <= width:
+        return text
+    out, used = [], 0
+    for ch in text:
+        w = cells(ch)
+        if used + w > width - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds}s" if seconds < 120 else f"{seconds // 60}m{seconds % 60:02d}s"
+
+
 def kchars(n) -> str:
     n = n or 0
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
@@ -59,6 +88,10 @@ class View:
         self.last_note: dict[str, float] = {}
         self.max_tokens: dict[str, int] = {}
         self.last_tail: dict[str, float] = {}
+        self.sent_tokens: dict[str, int] = {}
+        self.active: dict[str, dict] = {}    # rid -> model, start, phase, since (epoch seconds)
+        self.outcome: dict[str, dict] = {}   # rid -> what the request ended with (done/error)
+        self.last: dict | None = None        # the last finished request
 
     def c(self, kind: str, text: str) -> str:
         return f"\033[{COLORS[kind]}m{text}\033[0m" if self.color and COLORS[kind] else text
@@ -85,38 +118,86 @@ class View:
                 width = os.get_terminal_size().columns - 1
             except OSError:
                 width = 200
-            sys.stdout.write(self.c("dim", self.status[:max(20, width)]))
+            sys.stdout.write(self.c("dim", fit(self.status, max(20, width))))
             sys.stdout.flush()
 
+    def track(self, e: dict) -> None:
+        """Keep the state of every request from its events, so the status line runs on its own clock."""
+        rid, k, t = e.get("rid"), e.get("kind"), e.get("t", time.time())
+        if not rid:
+            return
+        if k == "request":
+            self.active[rid] = {"model": e.get("model"), "start": t, "phase": e.get("phase", "bridge"), "since": t}
+        elif k == "end":
+            self.active.pop(rid, None)
+            self.last = {"t": t, "rid": rid, "outcome": e.get("outcome"), **self.outcome.pop(rid, {})}
+        elif rid in self.active and e.get("phase") and e["phase"] != self.active[rid]["phase"]:
+            self.active[rid].update(phase=e["phase"], since=t)
+        if k == "done":
+            self.outcome[rid] = {"finish": e.get("finish"), "calls": e.get("call_args") or e.get("calls") or []}
+        elif k == "error":
+            self.outcome[rid] = {"error": e.get("message", "")}
+
     def tick(self, event: dict) -> None:
-        active = event.get("active") or []
+        """The bridge's own view, once a second: corrects ours (e.g. when diag started mid-request)."""
+        t = event.get("t", time.time())
+        seen = set()
+        for a in event.get("active") or []:
+            seen.add(a["rid"])
+            mine = self.active.setdefault(a["rid"], {"model": a.get("model"), "start": t - a["elapsed"]})
+            if mine.get("phase") != a["phase"]:
+                mine.update(phase=a["phase"], since=t - a["phase_for"])
+        for rid in [r for r in self.active if r not in seen and t - self.active[r]["start"] > 3]:
+            del self.active[rid]  # it ended while we were not connected
+
+    def render(self) -> None:
+        now = time.time()
         parts = []
-        for a in active:
+        for rid, a in self.active.items():
+            phase, phase_for = a.get("phase", "bridge"), now - a.get("since", now)
             more = ""
-            w = self.writing.get(a["rid"])
-            if a["phase"] == "generating" and w:
+            w = self.writing.get(rid)
+            if phase == "generating" and w:
                 more = f", text {kchars(w.get('chars'))} + reasoning {kchars(w.get('reasoning_chars'))} chars"
                 if w.get("tail"):
-                    more += f" | {'thinks' if w.get('now_writing') == 'reasoning' else 'writes'}: …{w['tail'][-70:]}"
-            parts.append(f"⏳ {a['rid']} {WAITING.get(a['phase'], a['phase'])} {a['phase_for']:.0f}s{more} "
-                         f"(total {a['elapsed']:.0f}s, {a.get('model')})")
+                    more += f" | {'thinks' if w.get('now_writing') == 'reasoning' else 'writes'}: …{w['tail'][-90:]}"
+            parts.append(f"⏳ {rid} {WAITING.get(phase, phase)} {ago(phase_for)} "
+                         f"(total {ago(now - a['start'])}, {a.get('model')}){more}")
             # Without a status line, remind every 15 s of a long wait.
-            if not self.tty and a["phase_for"] >= 15:
-                last = self.last_note.get(a["rid"], 0)
-                if event["t"] - last >= 15:
-                    self.last_note[a["rid"]] = event["t"]
-                    self.line({**event, "rid": a["rid"]}, "dim",
-                              f"… still {WAITING.get(a['phase'], a['phase'])}: {a['phase_for']:.0f}s")
-        self.clear_status()
-        self.status = "  ".join(parts) if parts else "idle: no request in flight (Pi is running a tool, " \
-                                                      "waiting for you, or backing off before a retry)"
-        self.draw_status()
+            if not self.tty and phase_for >= 15 and now - self.last_note.get(rid, 0) >= 15:
+                self.last_note[rid] = now
+                self.line({"t": now, "rid": rid}, "dim", f"… still {WAITING.get(phase, phase)}: {ago(phase_for)}")
+        status = "  ".join(parts) if parts else self.idle(now)
+        if status != self.status or self.tty:
+            self.clear_status()
+            self.status = status
+            self.draw_status()
+
+    def idle(self, now: float) -> str:
+        """No model request in flight: say what Pi is most likely doing."""
+        last = self.last
+        if last is None:
+            return "idle: no request to the model yet"
+        since = ago(now - last["t"])
+        if last.get("error"):
+            return (f"✗ the last request failed {since} ago ({last['error'][:80]}): Pi retries after its "
+                    f"back-off, or has stopped")
+        if last.get("outcome") == "client disconnected":
+            return f"■ Pi aborted the last request {since} ago (Esc, or its own timeout)"
+        if last.get("finish") == "tool_calls":
+            calls = last.get("calls") or ["a tool"]
+            more = f" (+{len(calls) - 1} more)" if len(calls) > 1 else ""
+            return f"⚙ Pi is running {calls[0]}{more} — for {since}; the model is asked again when it is done"
+        if last.get("finish") == "length":
+            return f"⚠ the last reply was cut off at max_tokens {since} ago: Pi has probably stopped"
+        return f"✓ the model answered {since} ago: Pi is waiting for you"
 
     def show(self, e: dict) -> None:
         k = e.get("kind")
         rid = e.get("rid", "")
         if k == "tick":
             return self.tick(e)
+        self.track(e)
         replay = " (earlier)" if e.get("replay") else ""
         if k == "request":
             self.pings[rid] = 0
@@ -143,6 +224,7 @@ class View:
             self.line(e, "warn", f"  ⏸ rate limited for ~{e['seconds']:.0f}s ({e.get('reason')}): the bridge "
                                  f"already answered Pi and keeps it connected with pings while it waits")
         elif k == "send":
+            self.sent_tokens[rid] = e.get("tokens") or 0
             self.line(e, "info", f"  → sent to the router: model={e.get('model')} ~{kchars(e.get('tokens'))} tokens "
                                  f"(+{e['elapsed']:.1f}s)")
         elif k == "headers":
@@ -157,8 +239,19 @@ class View:
             else:
                 self.line(e, "err", f"  ← router {status} after {e['seconds']:.2f}s: {e.get('message', '')}")
         elif k == "rate_limited":
-            self.line(e, "warn", f"  ⚠ 429 #{e.get('attempt')}: next try in {e.get('delay')}s "
-                                 f"(reset {e.get('reset', '?')})")
+            text = f"  ⚠ 429 #{e.get('attempt')}: next try in {e.get('delay')}s (reset {e.get('reset', '?')})"
+            left = re.search(r"remaining\W{0,3}(\d+)", e.get("message") or "", re.I)
+            if left and re.search(r"tokens", e.get("message") or "", re.I):
+                prompt, out = self.sent_tokens.get(rid, 0), self.max_tokens.get(rid, 0)
+                remaining = int(left.group(1))
+                if prompt and remaining >= prompt and out and remaining < prompt + out:
+                    text += (f"\n    the router says {kchars(remaining)} tokens remain: more than this prompt "
+                             f"(~{kchars(prompt)}), less than prompt + max_tokens (~{kchars(prompt + out)}). It "
+                             f"probably reserves max_tokens: a smaller maxTokens in config.yaml would have passed")
+                elif prompt and remaining < prompt:
+                    text += (f"\n    the router says {kchars(remaining)} tokens remain, less than this prompt "
+                             f"(~{kchars(prompt)}): the key's limit is used up")
+            self.line(e, "warn", text)
         elif k == "fallback":
             self.line(e, "warn", f"  ⚠ model {e.get('model')} refused ({e.get('status')}), trying {e.get('to')}")
         elif k == "upstream_error":
@@ -212,8 +305,11 @@ class View:
         elif k == "ping":
             self.pings[rid] = self.pings.get(rid, 0) + 1
         elif k == "done":
-            calls = ", ".join(e.get("calls") or []) or "none"
-            self.line(e, "info", f"  → to Pi: finish={e.get('finish')} tool calls: {calls}")
+            calls = e.get("call_args") or e.get("calls") or []
+            text = f"  → to Pi: finish={e.get('finish')} tool calls: {len(calls) or 'none'}"
+            for call in calls:
+                text += f"\n    {call}"
+            self.line(e, "info", text)
         elif k == "error":
             self.line(e, "err", f"  ✗ error {e.get('status')} to Pi: {e.get('message')}")
         elif k == "end":
@@ -240,17 +336,20 @@ class View:
         self.writing.pop(rid, None)
         self.max_tokens.pop(rid, None)
         self.last_tail.pop(rid, None)
+        self.sent_tokens.pop(rid, None)
         self.line(e, "end_ok" if ok else "end_bad", text)
 
 
-def follow(url: str, history: int, raw: bool, view: View) -> None:
+def read_events(url: str, history: int, raw: bool, events: queue.Queue) -> None:
+    """In a thread: the bridge's NDJSON events into `events` (reconnecting), so the main thread can
+    redraw the status line every second whether events come or not."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never via HTTP(S)_PROXY
     first = True
     while True:
         try:
             with opener.open(f"{url}/bridge/events?history={history if first else 0}", timeout=30) as response:
                 if not first:
-                    view.line({}, "dim", "reconnected to the bridge")
+                    events.put(("note", "reconnected to the bridge"))
                 first = False
                 for line in response:
                     if not line.strip():
@@ -259,17 +358,35 @@ def follow(url: str, history: int, raw: bool, view: View) -> None:
                         print(line.decode().rstrip(), flush=True)
                         continue
                     try:
-                        view.show(json.loads(line))
+                        events.put(("event", json.loads(line)))
                     except ValueError:
                         continue
-        except KeyboardInterrupt:
-            raise
         except Exception as e:  # noqa: BLE001  (bridge restarting, old bridge without /bridge/events, …)
             if getattr(e, "code", None) == 404:
-                sys.exit("this bridge has no /bridge/events: update it (pibox init && pibox setup && pibox up)")
-            view.status = ""
-            view.line({}, "err", f"bridge not reachable at {url} ({e}); retrying in 3s")
+                events.put(("fatal", "this bridge has no /bridge/events: update it (pibox init && pibox setup && pibox up)"))
+                return
+            events.put(("error", f"bridge not reachable at {url} ({e}); retrying in 3s"))
             time.sleep(3)
+
+
+def follow(url: str, history: int, raw: bool, view: View) -> None:
+    events: queue.Queue = queue.Queue()
+    threading.Thread(target=read_events, args=(url, history, raw, events), daemon=True).start()
+    while True:
+        try:
+            kind, item = events.get(timeout=1.0)
+        except queue.Empty:
+            if not raw:
+                view.render()
+            continue
+        if kind == "fatal":
+            sys.exit(item)
+        if kind in ("note", "error"):
+            view.line({}, "dim" if kind == "note" else "err", item)
+            continue
+        view.show(item)
+        if not item.get("replay") and item.get("kind") != "tick":
+            view.render()
 
 
 def main() -> int:

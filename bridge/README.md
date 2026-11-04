@@ -369,7 +369,7 @@ The trace and dumps contain your prompts, code and command output: keep them loc
 | `LOG_LEVEL` | `INFO` | Invalid model replies are logged at `WARNING` with the raw text |
 | `MIN_REQUEST_INTERVAL` | `1` | Seconds between the starts of two upstream requests (all clients, corrective retries included); `0` = off |
 | `RATE_LIMIT_MAX_RESET` | `3600` | A 429 whose named reset is further away than this many seconds is a quota: the client gets it at once. Nearer resets are always waited out |
-| `RATE_LIMIT_BACKOFF_MAX` | `20` | 429s that name no reset are retried every 5, 10, 20… s, at most this many seconds apart, until they pass |
+| `RATE_LIMIT_RETRY_MAX` | `20` | After a 429 the bridge tries again at the named reset or after 5, 10, 20… s, but at least this often, until the request passes. Many routers name "now + window" of a sliding window as the reset, which frees up earlier |
 | `RATE_LIMIT_LOW` | `1` | When the router reports this many remaining requests or fewer, the rest are spread evenly until the reset |
 | `MODEL_FALLBACKS` | empty | JSON `{"model": ["fallback", …], "*": […]}`: models to use when the router refuses one as unsupported/unauthorized |
 
@@ -388,11 +388,10 @@ bridge handles it instead:
   than a request needs (estimated at characters / 4), that request waits for the token reset.
 - **After a 429.** The wait comes from the headers or from the error body: `retry_after`- or
   `reset_at`-style fields, "try again in 1m30s", an ISO timestamp. Without any of these the bridge
-  backs off 5, 10, 20… s, up to `RATE_LIMIT_BACKOFF_MAX` (20 s). Then the same request is sent again. A reset the router
+  backs off 5, 10, 20… s. Never more than `RATE_LIMIT_RETRY_MAX` (20 s) passes between tries. Then the same request is sent again. A reset the router
   names is waited out as often as it comes: there is nothing better to do, Pi stays connected,
   and Esc in Pi cancels the wait. Only a reset more than `RATE_LIMIT_MAX_RESET` away (a quota)
-  goes to Pi at once. Without a named reset, the bridge retries every 5, 10, 20… s, at most
-  `RATE_LIMIT_BACKOFF_MAX` apart, also until the request passes. One 429 pauses every request, not only the one that got it.
+  goes to Pi at once. Without a named reset, it retries the same way until the request passes. One 429 pauses every request, not only the one that got it.
 - **Pi stays connected.** A wait of up to `PING_INTERVAL` seconds happens before the response
   starts. A longer wait happens inside the SSE stream, where `: ping` comments keep Pi's connection
   alive.
@@ -427,6 +426,7 @@ reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
 .venv/bin/python probe.py endpoints -v    # which endpoints answer, with the start of each answer
 .venv/bin/python probe.py models --stream --include some-model-missing-from-the-list --yaml
 .venv/bin/python probe.py limits          # GET /bridge/limits of a running bridge (--bridge URL)
+.venv/bin/python probe.py thinking --models glm-latest   # which field limits its thinking
 ```
 
 - `endpoints` tries the usual discovery and management routes. Relative to the API base:
@@ -441,7 +441,17 @@ reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
 - Requests are `--interval` seconds apart (default `MIN_REQUEST_INTERVAL` or 1.5), and a 429 is
   waited out once. Each model test costs a few tokens.
 
-In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`. The probe runs
+`thinking` sends one small question with each known way of limiting a model's thinking
+(`reasoning_effort`, `thinking: {type: disabled}`, `chat_template_kwargs.enable_thinking`,
+`enable_thinking`) and shows how many thinking tokens each answer used. If `reasoning_effort`
+works, give the model `reasoning: true` and `compat: { supportsReasoningEffort: true }` in
+`config.yaml`: Pi's thinking level (Shift+Tab) then reaches the model.
+
+When a reply is nothing but thinking cut off at `max_tokens`, the bridge asks again (counted
+in `MAX_RETRIES`), handing back the last 6000 characters of that thinking and telling the model
+to act in small steps. Pi would otherwise stop with "response was truncated".
+
+In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`, `pibox probe thinking --models ID`. The probe runs
 in the bridge container, with the router key and the same network path as the bridge.
 
 ## Watching requests live: `diag.py`
@@ -475,7 +485,9 @@ The time of each request is split into phases:
 A request that ends with `client disconnected` was closed by Pi (Esc, or its own timeout). The next
 request shows how long after the previous one it came. If it repeats the messages of a failed
 request, Pi is retrying, and that gap was Pi's own back-off. While no request is in flight the
-status line says `idle`: Pi is running a tool or waiting for you.
+status line says what Pi most likely does: `⚙ Pi is running bash: mvn test — for 42s` (the tool calls
+of the last reply), `✓ the model answered 3m ago: Pi is waiting for you`, or that the last request
+failed or was cut off. It is redrawn every second.
 
 Options: `--history N` (recent events shown first, default 40), `--json` (the raw events),
 `--bridge URL`. It reconnects when the bridge restarts and needs only the Python standard library.

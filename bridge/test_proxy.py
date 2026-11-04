@@ -984,11 +984,20 @@ def test_429_gives_up_with_retry_after_and_a_retryable_message():
 def test_429_without_a_named_reset_is_retried_until_it_passes(monkeypatch):
     monkeypatch.setattr(proxy.RateLimiter, "BACKOFF_START", 0.01)
     router = FakeRouter(*[(429, {"error": {"message": "slow down"}})] * 8, lambda nonce: "Done.")
-    with make_client(router, rate_limit_backoff_max=0.02) as client:
+    with make_client(router, rate_limit_retry_max=0.02) as client:
         r = client.post("/v1/chat/completions", json=tools_payload())
     assert r.status_code == 200 and len(router.requests) == 9
     gaps = [b["t"] - a["t"] for a, b in zip(router.requests, router.requests[1:])]
-    assert max(gaps) < 0.5  # capped at RATE_LIMIT_BACKOFF_MAX
+    assert max(gaps) < 0.5  # capped at RATE_LIMIT_RETRY_MAX
+
+
+def test_a_far_named_reset_is_still_tried_every_retry_max_seconds():
+    limited = (429, {"error": {"message": "Limit resets at: soon"}}, {"retry-after": "60"})
+    router = FakeRouter(limited, limited, lambda nonce: "Done.")
+    with make_client(router, rate_limit_retry_max=0.05) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 200 and len(router.requests) == 3
+    assert router.requests[-1]["t"] - router.requests[0]["t"] < 2
 
 
 def test_named_resets_are_waited_out_however_often_they_come():
@@ -1161,8 +1170,52 @@ def test_stream_cut_after_text_is_an_error_not_a_normal_end():
 
 
 def test_reply_cut_by_max_tokens_is_not_resent():
-    router = RawStreamRouter(sse_body({"reasoning_content": "long thoughts"}, finish="length"))
+    router = RawStreamRouter(sse_body({"content": "A long answer that was"}, finish="length"))
     with make_client(router) as client:
         r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
     assert len(router.requests) == 1
     assert [c["choices"][0]["finish_reason"] for c in sse_events(r) if c["choices"]][-1] == "length"
+
+
+# --------------------------------------------------------------------------- lenient tool-call bodies
+
+LS_TOOLS = [{"name": "ls", "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"}, "limit": {"type": "integer"}}}},
+            {"name": "bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                                             "required": ["command"]}}]
+
+
+@pytest.mark.parametrize("body, expected", [
+    ('ls\n    path: "."</arg_value>\n', ("ls", {"path": "."})),
+    ("ls\n<arg_key>path</arg_key>\n<arg_value>src</arg_value>\n<arg_key>limit</arg_key><arg_value>5</arg_value>",
+     ("ls", {"path": "src", "limit": 5})),
+    ('bash {"command": "ls -la"}', ("bash", {"command": "ls -la"})),
+    ("bash\ncommand=git status", ("bash", {"command": "git status"})),
+])
+def test_tool_calls_in_other_styles_are_accepted(body, expected):
+    nonce = "0123456789abcdef"
+    calls, _ = proxy.parse_tool_calls(f'<pi_tool_call id="{nonce}">\n{body}\n</pi_tool_call>', LS_TOOLS, nonce)
+    assert [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls] == [expected]
+
+
+@pytest.mark.parametrize("body", [
+    'bash commandcommand="ls -la /tmp" \n\nWait, the parameter is "command".',
+    "bash\tcwd命令</arg_value>ls a/ && ls b/</arg_value>",
+    "rm\npath: /",
+    "ls\npath: a\nwhatever this is",
+])
+def test_ambiguous_bodies_are_still_rejected(body):
+    nonce = "0123456789abcdef"
+    with pytest.raises(proxy.ProtocolError):
+        proxy.parse_tool_calls(f'<pi_tool_call id="{nonce}">\n{body}\n</pi_tool_call>', LS_TOOLS, nonce)
+
+
+def test_reply_that_was_only_thinking_until_max_tokens_is_asked_again():
+    router = RawStreamRouter(sse_body({"reasoning_content": "plan " * 50}, finish="length"),
+                             sse_body({"content": "Writing the report now."}))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert deltas(sse_events(r), "content") == "Writing the report now."
+    retry = router.requests[1]["messages"]
+    assert retry[-2]["role"] == "assistant" and "plan plan" in retry[-2]["content"]
+    assert "spent the whole output limit on thinking" in retry[-1]["content"]

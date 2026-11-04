@@ -6,6 +6,8 @@
                              LiteLLM /model/info, /openapi.json with the full list of routes, …)
     probe.py models          send a tiny chat request to every model: which ones really work
     probe.py limits          what the running bridge knows about the rate limits (GET /bridge/limits)
+    probe.py thinking --models M   which request field limits the model's thinking (reasoning_effort,
+                             thinking.type, enable_thinking …): the same question with each
 
 Reads PI_TEXT_URL and PI_TEXT_KEY like the bridge (or --url/--key). Requests are spaced by
 --interval seconds and a 429 is waited out, so probing doesn't burn the rate limit itself.
@@ -209,6 +211,60 @@ class Probe:
                 out(f"  - id: {r['model']}\n    contextWindow: {ctx}\n    maxTokens: {r['max_output'] or min(8192, ctx // 4)}")
         return 0 if working else 1
 
+    # ------------------------------------------------------------------ thinking
+    THINKING_VARIANTS = (
+        ("(nothing: the model's default)", {}),
+        ('reasoning_effort: "low"', {"reasoning_effort": "low"}),
+        ('reasoning_effort: "minimal"', {"reasoning_effort": "minimal"}),
+        ('thinking: {type: "disabled"}', {"thinking": {"type": "disabled"}}),
+        ("chat_template_kwargs: {enable_thinking: false}", {"chat_template_kwargs": {"enable_thinking": False}}),
+        ("enable_thinking: false", {"enable_thinking": False}),
+    )
+    THINKING_PROMPT = ("A train leaves at 9:40 and arrives at 13:05. How many minutes is the trip? "
+                       "Answer with the number only.")
+
+    def thinking(self, names: list[str]) -> int:
+        """Which request field the router honours to limit a model's thinking."""
+        if self.api != "chat":
+            out("probe thinking supports Chat Completions routers only")
+            return 1
+        if not names:
+            out("Name the models: probe.py thinking --models glm-latest")
+            return 1
+        for name in names:
+            out(f"{name}: the same small question with each way of limiting thinking ({self.interval}s apart)")
+            base = None
+            for label, extra in self.THINKING_VARIANTS:
+                body = {"model": name, "max_tokens": 4096, "stream": False,
+                        "messages": [{"role": "user", "content": self.THINKING_PROMPT}], **extra}
+                start = time.monotonic()
+                r = self.request("POST", self.endpoint, json=body)
+                ms = round((time.monotonic() - start) * 1000)
+                if r is None:
+                    continue
+                if r.status_code >= 400:
+                    out(f"  ❌ {label:<48} {r.status_code} {cut(error_text(r), 70)}")
+                    continue
+                data = json_or_none(r) or {}
+                message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+                thought = message.get("reasoning_content") or message.get("reasoning") or ""
+                usage = data.get("usage") or {}
+                rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+                size = rt if rt is not None else len(thought) // 4
+                if base is None:
+                    base = size
+                effect = ("" if not extra else "   ← no effect" if base and size >= base * 0.8
+                          else "   ← less thinking" if size else "   ← no thinking")
+                out(f"  ✅ {label:<48} thinking ~{size} tokens, completion {usage.get('completion_tokens', '?')}, "
+                    f"{ms} ms, answer {cut((message.get('content') or '').strip() or '(empty)', 12)!r}{effect}")
+            out("")
+        out("What to do with the result (config.yaml):\n"
+            "  reasoning_effort works  → the model's entry: reasoning: true and\n"
+            "                            compat: { supportsReasoningEffort: true }; then Shift+Tab in Pi sets the level\n"
+            "  another field works     → bridge: UPSTREAM_EXTRA_BODY with that field (for every model of the router)\n"
+            "Small differences are noise: the model thinks a little differently each time.")
+        return 0
+
     def print_limit_headers(self) -> None:
         if self.limit_headers:
             out("Rate-limit headers the router sends:")
@@ -294,7 +350,7 @@ def limits(bridge: str) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("what", nargs="?", default="all", choices=["all", "endpoints", "models", "limits"])
+    p.add_argument("what", nargs="?", default="all", choices=["all", "endpoints", "models", "limits", "thinking"])
     p.add_argument("--url", default=os.environ.get("PI_TEXT_URL", ""), help="router URL (default: $PI_TEXT_URL)")
     p.add_argument("--key", default=os.environ.get("PI_TEXT_KEY", ""), help="router key (default: $PI_TEXT_KEY)")
     p.add_argument("--models", default="", help="comma-separated: test only these models")
@@ -316,6 +372,8 @@ def main() -> int:
     probe = Probe(a.url, a.key, max(0.0, a.interval), a.timeout, a.verbose)
     split = lambda s: [x.strip() for x in s.split(",") if x.strip()]
     status = 0
+    if a.what == "thinking":
+        return probe.thinking(split(a.models))
     if a.what in ("all", "endpoints") and not a.json:
         probe.endpoints()
     if a.what in ("all", "models"):
