@@ -48,7 +48,7 @@ bridge:
   # MIN_REQUEST_INTERVAL: 1        # seconds between two requests to the router, 0 = off
   # RATE_LIMIT_MAX_RESET: 3600     # a 429 whose reset is further away is a quota: Pi gets it at once
   # RATE_LIMIT_RETRY_MAX: 20       # after a 429 the bridge tries again at least every 20 s, until it passes
-  # REASONING_BUDGET: 24000      # chars of thinking without an answer: then the bridge stops it, asks to act
+  # REASONING_BUDGET: auto       # thinking without an answer near max_tokens: stopped, the model asked to save it and act
   # Models the router refuses as "unsupported": use these instead. `pibox probe` shows which work
   # MODEL_FALLBACKS: { YOUR_MODEL_ID: [ANOTHER_MODEL_ID] }
 

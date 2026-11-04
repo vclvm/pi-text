@@ -94,6 +94,11 @@ def _env_json(name: str) -> dict:
     return data
 
 
+def _env_budget(name: str, default: str) -> int:
+    value = os.environ.get(name, default).strip().lower()
+    return -1 if value == "auto" else int(value)
+
+
 def resolve_endpoint(url: str, api: str = "") -> tuple[str, str]:
     """Return (endpoint_url, api). `url` may be a base URL (…/v1) or a full endpoint;
     the API kind is detected from the suffix unless `api` is given."""
@@ -123,7 +128,7 @@ class Settings:
     max_retries: int = 2              # corrective re-asks after a malformed tool call
     upstream_resends: int = 2         # replies requested again after a cut-off stream or an empty reply
     reasoning_budget: int = 0         # chars of thinking without any answer after which the bridge stops
-                                      # the reply and asks again ("act now"); 0 = never
+                                      # the reply and asks again; 0 = never, -1 = auto (70% of max_tokens)
     require_nonce: bool = True        # reject <tool_call> blocks without the session id
     schema_mismatch: str = "retry"    # "retry" (re-ask the model) or "passthrough" (let the client validate)
     ping_interval: float = 15.0       # SSE keep-alive comments while waiting for the model
@@ -174,7 +179,7 @@ class Settings:
             upstream_stream_usage=_env_bool("UPSTREAM_STREAM_USAGE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "2")),
             upstream_resends=int(os.environ.get("UPSTREAM_RESENDS", "2")),
-            reasoning_budget=int(os.environ.get("REASONING_BUDGET", "24000")),
+            reasoning_budget=_env_budget("REASONING_BUDGET", "auto"),
             require_nonce=_env_bool("REQUIRE_NONCE", True),
             schema_mismatch=os.environ.get("SCHEMA_MISMATCH", "retry"),
             ping_interval=float(os.environ.get("PING_INTERVAL", "15")),
@@ -1280,12 +1285,13 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
     return calls, text
 
 
-THOUGHT_CARRY = 6000  # characters of cut-off thinking given back to the model when asking again
+THOUGHT_CARRY = 48000  # characters of cut-off thinking given back to the model when asking again
 THOUGHT_CUT_MESSAGE = (
-    "[bridge] Your previous reply was only thinking, far too long, and was cut off before any answer or tool "
-    "call, so nothing of it was used. The end of that thinking is above. Do not plan everything again. Think briefly, then act now in a "
-    "small step: for a long result, create its file with the headings and fill it in section by section; "
-    "otherwise call the next tool or answer.")
+    "[bridge] Your previous reply was only thinking and was cut off before any answer or tool call, because "
+    "one reply cannot be longer than the output limit. That thinking is above, so your analysis is not lost. "
+    "Do not redo it. Now act: if it holds findings or a plan worth keeping, first save them with a tool call "
+    "(concise and structured, e.g. in .pi-notes/<task>.md), then continue in small steps; a long result "
+    "goes into its file section by section. Keep the thinking of each step short.")
 
 
 def correction_message(error: str, nonce: str, tag: str = DEFAULT_TAG) -> str:
@@ -1672,6 +1678,15 @@ class Bridge:
         raise BridgeError(502, f"upstream stream was interrupted: {problem} "
                                f"({self.s.upstream_resends + 1} times)", "upstream_error")
 
+    def thinking_budget(self, payload: dict) -> int:
+        """Characters of answerless thinking after which a reply is stopped: REASONING_BUDGET, or
+        (auto) 70% of max_tokens at ~4 characters per token: only thinking that would most likely
+        run into max_tokens anyway is stopped, so the analysis is kept rather than lost."""
+        if self.s.reasoning_budget >= 0:
+            return self.s.reasoning_budget
+        limit = payload.get("max_completion_tokens") or payload.get("max_tokens")
+        return int(limit * 4 * 0.7) if isinstance(limit, int) and limit > 0 else 0
+
     async def run(self, prep: Prepared, first: httpx.Response | None = None,
                   record: dict | None = None, trace: Tracer | None = None) -> AsyncIterator[tuple[str, Any]]:
         """Yields ("text"|"reasoning", str), ("tool_calls", list), ("usage", dict), ("finish", str)."""
@@ -1697,6 +1712,7 @@ class Bridge:
                 native: dict[Any, list] = {}  # key -> [name, arguments] of upstream-parsed tool calls
                 finish = None
 
+                budget = self.thinking_budget(payload)
                 think_pieces: list[str] = []  # <think> in the content (reasoning_content goes to `thoughts`)
                 thinking = [0]                # characters of thinking so far, both kinds
                 over_budget = False
@@ -1743,7 +1759,6 @@ class Bridge:
                         thoughts.append(value)
                         thinking[0] += len(value)
                         yield "reasoning", value
-                    budget = self.s.reasoning_budget
                     if budget and thinking[0] > budget and attempt < self.s.max_retries and not native \
                             and not scanner.started and scanner.calls is None \
                             and not (scanner.state == "text" and scanner.buf.strip()):
@@ -1804,12 +1819,13 @@ class Bridge:
                     # (it is not sent back otherwise) and a push to act.
                     info["error"] = (f"the whole reply ({len(thought)} chars) was thinking, cut off at max_tokens "
                                      "before any answer" if finish == "length" else
-                                     f"{len(thought)} chars of thinking without an answer (REASONING_BUDGET "
-                                     f"{self.s.reasoning_budget}): stopped")
+                                     f"{len(thought)} chars of thinking without an answer, close to max_tokens "
+                                     f"(REASONING_BUDGET {budget}): stopped")
                     log.warning("attempt %d: %s; asking again", attempt + 1, info["error"])
                     trace(f"!! {info['error']}; asking again")
                     messages = messages + [
-                        {"role": "assistant", "content": "(My thinking was cut off before I answered. Its end:)\n…"
+                        {"role": "assistant", "content": "(My thinking so far, cut off before I answered:)\n"
+                                                         + ("…" if len(thought) > THOUGHT_CARRY else "")
                                                          + thought[-THOUGHT_CARRY:]},
                         {"role": "user", "content": THOUGHT_CUT_MESSAGE},
                     ]

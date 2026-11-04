@@ -1289,3 +1289,10 @@ def test_broken_stream_after_text_gives_pi_a_retryable_message():
     with make_client(Router()) as client:
         r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
     assert "stream was interrupted" in r.text and "[DONE]" not in r.text
+
+
+def test_auto_reasoning_budget_follows_max_tokens():
+    bridge = proxy.Bridge(proxy.Settings(reasoning_budget=-1), None)
+    assert bridge.thinking_budget({"max_tokens": 16384}) == int(16384 * 4 * 0.7)
+    assert bridge.thinking_budget({}) == 0
+    assert proxy.Bridge(proxy.Settings(reasoning_budget=500), None).thinking_budget({"max_tokens": 9}) == 500
