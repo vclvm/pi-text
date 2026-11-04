@@ -280,7 +280,7 @@ with the existing keys):
 | `Set PI_TEXT_URL` (500) | Bridge started without `PI_TEXT_URL` |
 | `upstream: …` with 401/403/404 | Wrong `PI_TEXT_KEY`, wrong URL, or a model `id` the router does not know |
 | `upstream: the model you requested is unsupported…` (404) for a model that should exist | The key may not use that model, whatever the docs say. `probe.py models` shows which models really answer. Use one of them, or set `MODEL_FALLBACKS` |
-| Pi stops with a 429 / "rate limit" | `GET /bridge/limits` and the `!! upstream 429` trace lines show what the router said. Raise `RATE_LIMIT_MAX_WAIT` or `MIN_REQUEST_INTERVAL`. If the bridge can't find a reset time, send the 429 body from the trace to the maintainer |
+| Pi stops with a 429 / "rate limit" | `GET /bridge/limits` and the `!! upstream 429` trace lines show what the router said. If the reset is more than an hour away, it is a quota (`RATE_LIMIT_MAX_RESET`); otherwise raise `MIN_REQUEST_INTERVAL`. If the bridge can't find a reset time, send the 429 body from the trace to the maintainer |
 | `upstream returned 400` mentioning `stream_options` | `UPSTREAM_STREAM_USAGE=false` |
 | `upstream …` mentioning `reasoning_effort` | `compat.supportsReasoningEffort: false` for that model |
 | `bridge_protocol_error` … `id=None` | The model writes the block (often `<tool_call>`) without the id (common for Qwen/Hermes-style models): `REQUIRE_NONCE=false` |
@@ -355,6 +355,7 @@ The trace and dumps contain your prompts, code and command output: keep them loc
 | `UPSTREAM_STREAM` | `true` | Stream from the router. With `false` the full reply is awaited (no pings until the router responds) |
 | `UPSTREAM_STREAM_USAGE` | `true` | Chat API only: send `stream_options.include_usage`; disable if the router rejects it |
 | `MAX_RETRIES` | `2` | Corrective re-asks after an invalid tool call |
+| `UPSTREAM_RESENDS` | `2` | The same request is sent again when the router cut the stream off (no `finish_reason`, no `[DONE]`) before any text, or the reply was empty. Then the client gets a retryable 502 `upstream stream was interrupted`. Without this, Pi takes such a reply for a finished, empty answer and stops |
 | `PROTOCOL_TAG` | `pi_tool_call` | Tag name of tool-call blocks. `tool_call` is the Qwen/Hermes-native tag: models follow it best, but routers with a server-side tool parser swallow it |
 | `REQUIRE_NONCE` | `true` | Reject tool-call blocks without the session id. `false` accepts a missing id (Hermes-style models often drop it) but still rejects a wrong one |
 | `SCHEMA_MISMATCH` | `retry` | `passthrough` hands schema-invalid arguments to Pi and lets Pi report the error to the model |
@@ -367,8 +368,8 @@ The trace and dumps contain your prompts, code and command output: keep them loc
 | `DEBUG_DUMP_DIR` | empty (off) | Write every exchange (requests, raw replies, errors) as JSON. Contains your code and prompts |
 | `LOG_LEVEL` | `INFO` | Invalid model replies are logged at `WARNING` with the raw text |
 | `MIN_REQUEST_INTERVAL` | `1` | Seconds between the starts of two upstream requests (all clients, corrective retries included); `0` = off |
-| `RATE_LIMIT_MAX_WAIT` | `180` | Most seconds one client request may wait for rate limits; after that the client gets the 429 |
-| `RATE_LIMIT_RETRIES` | `5` | Upstream 429s waited out and retried per client request |
+| `RATE_LIMIT_MAX_RESET` | `3600` | A 429 whose named reset is further away than this many seconds is a quota: the client gets it at once. Nearer resets are always waited out |
+| `RATE_LIMIT_BACKOFF_MAX` | `20` | 429s that name no reset are retried every 5, 10, 20… s, at most this many seconds apart, until they pass |
 | `RATE_LIMIT_LOW` | `1` | When the router reports this many remaining requests or fewer, the rest are spread evenly until the reset |
 | `MODEL_FALLBACKS` | empty | JSON `{"model": ["fallback", …], "*": […]}`: models to use when the router refuses one as unsupported/unauthorized |
 
@@ -387,9 +388,11 @@ bridge handles it instead:
   than a request needs (estimated at characters / 4), that request waits for the token reset.
 - **After a 429.** The wait comes from the headers or from the error body: `retry_after`- or
   `reset_at`-style fields, "try again in 1m30s", an ISO timestamp. Without any of these the bridge
-  backs off 5, 10, 20… s, up to 60 s. Then the same request is sent again, for up to
-  `RATE_LIMIT_RETRIES` times and `RATE_LIMIT_MAX_WAIT` seconds. One 429 pauses every request,
-  not only the one that got it.
+  backs off 5, 10, 20… s, up to `RATE_LIMIT_BACKOFF_MAX` (20 s). Then the same request is sent again. A reset the router
+  names is waited out as often as it comes: there is nothing better to do, Pi stays connected,
+  and Esc in Pi cancels the wait. Only a reset more than `RATE_LIMIT_MAX_RESET` away (a quota)
+  goes to Pi at once. Without a named reset, the bridge retries every 5, 10, 20… s, at most
+  `RATE_LIMIT_BACKOFF_MAX` apart, also until the request passes. One 429 pauses every request, not only the one that got it.
 - **Pi stays connected.** A wait of up to `PING_INTERVAL` seconds happens before the response
   starts. A longer wait happens inside the SSE stream, where `: ping` comments keep Pi's connection
   alive.

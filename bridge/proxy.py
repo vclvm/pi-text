@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -120,6 +121,7 @@ class Settings:
     upstream_stream: bool = True      # use streaming towards the upstream router
     upstream_stream_usage: bool = True  # send stream_options.include_usage upstream
     max_retries: int = 2              # corrective re-asks after a malformed tool call
+    upstream_resends: int = 2         # replies requested again after a cut-off stream or an empty reply
     require_nonce: bool = True        # reject <tool_call> blocks without the session id
     schema_mismatch: str = "retry"    # "retry" (re-ask the model) or "passthrough" (let the client validate)
     ping_interval: float = 15.0       # SSE keep-alive comments while waiting for the model
@@ -131,8 +133,8 @@ class Settings:
     trace_max: int = 4000             # truncate long trace entries to this many characters (0 = never)
     # Rate limits. The dataclass defaults are "off" (tests); from_env() turns pacing on.
     min_request_interval: float = 0.0  # seconds between the starts of two upstream requests (all clients)
-    rate_limit_max_wait: float = 180.0  # most seconds one client request may wait for rate limits
-    rate_limit_retries: int = 5         # upstream 429s retried (after waiting) per client request
+    rate_limit_max_reset: float = 3600.0  # a named reset further away is a quota: the client gets the 429
+    rate_limit_backoff_max: float = 20.0  # 429s that name no reset: retry every 5, 10, 20… s, at most this
     rate_limit_low: int = 1             # remaining requests <= this: spread the rest until the reset
     model_fallbacks: dict = field(default_factory=dict)  # {"model": ["fallback", ...]} on "unsupported model"
     nonce_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
@@ -169,6 +171,7 @@ class Settings:
             upstream_stream=_env_bool("UPSTREAM_STREAM", True),
             upstream_stream_usage=_env_bool("UPSTREAM_STREAM_USAGE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "2")),
+            upstream_resends=int(os.environ.get("UPSTREAM_RESENDS", "2")),
             require_nonce=_env_bool("REQUIRE_NONCE", True),
             schema_mismatch=os.environ.get("SCHEMA_MISMATCH", "retry"),
             ping_interval=float(os.environ.get("PING_INTERVAL", "15")),
@@ -179,8 +182,8 @@ class Settings:
             trace=os.environ.get("TRACE", ""),
             trace_max=int(os.environ.get("TRACE_MAX", "4000")),
             min_request_interval=float(os.environ.get("MIN_REQUEST_INTERVAL", "1")),
-            rate_limit_max_wait=float(os.environ.get("RATE_LIMIT_MAX_WAIT", "180")),
-            rate_limit_retries=int(os.environ.get("RATE_LIMIT_RETRIES", "5")),
+            rate_limit_max_reset=float(os.environ.get("RATE_LIMIT_MAX_RESET", "3600")),
+            rate_limit_backoff_max=float(os.environ.get("RATE_LIMIT_BACKOFF_MAX", "20")),
             rate_limit_low=int(os.environ.get("RATE_LIMIT_LOW", "1")),
             model_fallbacks=_env_json("MODEL_FALLBACKS"),
         )
@@ -350,6 +353,15 @@ def _last_user_text(messages: list) -> str:
         if isinstance(m, dict) and m.get("role") in ("user", "tool"):
             return " ".join(_text(m.get("content"), placeholder=True).split())[:120]
     return ""
+
+
+def _tail(text: str, size: int = 160) -> str:
+    """The last `size` characters of `text` on one line, starting at a word."""
+    text = " ".join(text.split())
+    if len(text) > size:
+        text = text[-size:]
+        text = text[text.find(" ") + 1:] if " " in text[:30] else text
+    return text
 
 
 def _messages_hash(messages: list) -> str:
@@ -609,10 +621,11 @@ class RateLimiter:
       evenly until the reset; when it reports fewer remaining tokens than a request needs, that
       request waits for the token reset."""
 
-    BACKOFF_START, BACKOFF_MAX = 5.0, 60.0
+    BACKOFF_START = 5.0
 
     def __init__(self, settings: Settings):
         self.min_interval = max(0.0, settings.min_request_interval)
+        self.backoff_max = max(self.BACKOFF_START, settings.rate_limit_backoff_max)
         self.low = settings.rate_limit_low
         self.next_start = 0.0          # monotonic time of the next free slot
         self.blocked_until = 0.0       # monotonic; set by 429s and exhausted request windows
@@ -683,7 +696,7 @@ class RateLimiter:
             elif info.reset_requests and 0 < info.reset_requests <= MAX_PLAUSIBLE_WAIT:
                 delay = info.reset_requests + 0.5
             else:  # nothing said: back off, doubling
-                delay = min(self.BACKOFF_START * 2 ** (self.consecutive_429 - 1), self.BACKOFF_MAX)
+                delay = min(self.BACKOFF_START * 2 ** min(self.consecutive_429 - 1, 20), self.backoff_max)
             self._block(now + delay, "upstream returned 429")
             return delay
         if status < 400:
@@ -1395,13 +1408,17 @@ class Bridge:
         In streaming mode only the headers have been received when this returns.
         `payload` is chat-shaped and converted here for the configured upstream API.
 
-        Rate limits: waits for a free slot and, after a 429, until the reset, then sends again, for
-        at most `budget` seconds in all (default RATE_LIMIT_MAX_WAIT). Raises RateLimitWait when
-        that is not enough. A model the router refuses as unsupported is replaced by its fallback."""
+        Rate limits: waits for a free slot and, after a 429, until the reset, then sends again.
+        This goes on until the request passes or the client goes away (pings keep it connected,
+        Esc in Pi cancels): a named reset is waited for, without one the bridge retries every
+        5, 10, 20… s up to RATE_LIMIT_BACKOFF_MAX. Only a reset more than RATE_LIMIT_MAX_RESET away
+        (a quota, not a throttle) or a billing/quota error goes to the client. With `budget` (before
+        a stream has started) any longer wait raises RateLimitWait at once, so it happens inside it.
+        A model the router refuses as unsupported is replaced by its fallback."""
         trace = trace if trace is not None else Tracer(Settings())
         url = self.s.endpoint
         convert = to_responses_payload if self.s.api == "responses" else to_chat_payload
-        budget = self.s.rate_limit_max_wait if budget is None else budget
+        limit = math.inf if budget is None else budget
         tokens = estimate_tokens(payload)
         models = self._models_to_try(payload["model"])
         if models[0] != payload["model"]:
@@ -1409,7 +1426,7 @@ class Bridge:
         waited, limited, index = 0.0, 0, 0
         while True:
             model = models[index]
-            waited += await self.limiter.wait(tokens, budget - waited, trace)
+            waited += await self.limiter.wait(tokens, limit - waited, trace)
             trace.event("send", model=model, tokens=tokens, streaming=self.s.upstream_stream)
             sent = time.monotonic()
             try:
@@ -1435,18 +1452,18 @@ class Bridge:
                 delay = self.limiter.observe(info, status)
                 error = _upstream_error(status, raw)
                 limited += 1
-                log.warning("upstream 429 (%d/%d), next try in %.1fs: %s | %s", limited,
-                            self.s.rate_limit_retries, delay, error.message, info.as_dict())
-                trace(f"!! upstream 429 ({limited}/{self.s.rate_limit_retries}), next try in {delay:.1f}s: "
+                log.warning("upstream 429 (#%d), next try in %.1fs: %s | %s", limited,
+                            delay, error.message, info.as_dict())
+                trace(f"!! upstream 429 (#{limited}), next try in {delay:.1f}s: "
                       f"{error.message}", info.as_dict())
                 no_reset = info.retry_after is None and info.reset_requests is None and info.reset_tokens is None
                 if no_reset and _HARD_QUOTA.search(raw.decode("utf-8", "replace")):
                     raise error  # a plan/billing limit: waiting a minute won't help
                 trace.event("rate_limited", delay=round(delay, 1), attempt=limited,
-                            of=self.s.rate_limit_retries, budget_left=round(budget - waited, 1))
-                if limited > self.s.rate_limit_retries:
-                    raise RateLimitWait(delay, f"still limited after {limited - 1} retries", error.message)
-                if waited + delay > budget:
+                            reset="named by the router" if not no_reset else "unknown, backing off")
+                if not no_reset and delay > self.s.rate_limit_max_reset:
+                    raise RateLimitWait(delay, f"the limit resets only in {delay / 60:.0f} min", error.message)
+                if waited + delay > limit:
                     raise RateLimitWait(delay, "upstream returned 429", error.message)
                 continue
             self.limiter.observe(parse_rate_limit(response.headers), status)
@@ -1471,6 +1488,7 @@ class Bridge:
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        yield "done", None
                         break
                     try:
                         chunk = json.loads(data)
@@ -1509,6 +1527,38 @@ class Bridge:
             raise BridgeError(502, f"Upstream stream error: {e!r}", "upstream_error") from e
         finally:
             await response.aclose()
+
+    async def reply_events(self, payload: dict, response: httpx.Response, sink: list | None,
+                           trace: Tracer) -> AsyncIterator[tuple[str, Any]]:
+        """events(), but a reply that brought nothing usable is requested again (UPSTREAM_RESENDS times):
+        a stream the router cut off (no finish_reason, no [DONE]) before any text, or an empty reply.
+        Reasoning streamed meanwhile stays with the client. Pi would take either for a finished,
+        empty answer and stop; after the last resend the client gets a 502 it retries instead."""
+        for resend in range(self.s.upstream_resends + 1):
+            if resend:
+                response = await self.open(payload, trace=trace)
+            finish, done, useful = None, False, False
+            async for kind, value in self.events(response, sink):
+                if kind == "done":
+                    done = True
+                    continue
+                if kind == "finish":
+                    finish = value
+                elif kind == "native_call" or (kind == "content" and value):
+                    useful = True
+                yield kind, value
+            cut = self.s.upstream_stream and finish is None and not done
+            if useful and not cut or finish == "length":
+                return  # a reply, or one that hit max_tokens (a resend would end the same way)
+            problem = "the router ended the stream without finish_reason" if cut else "the reply was empty"
+            if useful:  # text already went to the client: it cannot be taken back
+                raise BridgeError(502, f"upstream stream was interrupted: {problem}", "upstream_error")
+            if resend < self.s.upstream_resends:
+                log.warning("%s; requesting the reply again (%d/%d)", problem, resend + 1, self.s.upstream_resends)
+                trace(f"!! {problem}; requesting the reply again ({resend + 1}/{self.s.upstream_resends})")
+                trace.event("resend", reason=problem, attempt=resend + 1, of=self.s.upstream_resends)
+        raise BridgeError(502, f"upstream stream was interrupted: {problem} "
+                               f"({self.s.upstream_resends + 1} times)", "upstream_error")
 
     async def run(self, prep: Prepared, first: httpx.Response | None = None,
                   record: dict | None = None, trace: Tracer | None = None) -> AsyncIterator[tuple[str, Any]]:
@@ -1550,9 +1600,13 @@ class Bridge:
                 body_started = time.monotonic()
                 sizes = {"text": 0, "reasoning": 0}
                 first_at = next_progress = None
-                async for kind, value in self.events(response, chunks):
+                recent, recent_kind = "", ""  # the end of what the model is writing now, for `pibox diag`
+                async for kind, value in self.reply_events(payload, response, chunks, trace):
                     if kind in ("content", "reasoning") and value:
                         sizes["text" if kind == "content" else "reasoning"] += len(value)
+                        if kind != recent_kind:
+                            recent, recent_kind = "", kind
+                        recent = (recent + value)[-400:]
                         now = time.monotonic()
                         if first_at is None:
                             first_at, next_progress = now, now + PROGRESS_EVERY
@@ -1561,7 +1615,8 @@ class Bridge:
                         elif now >= next_progress:
                             next_progress = now + PROGRESS_EVERY
                             trace.event("progress", chars=sizes["text"], reasoning_chars=sizes["reasoning"],
-                                        seconds=round(now - first_at, 1))
+                                        seconds=round(now - first_at, 1), now_writing=recent_kind and
+                                        ("text" if recent_kind == "content" else "reasoning"), tail=_tail(recent))
                     if kind == "content":
                         raw.append(value)
                         for event in route(scanner.feed(value)):
@@ -1816,7 +1871,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         bridge: Bridge = request.app.state.bridge
         now = time.monotonic()
         return {**bridge.limiter.status(),
-                "max_wait_seconds": settings.rate_limit_max_wait,
+                "max_reset_seconds": settings.rate_limit_max_reset,
+                "max_backoff_seconds": settings.rate_limit_backoff_max,
                 "refused_models": {m: round(t - now) for m, t in bridge.unsupported.items() if t > now},
                 "model_fallbacks": settings.model_fallbacks}
 

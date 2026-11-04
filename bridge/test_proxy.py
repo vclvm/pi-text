@@ -972,7 +972,7 @@ def test_long_429_wait_happens_inside_the_stream():
 def test_429_gives_up_with_retry_after_and_a_retryable_message():
     body = {"error": {"message": "Quota exceeded for this minute"}}
     router = FakeRouter((429, body, {"retry-after": "30"}))
-    with make_client(router, rate_limit_max_wait=1) as client:
+    with make_client(router, rate_limit_max_reset=1) as client:
         r = client.post("/v1/chat/completions", json=tools_payload())
     assert r.status_code == 429 and int(r.headers["retry-after"]) >= 30
     error = r.json()["error"]
@@ -980,10 +980,23 @@ def test_429_gives_up_with_retry_after_and_a_retryable_message():
     assert "Quota exceeded" in error["upstream_message"]
     assert len(router.requests) == 1
 
-    router = FakeRouter(*[(429, body, {"retry-after": "0.05"})] * 2)
-    with make_client(router, rate_limit_retries=1) as client:
+
+def test_429_without_a_named_reset_is_retried_until_it_passes(monkeypatch):
+    monkeypatch.setattr(proxy.RateLimiter, "BACKOFF_START", 0.01)
+    router = FakeRouter(*[(429, {"error": {"message": "slow down"}})] * 8, lambda nonce: "Done.")
+    with make_client(router, rate_limit_backoff_max=0.02) as client:
         r = client.post("/v1/chat/completions", json=tools_payload())
-    assert r.status_code == 429 and len(router.requests) == 2
+    assert r.status_code == 200 and len(router.requests) == 9
+    gaps = [b["t"] - a["t"] for a, b in zip(router.requests, router.requests[1:])]
+    assert max(gaps) < 0.5  # capped at RATE_LIMIT_BACKOFF_MAX
+
+
+def test_named_resets_are_waited_out_however_often_they_come():
+    limited = (429, {"error": {"message": "slow down"}}, {"retry-after": "0.05"})
+    router = FakeRouter(*[limited] * 8, lambda nonce: "Done.")
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload())
+    assert r.status_code == 200 and len(router.requests) == 9
 
 
 def test_hard_quota_429_is_not_retried():
@@ -1097,3 +1110,59 @@ def test_event_stream_replays_history_then_ticks():
     assert [l["kind"] for l in lines] == ["request", "send", "tick"]
     assert lines[0]["replay"] and lines[2]["active"][0]["phase"] == "upstream_headers"
     assert not monitor.subscribers
+
+
+# --------------------------------------------------------------------------- cut-off and empty replies
+
+class RawStreamRouter:
+    """Streams the given raw SSE bodies, one per request."""
+    stream = True
+
+    def __init__(self, *bodies):
+        self.bodies, self.requests = list(bodies), []
+
+    def __call__(self, request):
+        self.requests.append(json.loads(request.content))
+        return httpx.Response(200, content=self.bodies.pop(0).encode(), headers={"content-type": "text/event-stream"})
+
+
+def sse_body(*deltas, finish="stop", done=True):
+    lines = [{"choices": [{"index": 0, "delta": d}]} for d in deltas]
+    if finish:
+        lines.append({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+    return "".join(f"data: {json.dumps(x)}\n\n" for x in lines) + ("data: [DONE]\n\n" if done else "")
+
+
+def test_cut_off_stream_before_any_text_is_requested_again():
+    router = RawStreamRouter(sse_body({"reasoning_content": "hmm"}, finish=None, done=False),
+                             sse_body({"content": "Hello."}))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+        kinds = [e["kind"] for e in client.app.state.bridge.monitor.recent]
+    assert deltas(sse_events(r), "content") == "Hello."
+    assert len(router.requests) == 2 and "resend" in kinds
+
+
+def test_empty_replies_end_in_a_retryable_error():
+    router = RawStreamRouter(*[sse_body({"reasoning_content": "hmm"})] * 3)
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert len(router.requests) == 3
+    error = json.loads([l for l in r.text.splitlines() if l.startswith("data: {")][-1][6:])["error"]
+    assert "stream was interrupted" in error["message"] and "empty" in error["message"]
+
+
+def test_stream_cut_after_text_is_an_error_not_a_normal_end():
+    router = RawStreamRouter(sse_body({"content": "Half a sen"}, finish=None, done=False))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert len(router.requests) == 1
+    assert "stream was interrupted" in r.text and "[DONE]" not in r.text
+
+
+def test_reply_cut_by_max_tokens_is_not_resent():
+    router = RawStreamRouter(sse_body({"reasoning_content": "long thoughts"}, finish="length"))
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert len(router.requests) == 1
+    assert [c["choices"][0]["finish_reason"] for c in sse_events(r) if c["choices"]][-1] == "length"

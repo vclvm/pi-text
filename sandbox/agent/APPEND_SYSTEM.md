@@ -15,6 +15,8 @@ reply that reaches it is cut off mid-sentence and lost. So:
 # Long tasks: small steps, results on disk
 
 - Work in small steps of a few tool calls each; don't try to finish a big task in one reply.
+- Start every reply that calls tools with one short status line for the user: what you do now
+  and why ("Reading the bridge config to find the timeout."). It is their progress indicator.
 - At the start of a task that needs more than a few steps, write a short plan with checkboxes to
   `.pi-notes/<task>.md`, and tick items off and add key findings (paths, facts, decisions) there as
   you go. If the conversation gets compacted or cut off, that file is how you continue.

@@ -42,6 +42,9 @@ COLORS = {"request": "1;36", "end_ok": "1;32", "end_bad": "1;31", "warn": "33", 
           "info": "", "verdict": "35"}
 
 
+TAIL_EVERY = 20  # seconds between "what the model is writing now" lines in the log
+
+
 def kchars(n) -> str:
     n = n or 0
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
@@ -55,6 +58,7 @@ class View:
         self.writing: dict[str, dict] = {}
         self.last_note: dict[str, float] = {}
         self.max_tokens: dict[str, int] = {}
+        self.last_tail: dict[str, float] = {}
 
     def c(self, kind: str, text: str) -> str:
         return f"\033[{COLORS[kind]}m{text}\033[0m" if self.color and COLORS[kind] else text
@@ -92,6 +96,8 @@ class View:
             w = self.writing.get(a["rid"])
             if a["phase"] == "generating" and w:
                 more = f", text {kchars(w.get('chars'))} + reasoning {kchars(w.get('reasoning_chars'))} chars"
+                if w.get("tail"):
+                    more += f" | {'thinks' if w.get('now_writing') == 'reasoning' else 'writes'}: …{w['tail'][-70:]}"
             parts.append(f"⏳ {a['rid']} {WAITING.get(a['phase'], a['phase'])} {a['phase_for']:.0f}s{more} "
                          f"(total {a['elapsed']:.0f}s, {a.get('model')})")
             # Without a status line, remind every 15 s of a long wait.
@@ -151,8 +157,8 @@ class View:
             else:
                 self.line(e, "err", f"  ← router {status} after {e['seconds']:.2f}s: {e.get('message', '')}")
         elif k == "rate_limited":
-            self.line(e, "warn", f"  ⚠ 429 ({e.get('attempt')}/{e.get('of')}): next try in {e.get('delay')}s, "
-                                 f"budget left {e.get('budget_left')}s")
+            self.line(e, "warn", f"  ⚠ 429 #{e.get('attempt')}: next try in {e.get('delay')}s "
+                                 f"(reset {e.get('reset', '?')})")
         elif k == "fallback":
             self.line(e, "warn", f"  ⚠ model {e.get('model')} refused ({e.get('status')}), trying {e.get('to')}")
         elif k == "upstream_error":
@@ -164,10 +170,16 @@ class View:
             secs = max(e.get("seconds") or 0, 0.1)
             total = (e.get("chars") or 0) + (e.get("reasoning_chars") or 0)
             self.writing[rid] = e
-            if self.tty:
-                return  # the status line already shows it; keep the log short
-            self.line(e, "dim", f"  … writing {e['seconds']:.0f}s: text {kchars(e.get('chars'))}, "
-                                f"reasoning {kchars(e.get('reasoning_chars'))} chars (~{total / secs:.0f} chars/s)")
+            # Every TAIL_EVERY seconds one line: how far the model is, and the end of what it writes now.
+            if e["t"] - self.last_tail.setdefault(rid, e["t"] - TAIL_EVERY + 4) < TAIL_EVERY:
+                return  # (the first one ~4 s after the first token; the status line shows the rest)
+            self.last_tail[rid] = e["t"]
+            what = "thinking" if e.get("now_writing") == "reasoning" else "writing"
+            text = (f"  … {what} {e['seconds']:.0f}s: text {kchars(e.get('chars'))}, reasoning "
+                    f"{kchars(e.get('reasoning_chars'))} chars (~{total / secs:.0f} chars/s)")
+            if e.get("tail"):
+                text += f"\n    …{e['tail']}"
+            self.line(e, "dim", text)
         elif k == "reply":
             usage = e.get("usage") or {}
             u = " ".join(f"{a}={usage[a]}" for a in ("prompt_tokens", "completion_tokens") if a in usage)
@@ -188,10 +200,13 @@ class View:
                          f"thinking level (Shift+Tab in Pi)")
             elif e.get("finish") is None:
                 text += ("\n    ⚠ CUT OFF: the router ended the stream without a finish_reason (its own timeout "
-                         "or a dropped connection); Pi sees an ordinary end")
+                         "or a dropped connection)")
             if e.get("empty"):
                 text += "\n    ⚠ empty reply (no text, no tool call)"
             self.line(e, "warn" if e.get("empty") or cut else "info", text)
+        elif k == "resend":
+            self.line(e, "warn", f"  ↻ {e.get('reason')}: requesting the reply again "
+                                 f"({e.get('attempt')}/{e.get('of')})")
         elif k == "retry":
             self.line(e, "warn", f"  ↻ asking the model again ({e.get('attempt')}/{e.get('of')}): {e.get('reason')}")
         elif k == "ping":
@@ -224,6 +239,7 @@ class View:
             text += f"\n  → most of it ({share:.0f}%, {secs:.1f}s): {PHASES.get(phase, (phase, phase))[1]}"
         self.writing.pop(rid, None)
         self.max_tokens.pop(rid, None)
+        self.last_tail.pop(rid, None)
         self.line(e, "end_ok" if ok else "end_bad", text)
 
 
