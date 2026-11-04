@@ -57,6 +57,8 @@ bridge:
 #                  before it fills up. Take the real value from your router
 #   maxTokens      the most tokens the model may write in ONE reply. A file the agent writes is part
 #                  of a reply, so too little cuts big write/edit calls off. Must fit into contextWindow
+#                  A thinking model's reasoning counts too: give it 32768 or more, or the reply is
+#                  cut off mid-sentence (pibox diag shows "CUT OFF")
 # Optional:
 #   reasoning: true    for thinking models (gpt-oss, Qwen3 thinking…): Pi shows a thinking level
 #   name               shown in Pi; default "<id> (sandbox)"

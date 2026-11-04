@@ -54,6 +54,7 @@ class View:
         self.pings: dict[str, int] = {}
         self.writing: dict[str, dict] = {}
         self.last_note: dict[str, float] = {}
+        self.max_tokens: dict[str, int] = {}
 
     def c(self, kind: str, text: str) -> str:
         return f"\033[{COLORS[kind]}m{text}\033[0m" if self.color and COLORS[kind] else text
@@ -113,6 +114,8 @@ class View:
         replay = " (earlier)" if e.get("replay") else ""
         if k == "request":
             self.pings[rid] = 0
+            if e.get("max_tokens"):
+                self.max_tokens[rid] = e["max_tokens"]
             extra = []
             if e.get("idle") is not None:
                 extra.append(f"{e['idle']:.1f}s after the previous request ended")
@@ -120,7 +123,8 @@ class View:
                 extra.append(f"same messages as failed request {e['repeat_of_failed']}: Pi is retrying "
                              f"(the gap above was Pi's own back-off)")
             text = (f"▶ request{replay} model={e.get('model')} {'stream' if e.get('stream') else 'no-stream'} "
-                    f"messages={e.get('messages')} tools={e.get('tools')} ~{kchars(e.get('tokens'))} tokens")
+                    f"messages={e.get('messages')} tools={e.get('tools')} ~{kchars(e.get('tokens'))} tokens"
+                    + (f" max_tokens={e['max_tokens']}" if e.get("max_tokens") else ""))
             if e.get("last"):
                 text += f'\n  last input: "{e["last"]}"'
             if extra:
@@ -176,9 +180,18 @@ class View:
                     f"{kchars(e.get('reasoning_chars'))} chars in {e.get('seconds')}s (~{total / secs:.0f} chars/s)")
             if u:
                 text += f"\n    usage: {u}"
+            cut = e.get("finish") in ("length", None)
+            if e.get("finish") == "length":
+                limit = self.max_tokens.get(rid)
+                text += (f"\n    ⚠ CUT OFF: the reply hit max_tokens{f' ({limit})' if limit else ''}. Thinking and "
+                         f"text share this limit: raise maxTokens of the model in config.yaml, or lower its "
+                         f"thinking level (Shift+Tab in Pi)")
+            elif e.get("finish") is None:
+                text += ("\n    ⚠ CUT OFF: the router ended the stream without a finish_reason (its own timeout "
+                         "or a dropped connection); Pi sees an ordinary end")
             if e.get("empty"):
                 text += "\n    ⚠ empty reply (no text, no tool call)"
-            self.line(e, "warn" if e.get("empty") else "info", text)
+            self.line(e, "warn" if e.get("empty") or cut else "info", text)
         elif k == "retry":
             self.line(e, "warn", f"  ↻ asking the model again ({e.get('attempt')}/{e.get('of')}): {e.get('reason')}")
         elif k == "ping":
@@ -210,6 +223,7 @@ class View:
             share = 100 * secs / total if total else 0
             text += f"\n  → most of it ({share:.0f}%, {secs:.1f}s): {PHASES.get(phase, (phase, phase))[1]}"
         self.writing.pop(rid, None)
+        self.max_tokens.pop(rid, None)
         self.line(e, "end_ok" if ok else "end_bad", text)
 
 

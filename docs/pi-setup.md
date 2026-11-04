@@ -858,6 +858,7 @@ the extensions, and these settings, [sandbox/agent/settings.json](../sandbox/age
   "enableInstallTelemetry": false,
   "extensions": ["-builtin:mcp", "-builtin:llama.cpp"],
   "quietStartup": "header",
+  "hideThinkingBlock": true,
   "retry": {
     "enabled": true,
     "maxRetries": 6,
@@ -879,14 +880,18 @@ the extensions, and these settings, [sandbox/agent/settings.json](../sandbox/age
 | `defaultTools` | Tools available at start | The standard set; drop `bash`, `edit`, `write` for read-only reviews (`--tools read,grep,find,ls`) |
 | `enableInstallTelemetry: false` | No install/update reporting | Fewer outbound connections, important behind an approving proxy |
 | `"-builtin:mcp"`, `"-builtin:llama.cpp"` | Disable built-in MCP support and the local llama.cpp provider | MCP servers are extra processes outside Pi's tool hooks. Add them deliberately, if at all |
+| `hideThinkingBlock: true` | Thinking blocks are collapsed (Ctrl+T expands them) | Thinking models write pages of it. Hiding saves nothing: thinking still costs output tokens, but the bridge never sends it back to the model, so it does not fill the context |
 | `retry` | Agent retries: 6 instead of 3, pauses 5 s, 10 s, 20 s, 40 s, 60 s, 60 s instead of 2 s, 4 s, 8 s. Provider retries: 2, honouring a `Retry-After` of up to 5 minutes | The bridge waits out short rate limits itself (`RATE_LIMIT_MAX_WAIT`). When it gives up, it answers 429 with `Retry-After`, and this keeps Pi from giving up after 14 s |
 
 Next to it, [sandbox/agent/APPEND_SYSTEM.md](../sandbox/agent/APPEND_SYSTEM.md) adds a few lines to Pi's
 system prompt. They tell the model to batch independent tool calls into one reply, to read files in
 parts, to filter command output and to avoid re-reading files. Every reply is one more rate-limited
 request that re-sends the whole conversation, so fewer and smaller turns save requests and tokens.
-The file is ~150 tokens, sent with every request; delete the mount in `compose.yaml` if you don't
-want it.
+For long tasks they ask for small steps, a plan with findings in `.pi-notes/<task>.md` in the
+project, and long results (reports) written into files section by section, never as one huge
+reply: one reply has a hard output limit (`maxTokens`, shared with thinking), and a reply that hits
+it is cut off mid-sentence. The file is ~400 tokens, sent with every request; delete the mount in
+`compose.yaml` if you don't want it.
 
 The image sets `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1` and `PI_TELEMETRY=0`: Pi makes no network
 calls of its own (version checks, model catalogs), so the only traffic is what the agent does.

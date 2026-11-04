@@ -1840,6 +1840,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             messages = payload.get("messages") or []
             trace.event("request", model=prep.model, stream=bool(payload.get("stream")),
                         messages=len(messages), tools=len(prep.tools), tokens=estimate_tokens(prep.upstream),
+                        max_tokens=payload.get("max_completion_tokens", payload.get("max_tokens")),
                         last=_last_user_text(messages), messages_hash=_messages_hash(messages),
                         client=request.headers.get("user-agent", "")[:60])
             handed_over = False

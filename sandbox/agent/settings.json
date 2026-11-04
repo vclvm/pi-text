@@ -4,6 +4,7 @@
   "enableInstallTelemetry": false,
   "extensions": ["-builtin:mcp", "-builtin:llama.cpp"],
   "quietStartup": "header",
+  "hideThinkingBlock": true,
   "retry": {
     "enabled": true,
     "maxRetries": 6,
