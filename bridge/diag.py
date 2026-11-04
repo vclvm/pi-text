@@ -69,6 +69,25 @@ def fit(text: str, width: int) -> str:
     return "".join(out) + "…"
 
 
+def wrap(text: str, width: int) -> list[str]:
+    """Split `text` into pieces of at most `width` terminal columns, at spaces where possible."""
+    width = max(20, width - 4)
+    pieces = []
+    while cells(text) > width:
+        cut, used = 0, 0
+        for i, ch in enumerate(text):
+            used += cells(ch)
+            if used > width:
+                break
+            cut = i + 1
+        space = text.rfind(" ", 0, cut)
+        if space > cut // 2:
+            cut = space
+        pieces.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    return pieces + [text]
+
+
 def ago(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds}s" if seconds < 120 else f"{seconds // 60}m{seconds % 60:02d}s"
@@ -102,11 +121,23 @@ class View:
         self.clear_status()
         prefix = self.c("dim", f"{stamp} {rid:6}") + " "
         lines = text.splitlines() or [""]
-        print(prefix + self.c(kind, lines[0]), flush=False)
-        for more in lines[1:]:
-            print(" " * 16 + self.c(kind, more), flush=False)
+        width = self.width()
+        for n, line in enumerate(lines):
+            # Wrap long lines ourselves: a line the terminal wraps confuses the status line redraw.
+            pieces = wrap(line, width - 16) if width else [line]
+            for m, piece in enumerate(pieces):
+                lead = prefix if n == 0 and m == 0 else " " * (16 if m == 0 else 20)
+                print(lead + self.c(kind, piece), flush=False)
         sys.stdout.flush()
         self.draw_status()
+
+    def width(self) -> int:
+        if not self.tty:
+            return 0
+        try:
+            return max(40, os.get_terminal_size().columns)
+        except OSError:
+            return 0
 
     def clear_status(self) -> None:
         if self.tty and self.status:
@@ -114,10 +145,7 @@ class View:
 
     def draw_status(self) -> None:
         if self.tty and self.status:
-            try:
-                width = os.get_terminal_size().columns - 1
-            except OSError:
-                width = 200
+            width = (self.width() or 202) - 2  # one column spare: never let the terminal wrap it
             sys.stdout.write(self.c("dim", fit(self.status, max(20, width))))
             sys.stdout.flush()
 
@@ -291,6 +319,9 @@ class View:
                 text += (f"\n    ⚠ CUT OFF: the reply hit max_tokens{f' ({limit})' if limit else ''}. Thinking and "
                          f"text share this limit: raise maxTokens of the model in config.yaml, or lower its "
                          f"thinking level (Shift+Tab in Pi)")
+            elif e.get("finish") == "thinking_budget":
+                text += ("\n    ⏹ STOPPED by the bridge: only thinking, no answer yet (REASONING_BUDGET); "
+                         "it asks the model again to act")
             elif e.get("finish") is None:
                 text += ("\n    ⚠ CUT OFF: the router ended the stream without a finish_reason (its own timeout "
                          "or a dropped connection)")

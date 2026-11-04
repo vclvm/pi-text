@@ -542,12 +542,12 @@ def test_responses_incomplete_maps_to_length():
 
 
 def test_responses_failed_is_an_error():
-    router = FakeResponses(lambda n: "", fail="model crashed")
+    router = FakeResponses(*[lambda n: ""] * 3, fail="model crashed")
     with make_client(router, url=RESPONSES_URL) as client:
         r = client.post("/v1/chat/completions", json=tools_payload())
     assert r.status_code == 502 and "model crashed" in r.json()["error"]["message"]
 
-    router = FakeResponses(lambda n: "", fail="model crashed", stream=True)
+    router = FakeResponses(*[lambda n: ""] * 3, fail="model crashed", stream=True)
     with make_client(router, url=RESPONSES_URL) as client:
         r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
     assert '"error"' in r.text and "model crashed" in r.text
@@ -1218,4 +1218,74 @@ def test_reply_that_was_only_thinking_until_max_tokens_is_asked_again():
     assert deltas(sse_events(r), "content") == "Writing the report now."
     retry = router.requests[1]["messages"]
     assert retry[-2]["role"] == "assistant" and "plan plan" in retry[-2]["content"]
-    assert "spent the whole output limit on thinking" in retry[-1]["content"]
+    assert "was only thinking" in retry[-1]["content"]
+
+
+def test_endless_thinking_is_stopped_at_the_reasoning_budget():
+    thinking = [{"reasoning_content": "plan more " * 5}] * 10  # 500 chars
+    router = RawStreamRouter(sse_body(*thinking, {"content": "never reached"}),
+                             sse_body({"content": "Acting now."}))
+    with make_client(router, reasoning_budget=120) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+        events = list(client.app.state.bridge.monitor.recent)
+    assert deltas(sse_events(r), "content") == "Acting now."
+    assert len(router.requests) == 2 and "plan more" in router.requests[1]["messages"][-2]["content"]
+    assert [e["finish"] for e in events if e["kind"] == "reply"] == ["thinking_budget", "stop"]
+
+
+def test_reasoning_budget_counts_think_tags_and_spares_answers():
+    long_think = "<think>" + "hmm " * 100 + "</think>"
+    router = RawStreamRouter(sse_body({"content": long_think}), sse_body({"content": "Done."}))
+    with make_client(router, reasoning_budget=100) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert deltas(sse_events(r), "content") == "Done." and len(router.requests) == 2
+
+    router = RawStreamRouter(sse_body({"content": "Answer first. "}, *[{"reasoning_content": "x" * 50}] * 5))
+    with make_client(router, reasoning_budget=100) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert len(router.requests) == 1 and deltas(sse_events(r), "content").strip() == "Answer first."
+
+
+class BrokenStream(httpx.AsyncByteStream):
+    def __init__(self, first: bytes):
+        self.first = first
+
+    async def __aiter__(self):
+        yield self.first
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+def test_connection_broken_mid_thinking_is_requested_again():
+    bodies = [httpx.Response(200, stream=BrokenStream(
+                  sse_body({"reasoning_content": "thinking..."}, finish=None, done=False).encode()),
+                  headers={"content-type": "text/event-stream"}),
+              httpx.Response(200, content=sse_body({"content": "Hello."}).encode(),
+                             headers={"content-type": "text/event-stream"})]
+
+    class Router:
+        stream, requests = True, []
+
+        def __call__(self, request):
+            self.requests.append(request)
+            return bodies.pop(0)
+
+    router = Router()
+    with make_client(router) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert deltas(sse_events(r), "content") == "Hello." and len(router.requests) == 2
+
+
+def test_broken_stream_after_text_gives_pi_a_retryable_message():
+    body = httpx.Response(200, stream=BrokenStream(sse_body({"content": "Half"}, finish=None, done=False).encode()),
+                          headers={"content-type": "text/event-stream"})
+
+    class Router:
+        stream, requests = True, []
+
+        def __call__(self, request):
+            self.requests.append(request)
+            return body
+
+    with make_client(Router()) as client:
+        r = client.post("/v1/chat/completions", json=tools_payload(stream=True))
+    assert "stream was interrupted" in r.text and "[DONE]" not in r.text

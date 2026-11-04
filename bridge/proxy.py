@@ -122,6 +122,8 @@ class Settings:
     upstream_stream_usage: bool = True  # send stream_options.include_usage upstream
     max_retries: int = 2              # corrective re-asks after a malformed tool call
     upstream_resends: int = 2         # replies requested again after a cut-off stream or an empty reply
+    reasoning_budget: int = 0         # chars of thinking without any answer after which the bridge stops
+                                      # the reply and asks again ("act now"); 0 = never
     require_nonce: bool = True        # reject <tool_call> blocks without the session id
     schema_mismatch: str = "retry"    # "retry" (re-ask the model) or "passthrough" (let the client validate)
     ping_interval: float = 15.0       # SSE keep-alive comments while waiting for the model
@@ -172,6 +174,7 @@ class Settings:
             upstream_stream_usage=_env_bool("UPSTREAM_STREAM_USAGE", True),
             max_retries=int(os.environ.get("MAX_RETRIES", "2")),
             upstream_resends=int(os.environ.get("UPSTREAM_RESENDS", "2")),
+            reasoning_budget=int(os.environ.get("REASONING_BUDGET", "24000")),
             require_nonce=_env_bool("REQUIRE_NONCE", True),
             schema_mismatch=os.environ.get("SCHEMA_MISMATCH", "retry"),
             ping_interval=float(os.environ.get("PING_INTERVAL", "15")),
@@ -1279,8 +1282,8 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
 
 THOUGHT_CARRY = 6000  # characters of cut-off thinking given back to the model when asking again
 THOUGHT_CUT_MESSAGE = (
-    "[bridge] Your previous reply spent the whole output limit on thinking and was cut off before any answer "
-    "or tool call, so nothing of it was used. Do not plan everything again. Think briefly, then act now in a "
+    "[bridge] Your previous reply was only thinking, far too long, and was cut off before any answer or tool "
+    "call, so nothing of it was used. The end of that thinking is above. Do not plan everything again. Think briefly, then act now in a "
     "small step: for a long result, create its file with the headings and fill it in section by section; "
     "otherwise call the next tool or answer.")
 
@@ -1626,8 +1629,8 @@ class Bridge:
                     yield event
         except httpx.TimeoutException as e:
             raise BridgeError(504, f"Upstream timeout: {e!r}", "upstream_timeout") from e
-        except httpx.HTTPError as e:
-            raise BridgeError(502, f"Upstream stream error: {e!r}", "upstream_error") from e
+        except httpx.HTTPError as e:  # "stream was interrupted": wording Pi retries on
+            raise BridgeError(502, f"upstream stream was interrupted: {e!r}", "upstream_error") from e
         finally:
             await response.aclose()
 
@@ -1640,20 +1643,26 @@ class Bridge:
         for resend in range(self.s.upstream_resends + 1):
             if resend:
                 response = await self.open(payload, trace=trace)
-            finish, done, useful = None, False, False
-            async for kind, value in self.events(response, sink):
-                if kind == "done":
-                    done = True
-                    continue
-                if kind == "finish":
-                    finish = value
-                elif kind == "native_call" or (kind == "content" and value):
-                    useful = True
-                yield kind, value
+            finish, done, useful, broken = None, False, False, None
+            try:
+                async for kind, value in self.events(response, sink):
+                    if kind == "done":
+                        done = True
+                        continue
+                    if kind == "finish":
+                        finish = value
+                    elif kind == "native_call" or (kind == "content" and value):
+                        useful = True
+                    yield kind, value
+            except BridgeError as e:  # the connection broke, or an error object arrived mid-stream
+                if useful or e.status not in (502, 504):
+                    raise
+                broken = e
             cut = self.s.upstream_stream and finish is None and not done
-            if useful and not cut or finish == "length":
+            if broken is None and (useful and not cut or finish == "length"):
                 return  # a reply, or one that hit max_tokens (a resend would end the same way)
-            problem = "the router ended the stream without finish_reason" if cut else "the reply was empty"
+            problem = (f"the stream broke ({broken.message[:200]})" if broken else
+                       "the router ended the stream without finish_reason" if cut else "the reply was empty")
             if useful:  # text already went to the client: it cannot be taken back
                 raise BridgeError(502, f"upstream stream was interrupted: {problem}", "upstream_error")
             if resend < self.s.upstream_resends:
@@ -1688,10 +1697,16 @@ class Bridge:
                 native: dict[Any, list] = {}  # key -> [name, arguments] of upstream-parsed tool calls
                 finish = None
 
+                think_pieces: list[str] = []  # <think> in the content (reasoning_content goes to `thoughts`)
+                thinking = [0]                # characters of thinking so far, both kinds
+                over_budget = False
+
                 def route(pieces):
                     nonlocal streamed_text
                     for kind, value in pieces:
                         if kind == "reasoning":
+                            think_pieces.append(value)
+                            thinking[0] += len(value)
                             yield "reasoning", value
                         elif attempt == 0:
                             streamed_text = True
@@ -1726,7 +1741,14 @@ class Bridge:
                             yield event
                     elif kind == "reasoning":
                         thoughts.append(value)
+                        thinking[0] += len(value)
                         yield "reasoning", value
+                    budget = self.s.reasoning_budget
+                    if budget and thinking[0] > budget and attempt < self.s.max_retries and not native \
+                            and not scanner.started and scanner.calls is None \
+                            and not (scanner.state == "text" and scanner.buf.strip()):
+                        over_budget = True  # thinking on and on, no answer yet: stop it, ask to act
+                        break
                     elif kind == "native_call":
                         key, name, args = value
                         slot = native.setdefault(key, [None, ""])
@@ -1762,6 +1784,8 @@ class Bridge:
                 tail, calls_raw = scanner.finish()
                 for event in route(tail):
                     yield event
+                if over_budget:
+                    finish = "thinking_budget"
                 info.update(raw="".join(raw), finish_reason=finish)
                 now = time.monotonic()
                 trace.event("reply", finish=finish, chars=sizes["text"], reasoning_chars=sizes["reasoning"],
@@ -1772,17 +1796,20 @@ class Bridge:
                         trace("   model reasoning", "".join(thoughts))
                     trace(f"   model reply (attempt {attempt + 1}, finish={finish}, "
                           f"{time.monotonic() - started:.1f}s)", "".join(raw) or "(empty)")
-                if finish == "length" and thoughts and not native and not _THINK_RE.sub("", "".join(raw)).strip() \
-                        and attempt < self.s.max_retries:
-                    # All of max_tokens went into thinking: Pi would stop with "truncated". Ask again,
-                    # with the end of that thinking (it is not sent back otherwise) and a push to act.
-                    thought = "".join(thoughts)
+                thought = "".join(thoughts) or "".join(think_pieces)
+                if finish in ("length", "thinking_budget") and thought and not native and not scanner.started \
+                        and calls_raw is None and attempt < self.s.max_retries:
+                    # All of max_tokens went into thinking (Pi would stop with "truncated"), or the bridge
+                    # stopped endless thinking (REASONING_BUDGET). Ask again, with the end of that thinking
+                    # (it is not sent back otherwise) and a push to act.
                     info["error"] = (f"the whole reply ({len(thought)} chars) was thinking, cut off at max_tokens "
-                                     "before any answer")
+                                     "before any answer" if finish == "length" else
+                                     f"{len(thought)} chars of thinking without an answer (REASONING_BUDGET "
+                                     f"{self.s.reasoning_budget}): stopped")
                     log.warning("attempt %d: %s; asking again", attempt + 1, info["error"])
                     trace(f"!! {info['error']}; asking again")
                     messages = messages + [
-                        {"role": "assistant", "content": "(My thinking was cut off by the output limit. Its end:)\n…"
+                        {"role": "assistant", "content": "(My thinking was cut off before I answered. Its end:)\n…"
                                                          + thought[-THOUGHT_CARRY:]},
                         {"role": "user", "content": THOUGHT_CUT_MESSAGE},
                     ]
