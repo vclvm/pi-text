@@ -63,6 +63,7 @@ Check:
                  'probe thinking|history --models a,b': what changes thinking, does the model see
                  its earlier thinking
   nettest URL    where a request hangs: from the VM directly, via your Mac's proxy, as the agent
+  logs [svc] [n] the last n lines of a container (proxy, bridge, docker; default proxy 60)
   ps [kill PID]  the processes in Pi's container (how long each runs); kill one that hangs
   diag           live view of every request in a second terminal: rate-limit waits, router answer,
                  first token, writing speed, and where the time went (--history 0, --json)"
@@ -1619,15 +1620,45 @@ nettest)                                    # where a request to URL hangs: VM d
   running
   [[ "${1:-}" == http*://* ]] || die "usage: pibox nettest https://host/path   (e.g. your Maven repository)"
   compose_args; local -a c=($reply); dk; local -a d=($reply)
+  print "The sandbox network (the agent's container → the filtering proxy):"
+  $d $c exec -T proxy python3 -c '
+import os, socket
+ports = set()
+for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try:
+        for line in open(f).read().splitlines()[1:]:
+            parts = line.split()
+            if parts[3] == "0A":
+                ports.add(int(parts[1].rsplit(":", 1)[1], 16))
+    except OSError:
+        pass
+addrs = sorted({i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None)})
+print(f"  proxy container: PROXY_PORT={os.environ.get(\"PROXY_PORT\")}, listening on {sorted(ports)}, addresses {addrs}")
+' || print "  ❌ can't look into the proxy container"
+  $d $c run --rm --no-deps -T --entrypoint bash pi -c 'p=${HTTPS_PROXY#*://}; p=${p%/}; h=${p%%:*}; port=${p##*:}
+    echo "  agent container: HTTPS_PROXY=$HTTPS_PROXY; $h resolves to: $(getent ahostsv4 "$h" | awk "{print \$1}" | sort -u | tr "\n" " ")"
+    grep -w "$h" /etc/hosts | sed "s/^/  \/etc\/hosts: /"
+    for ip in $(getent ahostsv4 "$h" | awk "{print \$1}" | sort -u); do
+      if timeout 5 bash -c "</dev/tcp/$ip/$port" 2>/dev/null; then echo "  ✅ TCP $ip:$port connects"; else echo "  ❌ TCP $ip:$port: no connection within 5 s"; fi
+    done' 2>&1 | grep -v -E "Container .* (Creating|Created)"
+  print
   $d $c exec -T bridge python - "$1" < "$SB/bridge/nettest.py"
   print "\nAs the agent sees it (pi container → sandbox proxy → …; an http:// URL waits for pibox approve):"
-  $d $c run --rm --no-deps -T --entrypoint bash pi -c 'curl -sS -o /dev/null -m 60 -w "  HTTP %{http_code}  connect %{time_connect}s  tls %{time_appconnect}s  total %{time_total}s\n" "$1" || echo "  ❌ curl exit $? (28 = timeout, 56 = refused by the proxy)"' _ "$1"
+  $d $c run --rm --no-deps -T --entrypoint bash pi -c 'p=${HTTPS_PROXY#*://}; p=${p%/}
+    if timeout 5 bash -c "</dev/tcp/${p%%:*}/${p##*:}" 2>/dev/null; then echo "  ✅ the sandbox proxy $p answers"
+    else echo "  ❌ the sandbox proxy $p does not answer: it is not running or restarting (pibox status, pibox logs proxy)"; fi
+    curl -sS -o /dev/null -m 60 -w "  HTTP %{http_code}  connect %{time_connect}s  tls %{time_appconnect}s  total %{time_total}s\n" "$1" || echo "  ❌ curl exit $? (28 = timeout, 56 = refused by the proxy)"' _ "$1"
   print -r -- "
 How to read it: the agent's https:// requests to a repository go through the sandbox proxy as a
 tunnel (egress.tunnel), then out like the bridge lines above (directly or through your Mac's proxy).
   direct ✅, upstream proxy ❌ → add the host to network.upstream_no_proxy
   direct ❌, upstream proxy ✅ → remove it from network.upstream_no_proxy
   both ✅, the agent's line ❌ → the sandbox proxy: pibox log, and is the host in egress.tunnel?"
+  ;;
+
+logs)                                       # the last lines a container printed (default: proxy)
+  vm_running || die "the VM isn't running: pibox up"
+  compose_args; local -a c=($reply); dk; exec $reply $c logs --no-color --tail "${2:-60}" "${1:-proxy}"
   ;;
 
 ps)                                         # what the agent's commands are doing; ps kill PID stops one

@@ -62,7 +62,7 @@ services:
         && exec env HOME=/home/mitmproxy gosu mitmproxy
         mitmproxy --listen-port $${PROXY_PORT:-8080} --set connection_strategy=lazy
         --set stream_large_bodies=1m
-        $${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY}
+        $${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY --mode regular@$$EGRESS_DIRECT_PORT}
         -s /addons/egress_policy.py
     environment:
       EGRESS_ALLOW_ONLY: ${EGRESS_ALLOW_ONLY:-}
@@ -74,6 +74,9 @@ services:
       UPSTREAM_PROXY: ${UPSTREAM_PROXY:-}
       UPSTREAM_NO_PROXY: ${UPSTREAM_NO_PROXY:-}
       PROXY_PORT: ${PROXY_PORT:-8080}
+      # With an upstream proxy: a second listener through which tunnels to upstream_no_proxy hosts
+      # connect directly (upstream mode can't); only loopback connections skip the policy there
+      EGRESS_DIRECT_PORT: "18099"
     volumes:
       - ./addons:/addons:ro
     networks:

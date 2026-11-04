@@ -44,6 +44,12 @@ NO_APPROVAL = _domains("EGRESS_NO_APPROVAL")
 TUNNEL = _domains("EGRESS_TUNNEL")
 NO_PROXY = _domains("UPSTREAM_NO_PROXY")
 UPSTREAM = server_spec.parse(os.environ["UPSTREAM_PROXY"], "http") if os.environ.get("UPSTREAM_PROXY") else None
+# With UPSTREAM_PROXY: a second mitmproxy listener in regular mode on EGRESS_DIRECT_PORT (compose.yaml
+# starts it), through which tunnels to UPSTREAM_NO_PROXY hosts connect directly. It is reached at
+# 127.0.0.2: mitmproxy refuses connections to its own listeners at 127.0.0.1/localhost (loop guard).
+# Only connections from the loopback count as internal (not checked again); anyone else connecting
+# to that port goes through the same policy as on the main port.
+DIRECT = ("http", ("127.0.0.2", int(os.environ["EGRESS_DIRECT_PORT"]))) if os.environ.get("EGRESS_DIRECT_PORT") else None
 LOG_FILE = os.environ.get("EGRESS_LOG") or os.path.expanduser("~/.mitmproxy/egress.log")
 log = logging.getLogger("egress")
 
@@ -99,12 +105,38 @@ def running() -> None:
         ctx.options.update(ignore_hosts=[rf"^(.+\.)?{re.escape(d)}:\d+$" for d in sorted(TUNNEL)])
 
 
-def _route(flow, host: str) -> None:
-    if UPSTREAM:                          # decided per request; nothing is connected yet (lazy)
-        flow.server_conn.via = None if _matches(host, NO_PROXY) else UPSTREAM
+def _internal(flow) -> bool:
+    """A connection to the internal direct listener (see DIRECT): checked already, pass it on."""
+    if not (UPSTREAM and DIRECT):
+        return False
+    sock = flow.client_conn.sockname or ("", 0)
+    peer = str((flow.client_conn.peername or ("",))[0]).removeprefix("::ffff:")
+    return (getattr(flow.client_conn.proxy_mode, "type_name", "") == "regular" and sock[1] == DIRECT[1][1]
+            and peer.startswith("127."))
+
+
+def _route(flow, host: str, tunnel: bool = False) -> None:
+    """Decided per request; nothing is connected yet (lazy). In upstream mode mitmproxy hands every
+    CONNECT to its upstream-proxy layer, which needs a proxy (`via`): a tunnel to an
+    UPSTREAM_NO_PROXY host therefore goes to the internal direct listener, which connects directly."""
+    if not UPSTREAM:
+        return
+    if not _matches(host, NO_PROXY):
+        flow.server_conn.via = UPSTREAM
+    elif tunnel:
+        if not DIRECT:
+            _audit(logging.WARNING, f"{host} is in UPSTREAM_NO_PROXY but EGRESS_DIRECT_PORT is not set: "
+                                    f"the tunnel goes through the upstream proxy")
+            flow.server_conn.via = UPSTREAM
+        else:
+            flow.server_conn.via = DIRECT
+    else:
+        flow.server_conn.via = None
 
 
 def http_connect(flow: http.HTTPFlow) -> None:
+    if _internal(flow):
+        return
     req = flow.request
     if not _matches(req.host, TUNNEL):
         return _block(flow, 403, "encrypted tunnels (CONNECT) are not allowed; request http:// URLs through this proxy")
@@ -113,12 +145,14 @@ def http_connect(flow: http.HTTPFlow) -> None:
     if _matches(req.host, DENY):
         return _block(flow, 403, f"{req.host} is denied")
     flow.metadata["egress"] = "tunnel"
-    _route(flow, req.host)
+    _route(flow, req.host, tunnel=True)
     _tunnels[flow.client_conn.peername] = {"host": req.host, "port": req.port, "asked": time.time(), "connected": 0.0}
     _audit(logging.INFO, f"TUNNEL {req.host}:{req.port}")
 
 
 def requestheaders(flow: http.HTTPFlow) -> None:
+    if _internal(flow):
+        return
     req = flow.request
     if req.method.upper() not in ALLOWED_METHODS:
         return _block(flow, 405, f"method {req.method} not allowed (GET/HEAD only)")
@@ -161,6 +195,8 @@ def _tunnel_of(data):
 def _how(server) -> str:
     """ "directly" or "via the upstream proxy host:port" (server specs are (scheme, (host, port)))."""
     via = server.via[1] if getattr(server, "via", None) else None
+    if DIRECT and via and tuple(via) == DIRECT[1]:
+        return "directly"
     if not via and UPSTREAM and tuple(server.address or ()) == tuple(UPSTREAM[1]):
         via = UPSTREAM[1]
     return f"via the upstream proxy {via[0]}:{via[1]}" if via else "directly"

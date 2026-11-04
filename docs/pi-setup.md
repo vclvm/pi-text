@@ -1062,6 +1062,11 @@ Public default registries (registry.npmjs.org, pypi.org) are not added.
   (`repository.apt_sources`). The public npm and PyPI registries only if your own `.npmrc` / `pip.conf`
   names them. `pibox setup` prints the list. Add a host to `network.upstream_no_proxy` if it is reached
   directly rather than through the proxy on your Mac; `pibox nettest https://host/…` shows which way works.
+- **`upstream_no_proxy` and HTTPS repositories**: with `mac_proxy_port` set, mitmproxy runs in upstream
+  mode, which hands every tunnel to the proxy on your Mac. Tunnels to `upstream_no_proxy` hosts go
+  through a second mitmproxy listener in regular mode instead (`EGRESS_DIRECT_PORT`, reached inside
+  the proxy container at 127.0.0.2), which connects directly. Only loopback connections skip the
+  policy there; anything else connecting to that port is checked like on the main port.
 - **A repository that hangs**: `pibox log` shows each tunnel: `TUNNEL host` (asked), then `TUNNEL CONNECTED`
   (directly, or: connected to the proxy on your Mac, which was asked to CONNECT to the host) or
   `CONNECT FAILED` with the reason, and `TUNNEL CLOSED after Ns`. What happens inside a tunnel can't be
