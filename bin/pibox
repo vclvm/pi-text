@@ -733,8 +733,8 @@ cmd_setup() {
   ca_certs
   apt_sources
   tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
-  repo_hosts "$SB/generated/c"
   image_names
+  repo_hosts "$SB/generated/c"
   client_docker_config
   dns_hosts
   for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
@@ -1356,20 +1356,32 @@ own_daemon() {                              # own_daemon <yours> <copy> <proxy p
 }
 
 repo_hosts() {                              # repo_hosts <dir>: the repositories' hosts into the egress lists
-  # Every repository the generated files point to may be fetched from without asking you and even
-  # if it's in your network, over HTTPS through a tunnel the filter allows to these hosts alone; its
-  # port is allowed. Public default registries are not added.
-  local dir=$1 u h; local -a urls; local -aU hosts ports
+  # Every repository of your configuration may be fetched from without asking you and even if it's
+  # in your network, over HTTPS through a tunnel the filter allows to these hosts alone; its port is
+  # allowed. That is: Maven (settings.xml: repositories, mirrors, plugin repositories; Gradle and the
+  # Maven wrapper use the same), npm and pip (registries, index URLs), Docker (registry mirrors,
+  # insecure registries, logins, the registry of the images), apt (repository.apt_sources). The
+  # public npm and PyPI registries only when your own .npmrc / pip.conf names them.
+  local dir=$1 u h v; local -a urls skip; local -aU hosts ports
   urls=(${(f)"$(sed -nE 's#.*<url>[[:space:]]*([^<[:space:]]*)[[:space:]]*</url>.*#\1#p' "$dir/settings.xml")"}
         ${(f)"$(sed -nE 's#^[[:space:]]*(@[^:=[:space:]]+:)?registry[[:space:]]*=[[:space:]]*##p' "$dir/npmrc")"}
         ${(f)"$(grep -v '^proxy[[:space:]]*=' "$dir/pip.conf" | grep -oE 'https?://[^[:space:]]+')"}
         ${(f)"$(yq -p json -o yaml '(.["registry-mirrors"] // [])[], (.["insecure-registries"] // [])[]' "$dir/daemon.json")"}
+        ${(f)"$(sed -nE 's#^URIs:[[:space:]]*##p' "$SB/generated/apt/debian.sources" 2>/dev/null | tr ' ' '\n')"}
         $DOCKER_LOGIN_REGS)
+  for v in BASE_IMAGE NODE_IMAGE PYTHON_IMAGE MITMPROXY_IMAGE JDK17_IMAGE JDK21_IMAGE JDK25_IMAGE MAVEN_IMAGE \
+           GRADLE_IMAGE DOCKER_CLI_IMAGE DIND_IMAGE; do           # the registry an image name starts with
+    u=${(P)v}; u=${u%%/*}
+    [[ "${(P)v}" == */* && "$u" == *[.:]* && "$u" != docker.io ]] && urls+=("https://$u/")
+  done
+  [[ -n "$NPMRC_FILE" ]] || skip+=(registry.npmjs.org)
+  [[ -n "$PIP_CONF_FILE" ]] || skip+=(pypi.org files.pythonhosted.org)
   for u in $urls; do
     [[ -n "$u" && "$u" != *'$'* ]] || continue
     h=${${${u#*://}%%/*}##*@}
-    [[ "${h%%:*}" == (|registry.npmjs.org|pypi.org|localhost|127.0.0.1|proxy|bridge|docker|\[*) ]] && continue
+    [[ "${h%%:*}" == (|localhost|127.0.0.1|proxy|bridge|docker|\[*) || ${skip[(Ie)${h%%:*}]} -gt 0 ]] && continue
     hosts+=("${h%%:*}")
+    [[ "${h%%:*}" == pypi.org ]] && hosts+=(files.pythonhosted.org)   # pip downloads the files from there
     [[ "$h" == *:<-> ]] && ports+=("${h##*:}")
   done
   (( $#hosts )) || return 0

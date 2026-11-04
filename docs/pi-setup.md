@@ -1054,9 +1054,19 @@ Public default registries (registry.npmjs.org, pypi.org) are not added.
 - **npm, pnpm, yarn**: `.npmrc` for npm; corepack downloads pnpm and yarn from the registry of your `.npmrc`.
 - **pip**: `pip.conf`, inside virtual environments too.
 - **Credentials**: whatever your files contain ends up in the copies, so the agent can read them. Use tokens that can only read.
-- **HTTPS repositories work**: the filter allows tunnels to your repository hosts alone (§4.6). Their hosts
-  get into the egress lists by themselves (above); add a host to `network.upstream_no_proxy` if it
-  is reached directly rather than through the proxy on your Mac.
+- **HTTPS repositories work, without approval**: the filter allows tunnels to your repository hosts alone (§4.6).
+  `pibox setup` collects every repository of your configuration into the egress lists (tunnel, no
+  approval, private addresses allowed, their ports): Maven (`settings.xml`: repositories, plugin
+  repositories, mirrors; Gradle and the Maven wrapper use the same), npm and pip (registries, index
+  URLs), Docker (registry mirrors, insecure registries, logins, the registry of `images`), apt
+  (`repository.apt_sources`). The public npm and PyPI registries only if your own `.npmrc` / `pip.conf`
+  names them. `pibox setup` prints the list. Add a host to `network.upstream_no_proxy` if it is reached
+  directly rather than through the proxy on your Mac; `pibox nettest https://host/…` shows which way works.
+- **A repository that hangs**: `pibox log` shows each tunnel: `TUNNEL host` (asked), then `TUNNEL CONNECTED
+  … directly / via the upstream proxy` or `CONNECT FAILED`, and `TUNNEL CLOSED after Ns`. A `TUNNEL`
+  without `CONNECTED` is a connection that never got through (VPN, route, the proxy on your Mac).
+  Maven gives up after 20 s without a connection and 120 s without data (`MAVEN_ARGS`), and a bash
+  command of the agent after `extensions.bash_timeout`.
 - **Deploy, publish, push** (POST/PUT) are refused by the proxy: the agent builds and tests, you publish.
 
 ### 8.10 The agent's Docker engine
