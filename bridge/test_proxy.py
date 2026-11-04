@@ -1191,6 +1191,7 @@ LS_TOOLS = [{"name": "ls", "parameters": {"type": "object", "properties": {
      ("ls", {"path": "src", "limit": 5})),
     ('bash {"command": "ls -la"}', ("bash", {"command": "ls -la"})),
     ("bash\ncommand=git status", ("bash", {"command": "git status"})),
+    ("ls \npath \nsrc/main</arg_value>\nlimit\n5</arg_value>", ("ls", {"path": "src/main", "limit": 5})),
 ])
 def test_tool_calls_in_other_styles_are_accepted(body, expected):
     nonce = "0123456789abcdef"
@@ -1413,3 +1414,17 @@ def test_keep_thinking_settings_from_env(monkeypatch):
     monkeypatch.setenv("KEEP_THINKING", "nope")
     with pytest.raises(ValueError, match="KEEP_THINKING"):
         proxy.Settings.from_env()
+
+
+def test_call_summary_shows_the_start_of_a_long_command():
+    command = "find ~ -name x.jar 2>/dev/null | head -5; mvn -q help:evaluate -Dexpression=settings.localRepository"
+    call = {"function": {"name": "bash", "arguments": json.dumps({"command": command})}}
+    summary = proxy._call_summary(call, 40)
+    assert summary.startswith("bash: find ~ -name x.jar") and summary.endswith("…") and len(summary) == 46
+
+
+def test_arguments_split_between_name_and_arguments_are_joined():
+    nonce = "0123456789abcdef"
+    body = json.dumps({"name": "ls \npath \nsrc</arg_value>", "arguments": {"limit": 5}})
+    calls, _ = proxy.parse_tool_calls(f'<pi_tool_call id="{nonce}">\n{body}\n</pi_tool_call>', LS_TOOLS, nonce)
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "src", "limit": 5}

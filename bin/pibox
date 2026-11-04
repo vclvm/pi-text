@@ -62,6 +62,7 @@ Check:
                  request to each), rate-limit headers; 'probe limits': what the bridge knows now;
                  'probe thinking|history --models a,b': what changes thinking, does the model see
                  its earlier thinking
+  ps [kill PID]  the processes in Pi's container (how long each runs); kill one that hangs
   diag           live view of every request in a second terminal: rate-limit waits, router answer,
                  first token, writing speed, and where the time went (--history 0, --json)"
 }
@@ -391,6 +392,7 @@ typeset -A SETTING=(
   egress.allow_only EGRESS_ALLOW_ONLY            egress.deny EGRESS_DENY
   egress.ports EGRESS_PORTS
   extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
+  extensions.bash_timeout PI_BASH_TIMEOUT
   extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
   repository.apt_sources APT_SOURCES_FILE
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
@@ -430,7 +432,7 @@ load_config() {                             # defaults, then config.yaml on top
   CA_CERTS=""
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
-  PI_BASH_APPROVAL=risky PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
+  PI_BASH_APPROVAL=risky PI_BASH_TIMEOUT=600 PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
   APT_SOURCES_FILE=""
   # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
   # Maven wrapper's repository and login.
@@ -578,6 +580,7 @@ typeset -A CHECK=(
   egress.allow_private hosts            egress.no_approval hosts              egress.allow_only hosts
   egress.deny hosts                     egress.ports ports
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
+  extensions.bash_timeout int
   extensions.searxng url                extensions.fetch_max_chars int
   repository.apt_sources file           repository.maven_settings file        repository.npmrc file
   repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
@@ -1597,6 +1600,27 @@ shell)                                      # bash in the agent's container, wit
   fresh; running
   local h; h=$(here)
   compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" --entrypoint bash pi "$@"
+  ;;
+
+ps)                                         # what the agent's commands are doing; ps kill PID stops one
+  vm_running || die "the VM isn't running: pibox up"
+  dk; local -a d=($reply) ids; local id
+  ids=(${(f)"$($d ps -q --filter label=com.docker.compose.service=pi 2>/dev/null)"})
+  (( $#ids )) || die "no Pi is running (pibox run)"
+  if [[ "${1:-}" == kill ]]; then
+    [[ "${2:-}" == <-> ]] || die "usage: pibox ps kill PID   (a PID from pibox ps)"
+    for id in $ids; do
+      if $d exec "$id" kill "$2" 2>/dev/null; then
+        print "stopped $2: Pi's tool gets the output so far and the model goes on"; exit 0
+      fi
+    done
+    die "no process $2 in the Pi container(s)"
+  fi
+  for id in $ids; do
+    print -r -- "== $($d inspect -f '{{.Name}}' "$id")"
+    $d exec "$id" ps -eo pid,etime,pcpu,rss,args --forest | cut -c1-${COLUMNS:-200}
+  done
+  print -r -- "A command that hangs: pibox ps kill PID (Esc in Pi would abort the whole turn instead)"
   ;;
 
 approve)                                    # the approval console (detach: Ctrl-P Ctrl-Q)

@@ -421,7 +421,8 @@ def _call_summary(call: dict, size: int = 90) -> str:
         text = str(main) if main is not None else json.dumps(args, ensure_ascii=False)
     else:
         text = str(args)
-    return f"{name}: {_tail(text[:size * 2], size) if len(text) > size else ' '.join(text.split())}"
+    text = " ".join(text.split())  # the start: what is run (the end of a long command is its details)
+    return f"{name}: {text if len(text) <= size else text[:size - 1] + '…'}"
 
 
 def _messages_hash(messages: list) -> str:
@@ -1281,6 +1282,22 @@ def _typed(value: str, schema: dict) -> Any:
     return v
 
 
+def _value_pairs(rest: str, props: dict) -> dict | None:
+    """GLM pairs whose other tags the router dropped (special tokens): "key\nvalue</arg_value>" each."""
+    *segments, after = rest.split("</arg_value>")
+    if not segments or after.strip():
+        return None
+    args = {}
+    for segment in segments:
+        key, newline, value = segment.strip(" \n").partition("\n")
+        key = key.strip()
+        if not newline or not re.fullmatch(r"[A-Za-z_]\w*", key) or key in args or key not in props:
+            return None
+        prop = props[key] or {}
+        args[key] = value.strip("\n") if prop.get("type") == "string" else _typed(value.strip(), prop)
+    return args
+
+
 def lenient_call(body: str, by_name: dict) -> dict | None:
     """A tool call written in another model-native style instead of the JSON body, accepted when it is
     unambiguous: the tool name first, then a JSON object, GLM-style <arg_key>/<arg_value> pairs, or
@@ -1301,6 +1318,8 @@ def lenient_call(body: str, by_name: dict) -> dict | None:
     if pairs and not _ARG_PAIR.sub("", rest).strip():
         args = {k: v.strip("\n") if (props.get(k) or {}).get("type") == "string" else _typed(v, props.get(k) or {})
                 for k, v in pairs}
+    elif "<arg_key>" not in rest and _value_pairs(rest, props):
+        args = _value_pairs(rest, props)
     else:
         args = {}
         for line in _ARG_TAGS.sub("", rest).splitlines():
@@ -1372,8 +1391,11 @@ def parse_tool_calls(raw: str, tools: list[dict], nonce: str, *, require_nonce: 
         j = _skip_ws_fence(raw, end)
         pos = scan = j + len(close_tag) if raw.startswith(close_tag, j) else j
         if isinstance(obj, dict) and isinstance(obj.get("name"), str) and obj["name"] not in by_name \
-                and not obj.get("arguments"):  # {"name": "ls\n path: ..."}: the arguments ended up in the name
-            obj = lenient_call(obj["name"], by_name) or obj
+                and isinstance(obj.get("arguments") or {}, dict):
+            # {"name": "ls\n path: ..."}: (some of) the arguments ended up in the name
+            fixed = lenient_call(obj["name"], by_name)
+            if fixed:
+                obj = {**fixed, "arguments": {**fixed["arguments"], **(obj.get("arguments") or {})}}
         calls.append(_make_call(obj, by_name, schema_mismatch))
     text = "".join(stray)
     fake = _FAKE_RESULT_RE.search(text)

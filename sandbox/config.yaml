@@ -158,10 +158,19 @@ egress:
 # Pi extensions of the sandbox (docs/pi-setup.md §9).
 extensions:
   # Which bash commands of the agent need your OK in Pi:
-  #   risky  network tools, rm -rf, sudo/chmod, git push, paths in your home or /etc…
+  #   risky  only commands that go to the network (curl, ssh, git push/fetch/clone…), delete
+  #          recursively or discard changes (rm -r, find -delete, git reset --hard/clean…), change
+  #          rights or the system (sudo, chown…), run text as code (| sh, eval), touch credentials
+  #          (~/.m2/settings.xml, printenv…), publish (npm publish, mvn deploy) or write outside
+  #          your folders and /tmp. The command is parsed: reading (git log, grep, find, cat…)
+  #          never asks, whatever its arguments say
   #   all    every command
   #   off    none (the container's limits still apply)
   bash_approval: risky
+  # Seconds after which a bash command of the agent is stopped, unless the model gives it its own
+  # timeout: a command waiting for a server that never answers can't hold the agent for ever.
+  # The model sees that it timed out and can run it again with a longer timeout. 0 = none
+  bash_timeout: 600
   # The web tools send https:// pages to the proxy as plain http:// requests, so the proxy can see
   # and check them (it refuses encrypted tunnels). false = they use tunnels and get refused.
   web_plain_http: true

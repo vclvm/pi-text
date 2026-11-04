@@ -279,6 +279,8 @@ class View:
             self.request_model[rid] = model
             text = f"  → sent to the router: model={model} ~{kchars(e.get('tokens'))} tokens (+{e['elapsed']:.1f}s)"
             params = params_text(e.get("params") or {})
+            if e.get("reasoning_effort") and "reasoning_effort" not in (e.get("params") or {}):
+                params += f" · reasoning_effort={e['reasoning_effort']} from Pi (its thinking level wins)"
             if "params" in e and self.shown_params.get(model) != params:  # only when they change
                 self.shown_params[model] = params
                 text += f"\n    MODEL_PARAMS: {params}"

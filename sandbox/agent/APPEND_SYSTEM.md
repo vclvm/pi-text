@@ -8,6 +8,10 @@ reply that reaches it is cut off mid-sentence and lost. So:
 - Locate first, then read: find the lines with `grep`/`find`, then `read` only that part with
   `offset`/`limit`. Read a whole file only when it is small or you need all of it.
 - Keep command output short: filter it (`| head`, `| tail -n 50`, `grep`, quiet flags).
+- A command must not hang: search inside the project, never `find ~` or `find /`. bash stops a
+  command after 10 minutes unless you pass its `timeout` (seconds): give a long build or test run
+  a larger one, and a quick check a small one. Run Maven with `-B`, and `-o` (offline) when
+  everything it needs is already downloaded.
 - Don't re-read a file you have just read or written unless it changed since.
 - Change files with `edit`; use `write` only for new files or complete rewrites.
 - Think briefly, then act. Don't narrate long plans or findings in the chat.

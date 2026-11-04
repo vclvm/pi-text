@@ -148,10 +148,16 @@ services:
       MVNW_REPOURL: ${MVNW_REPOURL:-}        # the Maven wrapper downloads Maven from Central's mirror
       MVNW_USERNAME: ${MVNW_USERNAME:-}      # in your settings.xml, with the login of its <server>
       MVNW_PASSWORD: ${MVNW_PASSWORD:-}
+      # Maven gives up on a repository that doesn't answer: 20 s to connect, 120 s without data
+      # (its defaults: 10 s, 30 min). Maven 3.9 (resolver 1.x) and Maven 4 (resolver 2.x) names.
+      MAVEN_ARGS: >-
+        -Daether.connector.connectTimeout=20000 -Daether.connector.requestTimeout=120000
+        -Daether.transport.http.connectTimeout=20000 -Daether.transport.http.requestTimeout=120000
       # The agent's Docker engine (Docker Hub images come through the registry-mirrors of your daemon.json):
       DOCKER_HOST: ${PI_DOCKER_HOST:-}
       # Pi extensions (docs/pi-setup.md §9):
       PI_BASH_APPROVAL: ${PI_BASH_APPROVAL:-risky}
+      PI_BASH_TIMEOUT: ${PI_BASH_TIMEOUT:-600}     # seconds; a command the model gives no timeout
       PI_WEB_PLAIN_HTTP: ${PI_WEB_PLAIN_HTTP:-1}   # web.ts: send https:// pages as plain http:// requests
       WEB_SEARCH_SEARXNG: ${WEB_SEARCH_SEARXNG:-}
       WEB_FETCH_MAX_CHARS: ${WEB_FETCH_MAX_CHARS:-20000}

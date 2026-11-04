@@ -1128,17 +1128,31 @@ Without a UI (`pi -p`), dialogs are impossible, so both extensions **refuse** an
   folders in `PI_SANDBOX_ROOTS` (your projects and the vault; `pibox` and `compose.yaml` set it, from `folders`).
 - **Protected files:** `write` and `edit` may not touch `.git/hooks`, `.git/config` or `.obsidian`
   (§6.2). The model gets a clear reason instead of a cryptic error.
-- **Bash approval:** `extensions.bash_approval: risky` (the default; `PI_BASH_APPROVAL` in the agent's environment) asks before commands that match risky patterns:
-  - network tools;
-  - deletion, privilege and permission changes;
-  - macOS automation (`osascript`, `security`, `launchctl`);
-  - pipes into a shell;
-  - your home and system paths, and the protected files.
+- **Bash approval:** `extensions.bash_approval: risky` (the default; `PI_BASH_APPROVAL` in the agent's environment)
+  parses the command (pipes, `&&`, `$(…)`, `sh -c "…"`, `xargs`, `find -exec`, redirections) and asks
+  only when one of its commands:
+  - goes to the network (`curl`, `ssh`, `rsync`, `git push/fetch/pull/clone`, `git remote add`…);
+  - deletes recursively or discards work (`rm -r`, `find -delete`, `git reset --hard`, `git clean`,
+    `git checkout -- …`, `git branch -D`…);
+  - changes rights or the system (`sudo`, `chown`, setuid `chmod`, `launchctl`, `crontab`…);
+  - runs text as code (`… | sh`, `eval`, a script outside your folders);
+  - touches credentials (`~/.m2/settings.xml`, `.npmrc`, `printenv`/`env`, which show the Maven
+    wrapper's password) or the protected files;
+  - publishes (`npm publish`, `mvn deploy`, `docker push`);
+  - writes outside your folders and `/tmp` (a redirection, `cp`, `mv`, `tee`, `sed -i`…).
 
-  `all` asks before **every** command, and `off` keeps only the path guard.
+  The dialog says which of these it is. Reading asks never, whatever the arguments contain:
+  `grep -rn security src`, `find ~/.m2/repository …`, `git log -S curl` run without a question.
+  `all` asks before **every** command, and `off` keeps only the path guard. The rules are tested
+  in `sandbox/test/sandbox-guard.test.ts` (`node --experimental-strip-types --test sandbox/test/*.test.ts`).
+- **Bash timeout:** `extensions.bash_timeout: 600` (`PI_BASH_TIMEOUT`): a command the model gives no
+  `timeout` of its own is stopped after that many seconds, so a server that never answers (Maven
+  waiting for a repository behind a VPN) can't hold the agent for ever. The model sees the timeout and
+  can run it again with a longer one. Maven itself gives up on a silent repository after 120 s
+  (`MAVEN_ARGS` in `compose.yaml`; its own default is 30 minutes).
 - "Allow this exact command for the session" remembers the command string, which is handy for `npm test`.
 
-The regex screening can be bypassed by an agent that tries (`c''url`, or a script written to a file and then run).
+The screening can be bypassed by an agent that tries (a script written to a file and then run, a variable as the command name).
 It's an early warning that shows intent, while the OS layer does the enforcing.
 
 ### 9.3 `sandbox/extensions/web.ts`: read-only web tools with approval
@@ -1184,6 +1198,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `verify` | Try everything the agent must not be able to do (§6.7) |
 | `review` | After a session: git hooks, risky git config, recent `.obsidian` changes (§7.3) |
 | `probe [what]` | Ask your router what it really offers: endpoints (including `/openapi.json`), which models answer a tiny request, its rate-limit headers; `probe limits` shows the bridge's current rate-limit state and what it sends to each model; `probe thinking|history --models a,b`: which field changes a model's thinking, whether it sees its earlier thinking ([bridge/README.md](../bridge/README.md#probing-the-router-probepy)) |
+| `ps [kill PID]` | The processes in Pi's container with their running time: what a long "Pi is running bash …" really does. `pibox ps kill PID` stops one command; Pi's tool gets its output so far and the model goes on (Esc would abort the whole turn) |
 | `diag` | Live view of every request in a second terminal: on start the per-model request fields (`MODEL_PARAMS`), then rate-limit waits and tokens left, when the router answered, when the first token came, writing speed, and which phase took the time ([bridge/README.md](../bridge/README.md#watching-requests-live-diagpy)) |
 
 How it works:
@@ -1259,6 +1274,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: config.yaml changed since the last setup` | Run `pibox setup`, then `pibox up` |
 | `pibox: the sandbox isn't running` | `pibox up` |
 | `the model you requested is unsupported` for a model that should exist | `pibox probe models` lists the models that really answer; use one, or set `MODEL_FALLBACKS` in `bridge` |
+| Pi shows "Working…" for many minutes, `pibox diag` says "Pi is running bash: …" | A command of the agent hangs (a `find ~`, Maven resolving something over the network, a request waiting in `pibox approve`). `pibox ps` shows it and how long it runs, `pibox ps kill PID` stops it; `pibox log` shows web requests waiting for approval |
 | An answer takes minutes and it is unclear why | Run `pibox diag` in a second terminal and repeat: each request ends with a split into rate limit / router headers / first token / writing |
 | Pi stops on `429` / "rate limit" | The bridge waits out 429s itself until the reset the router names (up to an hour, `RATE_LIMIT_MAX_RESET`). `pibox probe limits` and the bridge log (`!! upstream 429`) show what the router answered ([bridge/README.md](../bridge/README.md#rate-limits-and-refused-models)) |
 | Pi can't reach the model from a VM or container | Test the bridge from inside, `pibox shell -c 'curl -s http://bridge:<network.bridge_port>/v1/models'`; check its log (§11) and `bridge` in `pibox config` |
