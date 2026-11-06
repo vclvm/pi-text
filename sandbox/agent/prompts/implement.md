@@ -3,6 +3,8 @@ description: Implement the current task, with tests and a report in the project'
 argument-hint: "[extra instructions]"
 ---
 Implement the current task from `<project_notes>`. Extra instructions from the user: ${@:-none}.
+The current task decides what to work on and how; where it says anything different from the
+defaults below, the task wins. This command only sets the kind of work and the result expected.
 If there is a design for it in `designs/` of the notes folder, follow the latest one.
 
 1. Read the code the task touches, starting from the most relevant files.

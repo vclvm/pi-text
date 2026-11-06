@@ -4,6 +4,8 @@ argument-hint: "[what to check]"
 ---
 Test the implementation of the current task from `<project_notes>`. What to check, from the
 user: ${@:-the task's acceptance criteria}.
+The current task decides what to work on and how; where it says anything different from the
+defaults below, the task wins. This command only sets the kind of work and the result expected.
 
 Don't change the code under test. Run the tests that cover the change first, then a wider run if
 it is cheap. If a test fails, find the cause from the evidence (output, code), not by guessing.

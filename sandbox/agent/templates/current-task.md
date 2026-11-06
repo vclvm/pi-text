@@ -1,8 +1,9 @@
 # Task
 <!-- Lines inside these comment marks are hints for you; Pi doesn't send them to the model.
      This file goes with every request, so the model keeps it in view however long it works.
-     Describe the problem and the result you want, not the step: the step is the command you give
-     in Pi (/design, /implement, /review, /test, /investigate) or your message.
+     Describe the problem, the result you want and what the work covers ("the changes of this
+     branch against master"). The command you give in Pi (/design, /implement, /review, /test,
+     /investigate) only sets the kind of work and what it delivers: it follows this file.
      Concrete beats long: names of classes, endpoints, an example to follow. -->
 <!-- One or two sentences. A change: what must work afterwards. A bug: what happens and what should.
      A question: what you want to understand ("how does X decide Y, and why is it built so"). -->

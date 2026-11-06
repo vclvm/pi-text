@@ -51,6 +51,9 @@ and never change `.gitignore` to hide them.
 
 - The project's rules (`AGENTS.md`) and the current task (`current-task.md`) of that folder are in
   `<project_notes>` too. When the user says "the task" or "the current task", they mean this one.
+- No command (`/review`, `/design`, `/implement`, `/test`, `/investigate`) replaces the current task.
+  The task says what to work on and how; the command says what kind of work it is and what to
+  deliver. Where the two differ on what to do, follow the task. Read it first, every time.
 - Project memory and the progress of the task are in `<project_notes>` as well, when there are any:
   use them before exploring, and check against the code what your work depends on. They are written
   automatically after each session, so you don't update them, and you can't: `memory.md`,

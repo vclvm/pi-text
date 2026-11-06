@@ -1,9 +1,16 @@
 ---
-description: Review the current changes against the task, report in the project's notes
+description: Review what the current task names, or else the current changes, report in the project's notes
 argument-hint: "[focus]"
 ---
-Review the current changes (`git status`, `git diff`, new files) against the current task from
-`<project_notes>`. Extra focus from the user: ${@:-none}.
+Do the review the current task from `<project_notes>` asks for. Extra focus from the user: ${@:-none}.
+The current task decides what to work on and how; where it says anything different from the
+defaults below, the task wins. This command only sets the kind of work and the result expected.
+
+What to review is what the task names: a branch against another, a range of commits, a module, a
+set of files. Find out exactly that with git, and read it whole. Only if the task names nothing:
+all the work of the current branch against the repository's default branch (from their merge base),
+plus uncommitted changes and new files; on the default branch itself, the uncommitted changes.
+Say in the report what you compared.
 
 Don't change any file of the repository. Look for: correctness, the task's acceptance criteria,
 fit with the architecture and its layers, error handling and validation, API and persistence

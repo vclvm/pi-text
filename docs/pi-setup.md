@@ -632,7 +632,11 @@ pibox run
 - **Commands for the steps**, prompt templates in [sandbox/agent/prompts](../sandbox/agent/prompts):
   `/design [focus]`, `/implement [instructions]`, `/review [focus]`, `/test [what]` on the current
   task, and `/investigate [question]` for a bug's cause or "how and why does this work" (without
-  a question: the current task). Each writes one report into `designs/`, `implemented/`, `reviews/`,
+  a question: the current task). No command replaces the task: the task says what to work on and
+  how, the command says what kind of work it is and what it delivers, and its defaults count only
+  where the task says nothing. So a task "review this branch against master" is what `/review`
+  reviews; a task that names nothing gets the branch's work against the default branch plus
+  uncommitted changes. Each writes one report into `designs/`, `implemented/`, `reviews/`,
   `tests/` or `investigations/` of the notes folder (named `<date>_<time>_<2-3 words>_<kind>.md`)
   and answers with a short verdict and the file's path. `/design`, `/review` and `/investigate`
   don't change the code; `/investigate` cites `file:line`, outputs and commits for every claim and
