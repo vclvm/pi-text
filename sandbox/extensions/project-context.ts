@@ -90,6 +90,28 @@ function asker(ctx: ExtensionContext, cancel: AbortSignal): Ask | null {
 
 const pause = (ms: number) => new Promise<void>((done) => { setTimeout(done, ms).unref(); });
 
+/** Resolves on the second Ctrl+C, or at once when the system stops us. In the container Pi is PID 1,
+ *  which gets no SIGINT at all unless it listens: without this, Ctrl+C does nothing here. */
+function userSkips(): { skipped: Promise<void>; forget: () => void } {
+  let presses = 0, go = () => {};
+  const skipped = new Promise<void>((done) => { go = done; });
+  const interrupt = () => {
+    if (++presses >= 2) go();
+    else process.stderr.write("pi: Ctrl+C once more to quit without it\n");
+  };
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", go);
+  process.on("SIGHUP", go);
+  return {
+    skipped,
+    forget() {
+      process.removeListener("SIGINT", interrupt);
+      process.removeListener("SIGTERM", go);
+      process.removeListener("SIGHUP", go);
+    },
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   if (!NOTES) return;
   const remember = MEMORY_CHARS > 0;
@@ -191,9 +213,11 @@ export default function (pi: ExtensionAPI) {
     prompts.finish(false);                                       // quit in the middle of a run
     flush(ctx.cwd);
     if (mine && event.reason === "quit" && unmerged(NOTES, mine)) {
-      process.stderr.write("pi: updating the project memory…\n");
+      process.stderr.write("pi: updating the project memory… (Ctrl+C twice to quit without it)\n");
+      const { skipped, forget } = userSkips();
       merge(ctx);
-      await Promise.race([merging, pause(QUIT_WAIT_MS)]);
+      await Promise.race([merging, pause(QUIT_WAIT_MS), skipped]);
+      forget();
     }
     stop.abort();
     await Promise.race([merging, pause(LET_GO_MS)]);

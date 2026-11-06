@@ -592,7 +592,8 @@ pibox run
 - **The project is remembered between sessions, without anyone writing it down.** A new session
   in a known project starts with what earlier ones found out, instead of exploring it again.
   Each session leaves a record, and one request turns it into memory: after two minutes without
-  work and when you quit (quitting waits for it up to 60 seconds). What that didn't cover, say after
+  work and when you quit (quitting waits for it up to 60 seconds; Ctrl+C twice quits at once, and
+  the next start does the update). What that didn't cover, say after
   a killed container, the next session does at its start, and your first message waits for it up
   to 30 seconds, then goes on with the memory as it was. A session that only talked, with no tool
   used, leaves no request and no memory.

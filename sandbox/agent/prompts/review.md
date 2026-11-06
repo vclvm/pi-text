@@ -7,7 +7,7 @@ The current task decides what to work on and how; where it says anything differe
 defaults below, the task wins. This command only sets the kind of work and the result expected.
 
 What to review is what the task names: a branch against another, a range of commits, a module, a
-set of files. Find out exactly that with git, and read it whole. Only if the task names nothing:
+set of files. Only if the task names nothing:
 all the work of the current branch against the repository's default branch (from their merge base),
 plus uncommitted changes and new files; on the default branch itself, the uncommitted changes.
 Say in the report what you compared.
