@@ -166,8 +166,9 @@ egress:
 # Pi extensions of the sandbox (docs/pi-setup.md §9).
 extensions:
   # Which bash commands of the agent need your OK in Pi:
-  #   risky  only commands that go to the network (curl, ssh, git push/fetch/clone…), delete
-  #          recursively or discard changes (rm -r, find -delete, git reset --hard/clean…), change
+  #   risky  only commands that go to the network (curl, ssh, git push/clone…; not git fetch or
+  #          pull), delete what git can't bring back or discard changes (rm -r of uncommitted work,
+  #          git reset --hard/clean…; not rm -r of committed files or build output), change
   #          rights or the system (sudo, chown…), run text as code (| sh, eval), touch credentials
   #          (~/.m2/settings.xml, printenv…), publish (npm publish, mvn deploy) or write outside
   #          your folders and /tmp. The command is parsed: reading (git log, grep, find, cat…)

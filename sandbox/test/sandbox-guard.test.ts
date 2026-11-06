@@ -1,7 +1,10 @@
 // node --experimental-strip-types --test sandbox/test/*.test.ts   (Node >= 22.6; no dependencies)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { riskReasons, parseCommand, promptNote } from "../extensions/sandbox-guard.ts";
 
 const ROOT = "/work/projects";
@@ -40,7 +43,8 @@ test("risky commands ask, with a reason", () => {
     ["curl https://example.com", /network/],
     ["c''url https://example.com", /network/],
     ["git push origin main", /git push/],
-    ["git -C ../x fetch", /git fetch/],
+    ["git -C ../x push", /git push/],
+    ["git clone https://x/y.git", /git clone/],
     ["git remote add up git@x:y.git", /git remote/],
     ["git config user.name bot", /git config/],
     ["git reset --hard HEAD~1", /reset --hard/],
@@ -98,4 +102,65 @@ test("the notes that go into the system prompt: reading is free, writing asks", 
   }
   assert.equal(promptNote(`${ROOT}/api/memory.md`, notes), false);          // the project's own file
   assert.deepEqual(notesRisk(`echo x > ${ROOT}/api/AGENTS.md`), []);
+});
+
+test("the project's notes folder is open, however the path is written", () => {
+  const notes = "/work/notes", project = `${notes}/Projects/api`, cwd = `${ROOT}/api`;
+  const notesRisk = (command: string) => riskReasons(command, [ROOT, notes], cwd, notes);
+  process.env.PI_PROJECT_NOTES = project;
+  try {
+    for (const command of [
+      `cat > "${project}/reviews/$(date +%Y-%m-%d_%H-%M-%S)_login_review.md" <<'EOF'\nx\nEOF`,
+      "cat > \"$PI_PROJECT_NOTES/notes/plan.md\" <<'EOF'\nx\nEOF",
+      "mkdir -p \"${PI_PROJECT_NOTES}/notes\"",
+      "cd \"$PI_PROJECT_NOTES\" && echo x > notes/a.md",
+      `F=${project}/notes/a.md; echo x > "$F"`,
+      `ts=$(date +%F); echo x > ${project}/notes/$ts.md`,
+      `rm -rf ${project}/notes/old`,
+      "rm -rf \"$PI_PROJECT_NOTES/history\"",
+      `find ${project}/context -name '*.log' -delete`,
+    ]) assert.deepEqual(notesRisk(command), [], command);
+    // the variable doesn't hide the files that go into the prompt
+    assert.match(notesRisk("echo x >> \"$PI_PROJECT_NOTES/memory.md\"").join(), /system prompt/);
+    assert.match(notesRisk("cd \"$PI_PROJECT_NOTES\" && echo x >> AGENTS.md").join(), /system prompt/);
+    assert.match(notesRisk("rm -rf \"$PI_PROJECT_NOTES/memory\"").join(), /system prompt/);
+    assert.match(notesRisk("rm -rf \"$PI_PROJECT_NOTES/.memory\"").join(), /system prompt/);
+    assert.match(notesRisk("rm -rf \"$PI_PROJECT_NOTES\"").join(), /deletes recursively/);
+    // what can't be known still asks
+    assert.notDeepEqual(notesRisk("echo x > \"$OTHER/a.md\""), []);
+    assert.notDeepEqual(notesRisk(`echo x > ${project}/$(cat name).md`), []);
+    assert.notDeepEqual(notesRisk("F=/etc/x; echo y > \"$F\""), []);
+  } finally {
+    delete process.env.PI_PROJECT_NOTES;
+  }
+});
+
+test("getting commits doesn't ask, sending them does", () => {
+  for (const command of ["git fetch origin", "git pull", "git pull --rebase origin main", "git ls-remote origin",
+    "git remote show origin", "git remote update", "git remote prune origin"]) {
+    assert.deepEqual(risk(command), [], command);
+  }
+  assert.match(risk("git push origin main").join(), /git push/);
+});
+
+test("a recursive delete asks only when git can't bring it back", () => {
+  const repo = realpathSync(mkdtempSync(join(tmpdir(), "guard-")));
+  const git = (...a: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd: repo });
+  for (const dir of ["src", "wip", "target"]) mkdirSync(join(repo, dir));
+  writeFileSync(join(repo, ".gitignore"), "target/\n");
+  writeFileSync(join(repo, "src/A.java"), "a");
+  writeFileSync(join(repo, "wip/B.java"), "b");
+  git("init", "-q"); git("add", "."); git("commit", "-q", "-m", "one");
+  writeFileSync(join(repo, "target/A.class"), "x");
+  writeFileSync(join(repo, "wip/New.java"), "not committed");
+  const here = (command: string) => riskReasons(command, [repo], repo, "");
+  for (const command of ["rm -rf target", "rm -rf src", "rm -r src/A.java", "rm -rf target/*", "find target -name '*.class' -delete"]) {
+    assert.deepEqual(here(command), [], command);
+  }
+  for (const command of ["rm -rf wip", "rm -rf .", "rm -rf *", "rm -rf .git", "rm -rf .*", "find . -delete", "ls | xargs rm -r",
+    "find src -name x -exec rm -rf {} \\;", "rm -rf \"$X\""]) {
+    assert.match(here(command).join(), /delet|outside/, command);
+  }
+  writeFileSync(join(repo, "src/A.java"), "edited, not committed");
+  assert.match(here("rm -rf src").join(), /deletes recursively/);
 });

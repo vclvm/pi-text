@@ -5,9 +5,9 @@
  *  - task-progress.md lives as long as the task: `pibox task new` moves it into history/
  *
  * Nothing here depends on the model remembering to write. Each session leaves a record in
- * .memory/pending/; the next session to start turns what happened into memory with one request. So a
- * killed container loses nothing, and quitting never waits for the router. The record also holds
- * hashes of the files the session read or changed, taken at that moment: that is how changes made
+ * .memory/pending/, and one request turns what happened into memory: when the session has been idle
+ * for a while, when it quits, and otherwise when the next session starts. So a killed container loses
+ * nothing. The record also holds hashes of the files the session read or changed, taken at that moment: that is how changes made
  * later, with or without git, show up as "memory may be out of date".
  *
  * .memory/state.json   last update, the hash of memory.md, known files, how far each session is merged
@@ -69,7 +69,7 @@ export interface Update {
   topics: Record<string, string>;
 }
 
-export type Ask = (system: string, user: string) => Promise<{ text: string; complete: boolean; error?: string }>;
+export type Ask = (system: string, user: string) => Promise<{ text: string; complete: boolean; error?: string; cancelled?: boolean }>;
 
 const dir = (notes: string) => join(notes, ".memory");
 const pendingDir = (notes: string) => join(dir(notes), "pending");
@@ -318,6 +318,12 @@ export interface Outcome {
   interrupted: boolean;             // an earlier session of the current task stopped midway
 }
 
+/** Whether this session did something that isn't in the memory yet. */
+export function unmerged(notes: string, p: Pending): boolean {
+  const jsonl = text(p.file);
+  return !!jsonl && digest(jsonl, readState(notes).merged[p.id] ?? p.start).worthwhile;
+}
+
 /** Merge every session with entries not merged yet, oldest first. Runs in one process at a time; the
  *  others find the lock and go on. A failure changes nothing: the session stays for the next start. */
 export async function mergeSessions(notes: string, current: string | null, limit: number, ask: Ask): Promise<Outcome> {
@@ -362,6 +368,7 @@ export async function mergeSessions(notes: string, current: string | null, limit
         memory: memoryBefore.replace(/<!--[\s\S]*?-->/g, "").trim(), topics: topicNames(notes), progress: progressBefore,
         task: where ? text(where.task) : "", digest: d.text,
       }));
+      if (answer.cancelled) break;                      // we hung up: says nothing about the session or the model
       const update = answer.complete && !answer.error ? parseUpdate(answer.text, limit) : null;
       if (!update) {
         const tries = (state.attempts[p.id] ?? 0) + 1;

@@ -116,8 +116,10 @@ cmd_init() {
   fi
 
   mkdir -p "$HOME/.local/bin"; ln -sfn "$SB/bin/pibox" "$HOME/.local/bin/pibox"
-  [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] ||
-    print "add ~/.local/bin to PATH, e.g. in ~/.zprofile: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  # -ef, not text: a trailing slash or a symlinked home folder is still the same folder
+  local d on_path=0
+  for d in ${(s.:.)PATH}; do [[ "$d" -ef "$HOME/.local/bin" ]] && on_path=1; done
+  (( on_path )) || print "add ~/.local/bin to your PATH, then pibox works from any folder"
   ok() { : }; miss() { warn "$*" }            # init only reports problems; pibox check lists everything
   docker_tools
 }

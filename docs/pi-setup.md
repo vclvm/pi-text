@@ -329,7 +329,7 @@ cd ~/Projects/api && pibox run       # terminal 1: Pi
 | What | Why | How to install |
 |---|---|---|
 | macOS 26 on Apple Silicon | Colima's `vz` VMs and virtiofs shared folders | — |
-| [Homebrew](https://brew.sh) | Installs everything below | The installer from brew.sh, or your company's installation. With a mirror: Homebrew's variables in `~/.zprofile` (`HOMEBREW_API_DOMAIN`, `HOMEBREW_BOTTLE_DOMAIN` or `HOMEBREW_ARTIFACT_DOMAIN`; `man brew`, section ENVIRONMENT) |
+| [Homebrew](https://brew.sh) | Installs everything below | The installer from brew.sh, or your company's installation. With a mirror: Homebrew's variables in your shell's startup file (`HOMEBREW_API_DOMAIN`, `HOMEBREW_BOTTLE_DOMAIN` or `HOMEBREW_ARTIFACT_DOMAIN`; `man brew`, section ENVIRONMENT) |
 | Colima | The Linux VM that runs Docker (§4.4) | `brew install colima` |
 | Docker CLI, Compose, Buildx | `pibox` drives the VM's Docker with them | `brew install docker docker-compose docker-buildx`. Homebrew puts Compose and Buildx in its own plugin folder (`$(brew --prefix)/lib/docker/cli-plugins`); `pibox check` and `pibox init` add it to `cliPluginsExtraDirs` in `~/.docker/config.json` (or `$DOCKER_CONFIG`) when either plugin doesn't work, once, with a backup |
 | yq (mikefarah, v4) | `pibox` reads `config.yaml` with it | `brew install yq` |
@@ -591,9 +591,11 @@ pibox run
   keep a model from wandering better than general principles.
 - **The project is remembered between sessions, without anyone writing it down.** A new session
   in a known project starts with what earlier ones found out, instead of exploring it again.
-  Each session leaves a record; the next one to start turns it into memory with one request in the
-  background, so a killed container loses nothing and quitting never waits for the router. Your
-  first message waits for that request up to 30 seconds, then goes on with the memory as it was.
+  Each session leaves a record, and one request turns it into memory: after two minutes without
+  work and when you quit (quitting waits for it up to 60 seconds). What that didn't cover, say after
+  a killed container, the next session does at its start, and your first message waits for it up
+  to 30 seconds, then goes on with the memory as it was. A session that only talked, with no tool
+  used, leaves no request and no memory.
 
   | File | Lives as long as | Holds | `pibox task new` |
   |---|---|---|---|
@@ -1225,9 +1227,9 @@ Without a UI (`pi -p`), dialogs are impossible, so both extensions **refuse** an
 - **Bash approval:** `extensions.bash_approval: risky` (the default; `PI_BASH_APPROVAL` in the agent's environment)
   parses the command (pipes, `&&`, `$(…)`, `sh -c "…"`, `xargs`, `find -exec`, redirections) and asks
   only when one of its commands:
-  - goes to the network (`curl`, `ssh`, `rsync`, `git push/fetch/pull/clone`, `git remote add`…);
-  - deletes recursively or discards work (`rm -r`, `find -delete`, `git reset --hard`, `git clean`,
-    `git checkout -- …`, `git branch -D`…);
+  - goes to the network (`curl`, `ssh`, `rsync`, `git push/clone`, `git remote add`…);
+  - deletes what git can't bring back, or discards work (`rm -r` and `find -delete` of uncommitted
+    files, `git reset --hard`, `git clean`, `git checkout -- …`, `git branch -D`…);
   - changes rights or the system (`sudo`, `chown`, setuid `chmod`, `launchctl`, `crontab`…);
   - runs text as code (`… | sh`, `eval`, a script outside your folders);
   - touches credentials (`~/.m2/settings.xml`, `.npmrc`, `printenv`/`env`, which show the Maven
@@ -1237,6 +1239,14 @@ Without a UI (`pi -p`), dialogs are impossible, so both extensions **refuse** an
 
   The dialog says which of these it is. Reading asks never, whatever the arguments contain:
   `grep -rn security src`, `find ~/.m2/repository …`, `git log -S curl` run without a question.
+  Neither does what git undoes: `git fetch`, `git pull`, `git ls-remote`, `git remote show`, and
+  `rm -r` or `find -delete` in a work tree when `git status` shows no uncommitted work under that
+  path. Files git ignores count as rebuildable, so `rm -rf target` doesn't ask; a `.env` in an
+  ignored folder would go with it. The whole work tree (`rm -rf .`, `rm -rf *`) always asks.
+  The project's own notes folder is open too, `rm -r` included, however the path is written
+  (`$PI_PROJECT_NOTES`, `$(date …)` in a file name, a variable set in the same command); only the
+  files of it that go into the system prompt ask (§7.2). A path that depends on anything else
+  counts as outside your folders.
   `all` asks before **every** command, and `off` keeps only the path guard. The rules are tested
   in `sandbox/test/sandbox-guard.test.ts` (`node --experimental-strip-types --test sandbox/test/*.test.ts`).
 - **Bash timeout:** `extensions.bash_timeout: 600` (`PI_BASH_TIMEOUT`): a command the model gives no

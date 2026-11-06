@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   digest, hashFile, memoryBlock, memoryPath, mergeSessions, parseUpdate, progressPath, readState, register,
-  savePending, staleness, taskFiles, taskId, topicNames, type Ask,
+  savePending, staleness, taskFiles, taskId, topicNames, unmerged, type Ask,
 } from "../extensions/lib/memory.ts";
 import { section } from "../extensions/project-context.ts";
 
@@ -118,6 +118,26 @@ test("a failed request changes nothing and is tried again, a few times", async (
   await mergeSessions(notes, null, LIMIT, broken);
   assert.equal(readState(notes).merged.s1, "3", "given up");
   assert.equal((await mergeSessions(notes, null, LIMIT, broken)).failed.length, 0);
+});
+
+test("a request we cancelled by quitting is no failed try", async () => {
+  const notes = folder();
+  session(notes, "s1", WORK);
+  for (let i = 0; i < 5; i++) {
+    const done = await mergeSessions(notes, null, LIMIT, async () => ({ text: "", complete: false, cancelled: true }));
+    assert.deepEqual(done.failed, []);
+  }
+  assert.equal(readState(notes).attempts.s1, undefined);
+  assert.equal(readState(notes).merged.s1, undefined);
+  assert.equal(existsSync(join(notes, ".memory", "merge.lock")), false);
+});
+
+test("a session knows whether it has something for the memory", async () => {
+  const notes = folder();
+  const p = { id: "s1", file: session(notes, "s1", WORK), start: null, task: "initial", at: "", files: {} };
+  assert.equal(unmerged(notes, p), true);
+  await mergeSessions(notes, null, LIMIT, answering("<unchanged/>"));
+  assert.equal(unmerged(notes, p), false);
 });
 
 test("a hand edit during the request wins", async () => {
