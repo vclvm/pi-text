@@ -51,6 +51,10 @@ and never change `.gitignore` to hide them.
 
 - The project's rules (`AGENTS.md`) and the current task (`current-task.md`) of that folder are in
   `<project_notes>` too. When the user says "the task" or "the current task", they mean this one.
+- Project memory and the progress of the task are in `<project_notes>` as well, when there are any:
+  use them before exploring, and check against the code what your work depends on. They are written
+  automatically after each session, so you don't update them, and you can't: `memory.md`,
+  `memory/`, `task-progress.md`, `AGENTS.md` and `current-task.md` are read-only for you.
 - Relative paths of notes and reports (`designs/…`, `reviews/…`, `docs/…`) mean that folder, unless
   the user says the file belongs to the project.
 - File names of reports: `<YYYY-MM-DD_HH-MM-SS>_<2-3-words>_<kind>.md` (`date +%Y-%m-%d_%H-%M-%S`).

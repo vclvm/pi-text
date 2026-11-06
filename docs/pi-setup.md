@@ -578,6 +578,7 @@ cd ~/Projects/api
 pibox task new          # current-task.md and AGENTS.md from the templates (an old task goes to history/)
 pibox task edit         # the task: goal, expected behaviour, in/out of scope, acceptance, where to look
 pibox task edit rules   # AGENTS.md: build and test commands, conventions, an example test, what not to do
+pibox task edit memory  # memory.md, if the automatic memory got something wrong
 pibox task              # where the folder is, whether a task is written
 pibox run
 ```
@@ -588,6 +589,38 @@ pibox run
   their hints in `<!-- … -->`, which is left out; a file with only headings counts as not written.
   Concrete beats long: "Out of scope: no database in the test" and "like `OrderControllerTest`"
   keep a model from wandering better than general principles.
+- **The project is remembered between sessions, without anyone writing it down.** A new session
+  in a known project starts with what earlier ones found out, instead of exploring it again.
+  Each session leaves a record; the next one to start turns it into memory with one request in the
+  background, so a killed container loses nothing and quitting never waits for the router. Your
+  first message waits for that request up to 30 seconds, then goes on with the memory as it was.
+
+  | File | Lives as long as | Holds | `pibox task new` |
+  |---|---|---|---|
+  | `memory.md` | the project | what it is, commands that work, decisions and why, pitfalls | stays |
+  | `memory/<topic>.md` | the project | details of one subject; the agent reads them when needed | stays |
+  | `task-progress.md` | the task | what is done, what is next, what failed | moves to `history/` with the task |
+
+  `memory.md` and `task-progress.md` go with every request, so they cost tokens each time; an
+  exploration read again costs more, because its output stays in the conversation as well.
+  `extensions.memory_chars` sets the size of `memory.md` (0 turns all of this off). A session that
+  ends before its task is replaced still counts: its progress goes to the archive of its own task.
+- **New session or `pibox run -c`?** New by default: for a new task, and for the next stage of the
+  same one. It starts from the memory and the progress, with fresh file contents. `pibox run -c`
+  is for work that stopped midway (a limit, a dropped connection, Ctrl+C), where the exact error
+  and the half-done step still matter; Pi says so when the last session of the task stopped that way.
+- **Memory can go out of date, so it says when.** A session hashes the files it reads and changes at
+  that moment. The next session compares them and is told what changed or disappeared since, with
+  or without git; with git it also gets the commits since. New files nobody has read can't show up
+  this way, so the rule is that where memory and code disagree, the code is right.
+- **Memory is a way into later sessions, so it is guarded.** Text the agent reads on the web or in a
+  repository could end up in the summary and then in every later prompt. Tool output stays out of
+  what the update reads (except failed commands), and the prompt marks memory as data, not
+  instructions. The agent can't `write` or `edit` `AGENTS.md`, `current-task.md`,
+  `task-progress.md`, `memory.md`, `memory/` or `.memory/`, and a bash command writing to them asks
+  you. This is defense in depth, not a boundary: a script could still write there. So
+  `.memory/versions/` keeps the last 30 versions, and `pibox review` warns when `memory.md` was
+  changed by anything but the update (your own edits included).
 - **The task describes the problem, the command the step.** `current-task.md` says what you want
   (a change, a bug, a question) with its scope, acceptance criteria and context: error messages,
   log lines, the ticket, what was tried. It is easier to write there than in Pi's input line, and
@@ -749,6 +782,7 @@ pi-text/
 │   ├── Dockerfile.pi          # §8.4
 │   ├── addons/egress_policy.py      # §8.6
 │   ├── extensions/sandbox-guard.ts, web.ts   # §9
+│   ├── extensions/project-context.ts, lib/memory.ts   # §7.2
 │   └── agent/settings.json    # §8.7
 ├── bridge/                    # the bridge: proxy.py, its Dockerfile, tests, README (§8.5)
 └── docs/pi-setup.md           # this guide
@@ -1250,14 +1284,14 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 | `config` | Print the settings in effect, secrets masked |
 | `up` | Start the VM (restarted when `pibox setup` changed its settings), install sysbox if needed (mode `sysbox`), build the images, start bridge, proxy and the agent's Docker engine, always as new containers (they mount files `init`/`setup` replace) (§6.7) |
 | `run [args]` | Pi in a fresh container, in the current folder; `args` go to Pi (§7.1) |
-| `task [new\|edit [rules]]` | The project's task and rules in its notes folder, outside the repository; `new` archives the current task into `history/` (§7.2) |
+| `task [new\|edit [rules\|memory]]` | The project's task, rules and memory in its notes folder, outside the repository; `new` archives the current task and its progress into `history/`, the memory stays (§7.2) |
 | `approve` | The approval console of the proxy; detach with Ctrl-P Ctrl-Q (§7.1) |
 | `log` | Follow the web journal |
 | `shell [args]` | A bash shell in the agent's container without Pi, in the current folder: try what the agent could do |
 | `status` | The VM and the containers |
 | `down [--vm]` | Stop the containers; with `--vm` the Colima VM too |
 | `verify` | Try everything the agent must not be able to do (§6.7) |
-| `review` | After a session: git hooks, risky git config, recent `.obsidian` changes (§7.3) |
+| `review` | After a session: git hooks, risky git config, recent `.obsidian` changes, project memory changed by anything but its update (§7.3) |
 | `probe [what]` | Ask your router what it really offers: endpoints (including `/openapi.json`), which models answer a tiny request, its rate-limit headers; `probe limits` shows the bridge's current rate-limit state and what it sends to each model; `probe thinking|history --models a,b`: which field changes a model's thinking, whether it sees its earlier thinking ([bridge/README.md](../bridge/README.md#probing-the-router-probepy)) |
 | `ps [kill PID]` | The processes in Pi's container with their running time: what a long "Pi is running bash …" really does. `pibox ps kill PID` stops one command; Pi's tool gets its output so far and the model goes on (Esc would abort the whole turn) |
 | `diag` | Live view of every request in a second terminal: on start the per-model request fields (`MODEL_PARAMS`), then rate-limit waits and tokens left, when the router answered, when the first token came, writing speed, and which phase took the time ([bridge/README.md](../bridge/README.md#watching-requests-live-diagpy)) |

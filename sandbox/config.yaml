@@ -179,6 +179,10 @@ extensions:
   # timeout: a command waiting for a server that never answers can't hold the agent for ever.
   # The model sees that it timed out and can run it again with a longer timeout. 0 = none
   bash_timeout: 600
+  # Size of the project's memory (memory.md in its notes folder) in characters: it goes with every
+  # request, and details beyond this move into topic files read when needed. 0 = no memory at all:
+  # no extra request per session, and nothing of it goes into the prompt
+  memory_chars: 20000
   # The web tools send https:// pages to the proxy as plain http:// requests, so the proxy can see
   # and check them (it refuses encrypted tunnels). false = they use tunnels and get refused.
   web_plain_http: true
@@ -320,3 +324,4 @@ vm:
 mac:
   uid: ""
   gid: ""
+

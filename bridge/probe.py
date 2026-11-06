@@ -9,6 +9,8 @@
     probe.py thinking --models M   which request field changes the model's thinking (reasoning_effort,
                              thinking.type, enable_thinking …): the same question with each
     probe.py history --models M    does the model see its own earlier thinking when it is sent back
+    probe.py identity --models M   which model really answers behind a name (alias): the router's
+                                   /model/info, its x-litellm-model-* headers, the reply's model field
                              (KEEP_THINKING: field = reasoning_content, text = <think> in the content)
 
 Reads PI_TEXT_URL and PI_TEXT_KEY like the bridge (or --url/--key). Requests are spaced by
@@ -155,6 +157,10 @@ class Probe:
             return result
         if stream:
             result["detail"] = cut(stream_text(r.text) or "(empty reply)", 50)
+            served = self.served_as(r, model)
+            if served:
+                result["detail"] += f"   (answered as {served})"
+                result["served_as"] = served
             return result
         data = json_or_none(r) or {}
         text = ""
@@ -171,6 +177,7 @@ class Probe:
                                                              if usage else "")
         if data.get("model") and data["model"] != model:
             result["detail"] += f"   (answered as {data['model']})"
+            result["served_as"] = data["model"]
         return result
 
     def models(self, only: list[str], include: list[str], stream: bool, as_json: bool, as_yaml: bool) -> int:
@@ -184,8 +191,10 @@ class Probe:
             out(f"/models lists {len(meta)} model(s); testing {len(names)} with a tiny request "
                 f"({'stream' if stream else 'no stream'}, {self.interval}s apart)…\n")
         results = []
+        _, deployed = self.deployments()
         for name in names:
             result = self.test_model(name, stream)
+            result["deployments"] = [d["model"] for d in deployed.get(name, []) if d["model"]]
             m = meta.get(name, {})
             result["listed"] = name in meta
             result["context"] = find_field(m, CONTEXT_FIELDS)
@@ -196,6 +205,8 @@ class Probe:
                 listed_mark = "" if result["listed"] else " (not in /models)"
                 out(f"{mark} {name}{listed_mark}\n     {result['status']}  {result['ms']} ms  "
                     f"ctx={result['context'] or '?'}  {result.get('detail', '')}")
+                if result["deployments"]:
+                    out(f"     → {', '.join(dict.fromkeys(result['deployments']))}   (the router's /model/info)")
         if as_json:
             print(json.dumps({"results": results, "limit_headers": self.limit_headers}, indent=2, ensure_ascii=False))
             return 0
@@ -271,6 +282,102 @@ class Probe:
             "Small differences are noise: the model thinks a little differently each time.")
         return 0
 
+    # ------------------------------------------------------------------ identity
+    IDENTITY_HEADERS = ("x-litellm-model-group", "x-litellm-model-id", "x-litellm-model-api-base",
+                        "x-litellm-model-region", "x-litellm-version", "openai-model", "x-model")
+    DEPLOYMENT_FACTS = ("base_model", "max_input_tokens", "max_output_tokens", "max_tokens", "litellm_provider",
+                        "providers", "mode", "supports_reasoning", "supports_function_calling", "id")
+
+    def deployments(self) -> tuple[str, dict[str, list[dict]]]:
+        """What the router says stands behind each model name: LiteLLM's /model/info (the deployed
+        model, often closed to plain keys), else /model_group/info (limits and providers, no model).
+        Returns (the source URL or "", {name: [{"model", "api_base", "facts"}]})."""
+        if hasattr(self, "_deployments"):
+            return self._deployments
+        found: tuple[str, dict[str, list[dict]]] = ("", {})
+        for path, group in (("model/info", False), ("model_group/info", True)):
+            for url in dict.fromkeys((f"{self.base}/{path}", f"{self.root}/{path}", f"{self.root}/v1/{path}")):
+                r = self.request("GET", url)
+                data = json_or_none(r) if r is not None and r.status_code == 200 else None
+                items = data.get("data") if isinstance(data, dict) else None
+                if not isinstance(items, list) or not items:
+                    continue
+                by_name: dict[str, list[dict]] = {}
+                for d in items:
+                    if not isinstance(d, dict):
+                        continue
+                    name = d.get("model_group" if group else "model_name")
+                    params, info = ({}, d) if group else (d.get("litellm_params") or {}, d.get("model_info") or {})
+                    by_name.setdefault(name, []).append({
+                        "model": params.get("model"), "api_base": params.get("api_base"),
+                        "facts": {k: info[k] for k in self.DEPLOYMENT_FACTS if info.get(k) not in (None, "", [])}})
+                found = (url, by_name)
+                break
+            if found[0]:
+                break
+        self._deployments = found
+        return found
+
+    @staticmethod
+    def served_as(r: httpx.Response, model: str) -> str:
+        """The model a reply says it came from, if that differs from the name asked for."""
+        data = json_or_none(r) if "json" in r.headers.get("content-type", "") else None
+        named = data.get("model") if isinstance(data, dict) else None
+        if not named and "data:" in r.text[:200]:
+            for line in r.text.splitlines():
+                chunk = json_or_none_text(line[5:].strip()) if line.startswith("data:") else None
+                if isinstance(chunk, dict) and chunk.get("model"):
+                    named = chunk["model"]
+                    break
+        return named if named and named != model else ""
+
+    def identity(self, names: list[str]) -> int:
+        """What a model name (often an alias like glm-latest) really is. Only what the router states
+        counts: asked about itself, a model names what its training data says, not what is deployed."""
+        if not names:
+            out("Name the models: probe.py identity --models glm-latest")
+            return 1
+        source, deployed = self.deployments()
+        if not source:
+            out("The router doesn't open /model/info or /model_group/info to this key: only the replies\n"
+                "below tell something (and only if the router puts the real name into them).\n")
+        elif source.endswith("model_group/info"):
+            out(f"{source}: limits and providers per name; the deployed model itself is in /model/info,\n"
+                "which this key may not read.\n")
+        else:
+            out(f"{source}: the deployments behind each name\n")
+        listed = {m.get("id"): m for m in self.listed_models()}
+        for name in names:
+            out(f"{name}:")
+            for d in deployed.get(name, []):
+                if d["model"]:
+                    out(f"  deployment → {d['model']}" + (f"   at {d['api_base']}" if d["api_base"] else ""))
+                if d["facts"]:
+                    out("    " + ", ".join(f"{k}={v}" for k, v in d["facts"].items()))
+            if source and name not in deployed:
+                out("  not listed there: a wildcard route, or a name the router maps elsewhere")
+            meta = listed.get(name) or {}
+            extra = {k: meta.get(k) for k in ("owned_by", "root", "parent", "max_model_len", "context_length")
+                     if meta.get(k) not in (None, "")}
+            if extra:
+                out("  /models: " + ", ".join(f"{k}={v}" for k, v in extra.items()))
+            r = self.request("POST", self.endpoint, json=self.chat_body(name, False))
+            if r is None:
+                continue
+            if r.status_code >= 400:
+                out(f"  ❌ request: {r.status_code} {cut(error_text(r), 80)}")
+                continue
+            data = json_or_none(r) or {}
+            out(f"  reply's model field: {data.get('model') or '(none)'}"
+                + (f", system_fingerprint={data['system_fingerprint']}" if data.get("system_fingerprint") else ""))
+            for h in self.IDENTITY_HEADERS:
+                if r.headers.get(h):
+                    out(f"  {h}: {r.headers[h]}")
+            out("")
+        out("Trust the deployment line, the reply's model field and the headers, in that order; a name\n"
+            "like 'latest' can point elsewhere tomorrow. Asking the model which it is proves nothing.")
+        return 0
+
     # ------------------------------------------------------------------ history
     SECRET = "PELICAN-7342"
     HISTORY_VARIANTS = (
@@ -335,6 +442,13 @@ class Probe:
                 out(f"  {k}: {v}")
         else:
             out("The router sent no rate-limit headers (x-ratelimit-*, retry-after) so far.")
+
+
+def json_or_none_text(text: str):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
 
 
 def json_or_none(r: httpx.Response | None):
@@ -420,7 +534,7 @@ def limits(bridge: str) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("what", nargs="?", default="all", choices=["all", "endpoints", "models", "limits", "thinking", "history"])
+    p.add_argument("what", nargs="?", default="all", choices=["all", "endpoints", "models", "limits", "thinking", "history", "identity"])
     p.add_argument("--url", default=os.environ.get("PI_TEXT_URL", ""), help="router URL (default: $PI_TEXT_URL)")
     p.add_argument("--key", default=os.environ.get("PI_TEXT_KEY", ""), help="router key (default: $PI_TEXT_KEY)")
     p.add_argument("--models", default="", help="comma-separated: test only these models")
@@ -446,6 +560,8 @@ def main() -> int:
         return probe.thinking(split(a.models))
     if a.what == "history":
         return probe.history(split(a.models))
+    if a.what == "identity":
+        return probe.identity(split(a.models))
     if a.what in ("all", "endpoints") and not a.json:
         probe.endpoints()
     if a.what in ("all", "models"):

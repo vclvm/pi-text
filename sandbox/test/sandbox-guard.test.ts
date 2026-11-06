@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
-import { riskReasons, parseCommand } from "../extensions/sandbox-guard.ts";
+import { riskReasons, parseCommand, promptNote } from "../extensions/sandbox-guard.ts";
 
 const ROOT = "/work/projects";
 const risk = (command: string, cwd = `${ROOT}/api`) => riskReasons(command, [ROOT], cwd);
@@ -79,4 +79,23 @@ test("parser: pipes, substitutions, redirections, heredocs", () => {
   assert.deepEqual(parsed.map((s) => s.words[0]), ["a", "b", "d", "c", "f", "g"]);
   assert.deepEqual(parsed[1].writes, ["out.txt"]);
   assert.equal(homedir().length > 0, true);
+});
+
+test("the notes that go into the system prompt: reading is free, writing asks", () => {
+  const notes = "/work/notes", cwd = `${ROOT}/api`;
+  const notesRisk = (command: string) => riskReasons(command, [ROOT, notes], cwd, notes);
+  for (const f of ["memory.md", "memory/payments.md", "task-progress.md", "AGENTS.md", "current-task.md", ".memory/state.json"]) {
+    const path = `${notes}/Projects/api/${f}`;
+    assert.ok(promptNote(path, notes), f);
+    assert.deepEqual(notesRisk(`cat ${path}`), [], f);
+    assert.match(notesRisk(`echo x >> ${path}`).join(), /system prompt/, f);
+    assert.match(notesRisk(`sed -i s/a/b/ ${path}`).join(), /system prompt/, f);
+    assert.match(notesRisk(`tee ${path}`).join(), /system prompt/, f);
+  }
+  for (const f of ["notes/plan.md", "reviews/r.md", "history/2026_task.md"]) {
+    assert.equal(promptNote(`${notes}/Projects/api/${f}`, notes), false, f);
+    assert.deepEqual(notesRisk(`echo x > ${notes}/Projects/api/${f}`), [], f);
+  }
+  assert.equal(promptNote(`${ROOT}/api/memory.md`, notes), false);          // the project's own file
+  assert.deepEqual(notesRisk(`echo x > ${ROOT}/api/AGENTS.md`), []);
 });

@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { meaningful, section } from "../extensions/project-context.ts";
 
 test("the untouched templates count as not written", () => {
-  for (const name of ["current-task.md", "AGENTS.md"]) {
+  for (const name of ["current-task.md", "AGENTS.md", "memory.md"]) {
     assert.equal(meaningful(readFileSync(new URL(`../agent/templates/${name}`, import.meta.url), "utf8")), "", name);
   }
 });

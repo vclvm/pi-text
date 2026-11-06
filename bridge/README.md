@@ -434,6 +434,7 @@ reads `PI_TEXT_URL`/`PI_TEXT_KEY` (or `--url`/`--key`):
 .venv/bin/python probe.py limits          # GET /bridge/limits of a running bridge (--bridge URL)
 .venv/bin/python probe.py thinking --models glm-latest   # which field changes its thinking
 .venv/bin/python probe.py history --models glm-latest,qwen-latest   # does it see its earlier thinking
+.venv/bin/python probe.py identity --models glm-latest              # which model really answers behind the name
 ```
 
 - `endpoints` tries the usual discovery and management routes. Relative to the API base:
@@ -464,7 +465,7 @@ in `MAX_RETRIES`), handing back that thinking (up to 48000 characters) and askin
 its findings and act in small steps. Pi would otherwise stop with "response was truncated".
 
 In the sandbox: `pibox probe`, `pibox probe models --stream`, `pibox probe limits`, `pibox probe thinking --models ID`,
-`pibox probe history --models ID,ID`. The probe runs
+`pibox probe history --models ID,ID`, `pibox probe identity --models ID` (what an alias like `glm-latest` really is: the deployment from LiteLLM's `/model/info`, or limits and providers from `/model_group/info` when the key may not read the first, the `x-litellm-model-*` headers, the reply's `model` field; `probe models` shows the deployment and a differing reply model too; asking the model itself tells only what its training data says). The probe runs
 in the bridge container, with the router key and the same network path as the bridge.
 
 ## Watching requests live: `diag.py`

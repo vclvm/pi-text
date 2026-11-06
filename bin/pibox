@@ -49,9 +49,10 @@ Install and configure:
 Run:
   up             start the VM, build the images, start bridge, proxy and the agent's Docker engine
   run [args]     Pi in a fresh container, in the current folder (args go to pi)
-  task [new|edit [rules]]
-                 the project's task and rules, outside its repository (folders.notes/<path under ~>):
-                 new archives the current task and starts one from the template; Pi reads both
+  task [new|edit [rules|memory]]
+                 the project's task, rules and memory, outside its repository (folders.notes/<path under
+                 ~>): new archives the task with its progress and starts one from the template, the
+                 memory stays; Pi reads them all
   approve        the approval console for the agent's web requests (detach: Ctrl-P Ctrl-Q)
   log            follow the web journal
   shell          a bash shell in the agent's container, without Pi
@@ -64,7 +65,8 @@ Check:
   probe [what]   what your router really offers, asked from the bridge: endpoints, models (a tiny
                  request to each), rate-limit headers; 'probe limits': what the bridge knows now;
                  'probe thinking|history --models a,b': what changes thinking, does the model see
-                 its earlier thinking
+                 its earlier thinking; 'probe identity --models a': which model really
+                 answers behind a name like glm-latest
   nettest URL    where a request hangs: from the VM directly, via your Mac's proxy, as the agent
   logs [svc] [n] the last n lines of a container (proxy, bridge, docker; default proxy 60)
   ps [kill PID]  the processes in Pi's container (how long each runs); kill one that hangs
@@ -402,7 +404,7 @@ typeset -A SETTING=(
   egress.allow_only EGRESS_ALLOW_ONLY            egress.deny EGRESS_DENY
   egress.ports EGRESS_PORTS
   extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
-  extensions.bash_timeout PI_BASH_TIMEOUT
+  extensions.bash_timeout PI_BASH_TIMEOUT        extensions.memory_chars PI_MEMORY_CHARS
   extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
   repository.apt_sources APT_SOURCES_FILE
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
@@ -442,7 +444,7 @@ load_config() {                             # defaults, then config.yaml on top
   CA_CERTS=""
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
-  PI_BASH_APPROVAL=risky PI_BASH_TIMEOUT=600 PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
+  PI_BASH_APPROVAL=risky PI_BASH_TIMEOUT=600 PI_MEMORY_CHARS=20000 PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
   APT_SOURCES_FILE=""
   # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
   # Maven wrapper's repository and login.
@@ -591,7 +593,7 @@ typeset -A CHECK=(
   egress.allow_private hosts            egress.no_approval hosts              egress.allow_only hosts
   egress.deny hosts                     egress.ports ports
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
-  extensions.bash_timeout int
+  extensions.bash_timeout int           extensions.memory_chars int
   extensions.searxng url                extensions.fetch_max_chars int
   repository.apt_sources file           repository.maven_settings file        repository.npmrc file
   repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
@@ -1615,7 +1617,8 @@ up)                                         # VM, images, bridge, proxy, the age
 
 run)                                        # Pi in a fresh container, in the current folder
   fresh; running
-  local h n; h=$(here); n=$(project_notes "$h"); mkdir -p "$n"
+  local h n; h=$(here); n=$(project_notes "$h"); mkdir -p "$n/.memory"
+  [[ -f "$n/memory.md" || ! -f "$SB/agent/templates/memory.md" ]] || cp "$SB/agent/templates/memory.md" "$n/memory.md"
   compose_args; local -a c=($reply); dk; exec $reply $c run --rm -w "$h" -e PI_PROJECT_NOTES="$n" pi "$@"
   ;;
 
@@ -1627,23 +1630,33 @@ task)                                       # the project's task and notes, outs
       print -r -- "notes of this project: $n"
       if [[ -f "$n/current-task.md" ]]; then print -r -- "current task: $n/current-task.md (${$(wc -l <"$n/current-task.md")// /} lines)"
       else print -r -- "no current task yet: pibox task new"; fi
+      if [[ -f "$n/task-progress.md" ]]; then print -r -- "progress: $n/task-progress.md"; fi
+      if [[ -f "$n/memory.md" ]]; then print -r -- "project memory: $n/memory.md (${$(wc -c <"$n/memory.md")// /} bytes)"; fi
       ;;
-    new|next)                               # archive the current task, start a new one from the template
-      mkdir -p "$n"/{designs,implemented,reviews,tests,investigations,context,history}
+    new|next)                               # archive the task and its progress, start a new one; the memory stays
+      mkdir -p "$n"/{designs,implemented,reviews,tests,investigations,context,history,.memory}
       [[ -f "$n/AGENTS.md" ]] || cp "$t/AGENTS.md" "$n/AGENTS.md"
+      ts=$(date +%Y-%m-%d_%H-%M-%S)
       if [[ -f "$n/current-task.md" ]]; then
-        ts=$(date +%Y-%m-%d_%H-%M-%S); mv "$n/current-task.md" "$n/history/${ts}_task.md"
+        mv "$n/current-task.md" "$n/history/${ts}_task.md"
         print -r -- "archived: $n/history/${ts}_task.md"
       fi
+      if [[ -f "$n/task-progress.md" ]]; then mv "$n/task-progress.md" "$n/history/${ts}_progress.md"; fi
+      # Sessions of the old task not merged yet find its archive here (extensions/lib/memory.ts)
+      local old=initial
+      if [[ -s "$n/.memory/task-id" ]]; then old=$(<"$n/.memory/task-id"); fi
+      print -r -- "$old"$'\t'"$ts" >>"$n/.memory/tasks.tsv"
+      print -r -- "$ts" >"$n/.memory/task-id"
       cp "$t/current-task.md" "$n/current-task.md"
       print -r -- "new task: $n/current-task.md (pibox task edit); project rules: $n/AGENTS.md"
       ;;
-    edit)                                   # open the current task (or the project rules: edit rules)
-      local f="$n/current-task.md"; [[ "${2:-}" == rules ]] && f="$n/AGENTS.md"
+    edit)                                   # open the current task (edit rules, edit memory: those files)
+      local f="$n/current-task.md"
+      case "${2:-}" in rules) f="$n/AGENTS.md" ;; memory) f="$n/memory.md" ;; esac
       [[ -f "$f" ]] || die "$f doesn't exist: pibox task new"
       exec ${=VISUAL:-${EDITOR:-vi}} "$f"
       ;;
-    *) die "usage: pibox task [show|new|edit [rules]]" ;;
+    *) die "usage: pibox task [show|new|edit [rules|memory]]" ;;
   esac
   ;;
 
@@ -1802,7 +1815,25 @@ review)                                     # changes that would make YOUR tools
     print "⚠️  Obsidian settings changed in the last 24 h (plugins run with your rights):"
     print -r -- "$changed" | sed 's/^/    /'
   fi
-  (( found )) || print "pibox review: nothing suspicious (hooks, git config, .obsidian)"
+  # What goes into the system prompt of later sessions: an update of the memory is normal, a change
+  # by anything else is what a planted instruction would look like.
+  local st m sum v want
+  while IFS= read -r st; do
+    m=${st:h:h}/memory.md
+    [[ -f "$m" ]] || continue
+    sum=$( { shasum -a 256 "$m" 2>/dev/null || sha256sum "$m"; } | cut -d' ' -f1)
+    v=$(ls -1 "${st:h}/versions" 2>/dev/null | tail -1 || true)
+    [[ -z "$v" ]] || v=${st:h}/versions/$v
+    want=$(yq -r '.memorySha // ""' "$st" 2>/dev/null || true)
+    if [[ ( -n "$want" && "$want" != "$sum" ) || -n "$(find "${st:h}/foreign-edit" -mtime -7 2>/dev/null || true)" ]]; then
+      found=1
+      print -r -- "⚠️  $m changed by something other than the memory update: if it wasn't you, read it"
+      [[ -z "$v" ]] || print -r -- "    the version before the last update: $v"
+    elif [[ -n "$(find "$m" -mtime -1 2>/dev/null || true)" ]]; then
+      print -r -- "memory updated in the last 24 h: $m${v:+ (before: $v)}"
+    fi
+  done < <(find "$NOTES" -path '*/.memory/state.json' 2>/dev/null)
+  (( found )) || print "pibox review: nothing suspicious (hooks, git config, .obsidian, project memory)"
   exit $found
   ;;
 

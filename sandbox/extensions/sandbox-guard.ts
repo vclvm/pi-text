@@ -13,6 +13,9 @@
  *    so a command that hangs (a network call that never answers) can't block the agent for ever
  *  - a new Markdown file in a project (not in the notes folder PI_NOTES_DIR) needs approval: notes
  *    and reports belong in the notes folder, outside the repository, or they end up in git
+ *  - the files of the notes folder that go into the system prompt (rules, task, memory) are not
+ *    written by the agent: write/edit are refused, a bash command writing to them asks. Otherwise
+ *    text the agent picked up somewhere could instruct every later session.
  *  - without a UI (pi -p), anything that would need approval is blocked
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -29,6 +32,7 @@ const WRITE_TOOLS = new Set(["write", "edit"]);
 const NOTES_DIR = process.env.PI_NOTES_DIR && existsSync(process.env.PI_NOTES_DIR)
   ? realpathSync(process.env.PI_NOTES_DIR) : "";
 const PROTECTED = /(^|\/)(\.git\/(hooks|config)|\.obsidian)(\/|$)/;
+const PROMPT_NOTES = /(^|\/)(AGENTS\.md|current-task\.md|task-progress\.md|memory\.md|memory\/[^/]+|\.memory\/.*)$/;
 
 // ------------------------------------------------------------------ what makes a command risky
 
@@ -221,14 +225,25 @@ function gitSub(args: string[]): { sub: string; rest: string[] } {
   return { sub: args[k] ?? "", rest: args.slice(k + 1) };
 }
 
+/** Does this path in the notes folder end up in the system prompt, or decide what does? */
+export function promptNote(target: string, notes: string = NOTES_DIR): boolean {
+  return !!notes && inside(target, notes) && PROMPT_NOTES.test(relative(notes, target));
+}
+
 /** Why `command` needs approval in "risky" mode; empty = it doesn't. */
-export function riskReasons(command: string, roots: string[] = ROOTS, cwd: string = process.cwd()): string[] {
+export function riskReasons(command: string, roots: string[] = ROOTS, cwd: string = process.cwd(),
+                            notes: string = NOTES_DIR): string[] {
   const parsed = parseCommand(command);
   if (!parsed) return ["the command can't be parsed (unbalanced quotes or parentheses)"];
   const reasons = new Set<string>();
   let dir: string | null = cwd;
   const queue = [...parsed];
-  const outside = (path: string) => !insideRoots(path, dir, roots);
+  const outside = (path: string) => {
+    if (notes && !path.includes("$") && promptNote(canonical(resolve(dir ?? "/", expand(path)), "/"), notes)) {
+      reasons.add(`writes ${path}, which goes into the system prompt of later sessions`);
+    }
+    return !insideRoots(path, dir, roots);
+  };
   while (queue.length) {
     const { words, writes } = queue.shift()!;
     const all = [...words, ...writes];
@@ -371,6 +386,9 @@ export default function (pi: ExtensionAPI) {
       }
       if (WRITE_TOOLS.has(event.toolName) && PROTECTED.test(target)) {
         return { block: true, reason: `"${path}" is protected: hooks, git config and .obsidian are edited by the user only` };
+      }
+      if (WRITE_TOOLS.has(event.toolName) && promptNote(target)) {
+        return { block: true, reason: `"${path}" goes into the system prompt: only the user and the automatic memory update change it. Keep your own notes in notes/<task>.md` };
       }
       if (NOTES_DIR && event.toolName === "write" && /\.md$/i.test(target) && !inside(target, NOTES_DIR)
           && !existsSync(target)) {

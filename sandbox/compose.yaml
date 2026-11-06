@@ -161,6 +161,7 @@ services:
       # Pi extensions (docs/pi-setup.md §9):
       PI_BASH_APPROVAL: ${PI_BASH_APPROVAL:-risky}
       PI_BASH_TIMEOUT: ${PI_BASH_TIMEOUT:-600}     # seconds; a command the model gives no timeout
+      PI_MEMORY_CHARS: ${PI_MEMORY_CHARS:-20000}   # project-context.ts: size of memory.md, 0 = no memory
       PI_WEB_PLAIN_HTTP: ${PI_WEB_PLAIN_HTTP:-1}   # web.ts: send https:// pages as plain http:// requests
       WEB_SEARCH_SEARXNG: ${WEB_SEARCH_SEARXNG:-}
       WEB_FETCH_MAX_CHARS: ${WEB_FETCH_MAX_CHARS:-20000}
