@@ -166,13 +166,14 @@ egress:
 # Pi extensions of the sandbox (docs/pi-setup.md §9).
 extensions:
   # Which bash commands of the agent need your OK in Pi:
-  #   risky  only commands that go to the network (curl, ssh, git push/clone…; not git fetch or
-  #          pull), delete what git can't bring back or discard changes (rm -r of uncommitted work,
-  #          git reset --hard/clean…; not rm -r of committed files or build output), change
-  #          rights or the system (sudo, chown…), run text as code (| sh, eval), touch credentials
-  #          (~/.m2/settings.xml, printenv…), publish (npm publish, mvn deploy) or write outside
-  #          your folders and /tmp. The command is parsed: reading (git log, grep, find, cat…)
-  #          never asks, whatever its arguments say
+  #   risky  only what changes something git can't reset: sending out (git push, curl to another
+  #          host, ssh, npm publish, mvn deploy, docker push), losing work git doesn't hold (rm -r,
+  #          git reset --hard, git clean… with uncommitted work in the way), dropping history
+  #          (git branch -D, git stash drop…), changing the system (sudo, chown…), writing to a path
+  #          known to be outside your folders and /tmp, to .git/hooks, .git/config, .obsidian,
+  #          credentials or the notes that go into the prompt, and text it can't look into
+  #          (| sh, eval "$X"). Reading never asks, whatever it reads, and neither does changing
+  #          the project: edits, commits, rebases, fetch, pull
   #   all    every command
   #   off    none (the container's limits still apply)
   bash_approval: risky

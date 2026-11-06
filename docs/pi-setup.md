@@ -27,7 +27,7 @@ setup (§6), daily use (§7), and how the sandbox is built (§8–10). Part III 
 
 | Part | Tested on | Result |
 |---|---|---|
-| Pi extensions `sandbox-guard.ts`, `web.ts` (§9) | Pi 1.5.0 through the pi-text bridge | Path guard allows the projects and the vault, blocks `/etc/...`; `write`/`edit` of `.git/hooks` and `.obsidian` refused; risky bash and unapproved web access are refused without a UI; `web_fetch` and `web_search` return real content |
+| Pi extensions `sandbox-guard.ts`, `web.ts` (§9) | Pi 1.5.0 through the pi-text bridge | Path guard keeps `write`/`edit` in the projects and the vault, reading is free; `write`/`edit` of `.git/hooks` and `.obsidian` refused; risky bash and unapproved web access are refused without a UI; `web_fetch` and `web_search` return real content |
 | Egress policy `egress_policy.py` (§8.6) | mitmproxy 12.3.1 | GET/HEAD pass; POST/PUT, bodies, HTTP/1.1 upgrades, private and metadata IPs, other ports, denied hosts and raw TCP are refused; encrypted tunnels (CONNECT) are refused; allowed requests wait for approval except `egress.no_approval` hosts; an `egress.allow_private` host passes; allowed plain-HTTP requests are forwarded to an upstream HTTP proxy (`--mode upstream`), `network.upstream_no_proxy` hosts directly (the upstream proxy sees none of their requests); large downloads stream through; the journal records every decision |
 | `pibox` and the Compose stack (§6, §8) | zsh 5.9, yq 4.53, Docker Engine 29 + Compose 5 on Linux, against the real stack; `colima` a stand-in | `init` installs the components and the `config.yaml` template, links the command, keeps `config.yaml` on a second run and lists new template sections; `check` refuses placeholders; `setup` writes `.env`, `bridge.env`, `models.json` (two models with their own limits, reasoning and compat), the tools' settings and `colima.yaml`; `up` builds the images and starts bridge, proxy and the agent's engine (`privileged`), refuses stale generated files; `shell`, `log`, `review`, `down` work; `verify` passes: no route out, the Mac unreachable, tunnels and private addresses 403, POST 405, the bridge answers, projects and vault writable, `.obsidian` and extensions read-only, JDK 21 and 17, Maven, Gradle, Node, Python, the agent's Docker; the bridge container gets only its own settings |
 | Development toolchain (§8.4, §8.9, §8.10) | Docker Engine 29 on Linux; nginx in front of Maven Central, npm, PyPI and the Gradle plugin portal over plain HTTP, `registry:2` as Docker Hub mirror, a separate upstream proxy | JDK 17/21/25 (`jdk`), Maven 3.10 (`mvn test` on 17 and 25), Gradle 9.8 with a JDK 17 toolchain and `mavenCentral()` redirected by `init.gradle`, npm, pip in a venv, all through the generated settings (credentials with special characters included) and the proxy, the repository reached directly via `network.upstream_no_proxy`. The agent's engine (`privileged`): pulls through the mirror and from the HTTP registry, `docker compose up` + request to `docker:8088`, `docker build` with network in `RUN`, nested containers only GET through the proxy and no direct route, a Testcontainers Redis test passes. `sysbox` mode **not run here** |
@@ -1216,37 +1216,39 @@ the command line. pi-sandbox mounts them read-only into the auto-load folder of 
 
 Without a UI (`pi -p`), dialogs are impossible, so both extensions **refuse** anything that would need approval.
 
-### 9.2 `sandbox/extensions/sandbox-guard.ts`: keep file tools in your folders, ask before risky commands
+### 9.2 `sandbox/extensions/sandbox-guard.ts`: ask only about what git can't reset
 
 [sandbox/extensions/sandbox-guard.ts](../sandbox/extensions/sandbox-guard.ts). What it does:
-- **Path guard:** for `read`, `write`, `edit`, `ls`, `grep` and `find`, it resolves the target path,
-  including symlinks, so `./link-to-home/.ssh` doesn't slip through. It blocks anything outside the
-  folders in `PI_SANDBOX_ROOTS` (your projects and the vault; `pibox` and `compose.yaml` set it, from `folders`).
+- **The rule:** it asks only about what changes something git can't reset. Reading is free, in any
+  tool and on any path, credentials included: the model sees what it reads, and so does the provider
+  behind it. Changing the project is what the agent is for.
+- **Path guard:** for `write` and `edit`, it resolves the target path, including symlinks, so
+  `./link-to-home/.ssh` doesn't slip through. It blocks anything outside the folders in
+  `PI_SANDBOX_ROOTS` (your projects and the vault; `pibox` and `compose.yaml` set it, from `folders`).
 - **Protected files:** `write` and `edit` may not touch `.git/hooks`, `.git/config` or `.obsidian`
   (§6.2). The model gets a clear reason instead of a cryptic error.
 - **Bash approval:** `extensions.bash_approval: risky` (the default; `PI_BASH_APPROVAL` in the agent's environment)
-  parses the command (pipes, `&&`, `$(…)`, `sh -c "…"`, `xargs`, `find -exec`, redirections) and asks
-  only when one of its commands:
-  - goes to the network (`curl`, `ssh`, `rsync`, `git push/clone`, `git remote add`…);
-  - deletes what git can't bring back, or discards work (`rm -r` and `find -delete` of uncommitted
-    files, `git reset --hard`, `git clean`, `git checkout -- …`, `git branch -D`…);
-  - changes rights or the system (`sudo`, `chown`, setuid `chmod`, `launchctl`, `crontab`…);
-  - runs text as code (`… | sh`, `eval`, a script outside your folders);
-  - touches credentials (`~/.m2/settings.xml`, `.npmrc`, `printenv`/`env`, which show the Maven
-    wrapper's password) or the protected files;
-  - publishes (`npm publish`, `mvn deploy`, `docker push`);
-  - writes outside your folders and `/tmp` (a redirection, `cp`, `mv`, `tee`, `sed -i`…).
+  parses the command (pipes, `&&`, `$(…)`, `sh -c "…"`, `xargs`, `find -exec`, redirections) and
+  looks at what each part does, never at words in its arguments. It asks only when a part:
+  - sends something out (`git push`, `curl` to another host, `ssh`, `gh pr create`, `npm publish`,
+    `mvn deploy`, `docker push`);
+  - loses work git doesn't hold (`rm -r` and `find -delete` of uncommitted files; `git reset --hard`,
+    `git checkout -- …`, `git restore`, `git clean`, but only when there is uncommitted work they
+    would lose) or drops history (`git branch -D`, `git stash drop`, `git filter-repo`…);
+  - changes the system (`sudo`, `chown`, setuid `chmod`, `systemctl restart`…);
+  - writes to a path known to be outside your folders and `/tmp`, to the protected files, to
+    credentials, or to the notes that go into the system prompt (§7.2);
+  - runs text it can't look into (`… | sh`, `eval "$X"`).
 
-  The dialog says which of these it is. Reading asks never, whatever the arguments contain:
-  `grep -rn security src`, `find ~/.m2/repository …`, `git log -S curl` run without a question.
-  Neither does what git undoes: `git fetch`, `git pull`, `git ls-remote`, `git remote show`, and
-  `rm -r` or `find -delete` in a work tree when `git status` shows no uncommitted work under that
-  path. Files git ignores count as rebuildable, so `rm -rf target` doesn't ask; a `.env` in an
-  ignored folder would go with it. The whole work tree (`rm -rf .`, `rm -rf *`) always asks.
-  The project's own notes folder is open too, `rm -r` included, however the path is written
-  (`$PI_PROJECT_NOTES`, `$(date …)` in a file name, a variable set in the same command); only the
-  files of it that go into the system prompt ask (§7.2). A path that depends on anything else
-  counts as outside your folders.
+  The dialog says which of these it is. Everything else runs without a question: anything that reads
+  (`cat ~/.m2/settings.xml`, `env`, `find . -not -path './.obsidian/*' | grep -v x`), `curl` to
+  localhost, read-only `gh`, every commit, rebase, merge, fetch, pull and clone into your folders.
+  Files git ignores count as rebuildable, so `rm -rf target` doesn't ask; a `.env` in an ignored
+  folder would go with it. The whole work tree (`rm -rf .`, `rm -rf *`) always asks. The project's
+  own notes folder is open, `rm -r` included. A path that can't be told (`"$f"` in a loop) doesn't
+  ask: the container's disk is read-only, so only mounted folders could be hit; deleting such a path
+  recursively does ask. Changes to a single uncommitted file (`rm a`, `> a`, `sed -i`) don't ask:
+  that is the agent's everyday work.
   `all` asks before **every** command, and `off` keeps only the path guard. The rules are tested
   in `sandbox/test/sandbox-guard.test.ts` (`node --experimental-strip-types --test sandbox/test/*.test.ts`).
 - **Bash timeout:** `extensions.bash_timeout: 600` (`PI_BASH_TIMEOUT`): a command the model gives no
@@ -1407,7 +1409,7 @@ Repeat after upgrading macOS, Colima, Docker, mitmproxy or Pi. After the session
 | `pibox: unknown setting …` | A typo, or a key in the wrong section: compare with §6.5 |
 | `pibox: models in … each with id, contextWindow and maxTokens` | Every entry under `models` needs all three; numbers without quotes |
 | `yq`: `did not find expected key` and similar | A YAML syntax error at the line shown: indentation, or a value starting with `-`, `@`, `*`, `{` that needs quotes |
-| "Path … is outside …" | `sandbox-guard.ts` is doing its job: the file is outside your projects and the vault. Copy it in |
+| "Path … is outside …" | `sandbox-guard.ts` is doing its job: `write`/`edit` go outside your projects and the vault. Copy the file in |
 | "… is protected: hooks, git config and .obsidian …" | Also on purpose (§6.2). Make that change yourself |
 | Maven or Gradle: `Could not transfer artifact … 403` / `CONNECT tunnel failed` | The build reached for a repository directly. Check that the repository is in your `settings.xml` (an active profile or a mirror) and `repository.maven_settings` is set, then `pibox setup`; for Gradle, that `~/.gradle/init.d/pi-sandbox.gradle` exists in the container |
 | `./gradlew` hangs or fails downloading `gradle-…-bin.zip` | The wrapper downloads from `services.gradle.org` over HTTPS (§8.9). Use `gradle`, or set `distributionUrl` to your repository's copy |
