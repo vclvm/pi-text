@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   digest, hashFile, memoryBlock, memoryPath, mergeSessions, parseUpdate, progressPath, readState, register,
-  savePending, staleness, taskFiles, taskId, topicNames, unmerged, type Ask,
+  report, savePending, staleness, taskFiles, taskId, topicNames, unmerged, type Ask,
 } from "../extensions/lib/memory.ts";
 import { section } from "../extensions/project-context.ts";
 
@@ -138,6 +138,34 @@ test("a session knows whether it has something for the memory", async () => {
   assert.equal(unmerged(notes, p), true);
   await mergeSessions(notes, null, LIMIT, answering("<unchanged/>"));
   assert.equal(unmerged(notes, p), false);
+});
+
+test("one pass is one message, and only lost work is a warning", () => {
+  const pass = (o: object) => report({ updated: 0, failed: [], lost: 0, interrupted: false, ...o });
+  assert.equal(pass({}), null);
+  assert.deepEqual(pass({ updated: 1 }), { text: "project memory: updated from 1 session", level: "info" });
+  assert.deepEqual(pass({ updated: 1, failed: ["no answer"] }),
+    { text: "project memory: updated from 1 session; 1 session will be tried again: no answer", level: "info" });
+  assert.equal(pass({ failed: ["a", "b"] })?.level, "info");
+  assert.equal(pass({ failed: ["a"], lost: 1 })?.level, "warning");
+  assert.match(pass({ failed: ["a"], lost: 1 })?.text ?? "", /gave up on 1 session after 3 tries/);
+});
+
+test("when the time ran out the pass stops: the next request would wait as long", async () => {
+  const notes = folder(); let asked = 0;
+  session(notes, "s1", WORK); session(notes, "s2", WORK);
+  const done = await mergeSessions(notes, null, LIMIT, async () => { asked++; return { text: "", complete: false, slow: true, error: "too slow" }; });
+  assert.equal(asked, 1);
+  assert.deepEqual(done.failed, ["too slow"]);
+  assert.equal(done.lost, 0);
+});
+
+test("a session given up on is counted as lost", async () => {
+  const notes = folder(), broken: Ask = async () => ({ text: "x", complete: true });
+  session(notes, "s1", WORK);
+  assert.equal((await mergeSessions(notes, null, LIMIT, broken)).lost, 0);
+  assert.equal((await mergeSessions(notes, null, LIMIT, broken)).lost, 0);
+  assert.equal((await mergeSessions(notes, null, LIMIT, broken)).lost, 1);
 });
 
 test("a hand edit during the request wins", async () => {

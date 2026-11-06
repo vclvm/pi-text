@@ -69,7 +69,11 @@ export interface Update {
   topics: Record<string, string>;
 }
 
-export type Ask = (system: string, user: string) => Promise<{ text: string; complete: boolean; error?: string; cancelled?: boolean }>;
+export type Ask = (system: string, user: string) => Promise<{
+  text: string; complete: boolean; error?: string;
+  cancelled?: boolean;              // we hung up
+  slow?: boolean;                   // the time ran out: the next session would likely wait for it too
+}>;
 
 const dir = (notes: string) => join(notes, ".memory");
 const pendingDir = (notes: string) => join(dir(notes), "pending");
@@ -314,7 +318,8 @@ function keepNewest(files: Record<string, string>): Record<string, string> {
 
 export interface Outcome {
   updated: number;                  // sessions merged by a request
-  failed: string[];
+  failed: string[];                 // why requests failed; those sessions are tried again…
+  lost: number;                     // …except these, given up after MAX_ATTEMPTS: never in the memory
   interrupted: boolean;             // an earlier session of the current task stopped midway
 }
 
@@ -327,7 +332,7 @@ export function unmerged(notes: string, p: Pending): boolean {
 /** Merge every session with entries not merged yet, oldest first. Runs in one process at a time; the
  *  others find the lock and go on. A failure changes nothing: the session stays for the next start. */
 export async function mergeSessions(notes: string, current: string | null, limit: number, ask: Ask): Promise<Outcome> {
-  const outcome: Outcome = { updated: 0, failed: [], interrupted: false };
+  const outcome: Outcome = { updated: 0, failed: [], lost: 0, interrupted: false };
   const release = lock(notes);
   if (!release) return outcome;
   try {
@@ -372,10 +377,11 @@ export async function mergeSessions(notes: string, current: string | null, limit
       const update = answer.complete && !answer.error ? parseUpdate(answer.text, limit) : null;
       if (!update) {
         const tries = (state.attempts[p.id] ?? 0) + 1;
-        if (tries >= MAX_ATTEMPTS) { state.merged[p.id] = d.lastId; delete state.attempts[p.id]; }
+        if (tries >= MAX_ATTEMPTS) { state.merged[p.id] = d.lastId; delete state.attempts[p.id]; outcome.lost++; }
         else state.attempts[p.id] = tries;
         saveState(notes, state);
         outcome.failed.push(answer.error || (answer.complete ? "the model's answer wasn't an update" : "the model's answer was cut off"));
+        if (answer.slow) break;
         continue;
       }
       // Edited by hand during the request: those words win, the session is merged next time.
@@ -393,6 +399,18 @@ export async function mergeSessions(notes: string, current: string | null, limit
   } finally {
     release();
   }
+}
+
+/** What the user hears of one pass, in one message. A session tried again costs nothing, so only a
+ *  session given up on is a warning. */
+export function report(o: Outcome): { text: string; level: "info" | "warning" } | null {
+  const sessions = (n: number) => `${n} session${n === 1 ? "" : "s"}`;
+  const parts: string[] = [];
+  if (o.updated) parts.push(`updated from ${sessions(o.updated)}`);
+  const retried = o.failed.length - o.lost;
+  if (retried > 0) parts.push(`${sessions(retried)} will be tried again: ${o.failed[o.failed.length - 1]}`);
+  if (o.lost) parts.push(`gave up on ${sessions(o.lost)} after ${MAX_ATTEMPTS} tries, that work stays out of it: ${o.failed[o.failed.length - 1]}`);
+  return parts.length ? { text: `project memory: ${parts.join("; ")}`, level: o.lost ? "warning" : "info" } : null;
 }
 
 // -------------------------------------------------------------------------------- what's out of date

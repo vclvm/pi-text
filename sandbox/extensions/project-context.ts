@@ -17,14 +17,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   DEFAULT_MEMORY_CHARS, gitHead, hashFile, memoryBlock, mergeSessions, progressPath, register,
-  savePending, staleness, topicNames, unmerged, type Ask, type Pending,
+  report, savePending, staleness, topicNames, unmerged, type Ask, type Pending,
 } from "./lib/memory.ts";
 
 const NOTES = process.env.PI_PROJECT_NOTES || "";
 const MAX_CHARS = 20000;   // per file: the section goes with every request
 const MEMORY_CHARS = Number(process.env.PI_MEMORY_CHARS ?? DEFAULT_MEMORY_CHARS);   // 0 = no memory
 const MERGE_WAIT_MS = 30_000;       // how long the first message waits for the memory of the last session
-const MERGE_TIMEOUT_MS = 600_000;   // the router may be busy; the session then stays for the next start
+const MERGE_TIMEOUT_MS = 600_000;   // per request: the router may be busy; the session then waits for the next pass
 const IDLE_MS = 120_000;            // a pause this long after a run: the work so far goes into memory
 const QUIT_WAIT_MS = 60_000;        // how long quitting waits for that; the next start does what is left
 const LET_GO_MS = 2_000;            // after cancelling: enough to release the lock
@@ -68,16 +68,21 @@ export function section(notes: string, rules: string, task: string, progress = "
 }
 
 /** One request to the session's model, without tools. */
-function asker(ctx: ExtensionContext, signal: AbortSignal, cancel: AbortSignal): Ask | null {
+function asker(ctx: ExtensionContext, cancel: AbortSignal): Ask | null {
   const model = ctx.model, registry = ctx.modelRegistry;
   if (!model) return null;
   return async (systemPrompt, user) => {
+    const time = AbortSignal.timeout(MERGE_TIMEOUT_MS);
     const stream = registry.streamSimple(model, {
       systemPrompt, messages: [{ role: "user", content: user, timestamp: Date.now() }],
-    }, { signal });
+    }, { signal: AbortSignal.any([cancel, time]) });
     const reply = await stream.result();
     const text = reply.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("");
-    return { text, complete: reply.stopReason === "stop", error: reply.errorMessage, cancelled: cancel.aborted };
+    const slow = time.aborted && !cancel.aborted;
+    return {
+      text, complete: reply.stopReason === "stop", cancelled: cancel.aborted, slow,
+      error: slow ? `the model didn't answer within ${MERGE_TIMEOUT_MS / 60_000} minutes` : reply.errorMessage,
+    };
   };
 }
 
@@ -110,11 +115,11 @@ export default function (pi: ExtensionAPI) {
     const session = ctx.sessionManager.getSessionFile() ? ctx.sessionManager.getSessionId() : null;
     const fresh = ctx.sessionManager.getLeafId() === null, cwd = ctx.cwd;
     merging = merging.then(async () => {
-      const ask = asker(ctx, AbortSignal.any([stop.signal, AbortSignal.timeout(MERGE_TIMEOUT_MS)]), stop.signal);
+      const ask = asker(ctx, stop.signal);
       if (ask) {
         const done = await mergeSessions(NOTES, session, MEMORY_CHARS, ask);
-        if (done.updated) say(`project memory updated from ${done.updated} session(s)`);
-        if (done.failed.length) say(`project memory not updated (tried again later): ${done.failed[0]}`, "warning");
+        const news = report(done);
+        if (news) say(news.text, news.level);
         if (atStart && done.interrupted && fresh) say("the last session of this task stopped midway: `pibox run -c` continues it");
       }
       if (atStart) stale = staleness(NOTES, cwd);
