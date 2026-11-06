@@ -1633,6 +1633,7 @@ task)                                       # the project's task and notes, outs
       if [[ -f "$n/current-task.md" ]]; then print -r -- "current task: $n/current-task.md (${$(wc -l <"$n/current-task.md")// /} lines)"
       else print -r -- "no current task yet: pibox task new"; fi
       if [[ -f "$n/task-progress.md" ]]; then print -r -- "progress: $n/task-progress.md"; fi
+      if [[ -f "$n/current-prompt.txt" ]]; then print -r -- "current prompt: $n/current-prompt.txt"; fi
       if [[ -f "$n/memory.md" ]]; then print -r -- "project memory: $n/memory.md (${$(wc -c <"$n/memory.md")// /} bytes)"; fi
       ;;
     new|next)                               # archive the task and its progress, start a new one; the memory stays

@@ -602,6 +602,7 @@ pibox run
   | `memory.md` | the project | what it is, commands that work, decisions and why, pitfalls | stays |
   | `memory/<topic>.md` | the project | details of one subject; the agent reads them when needed | stays |
   | `task-progress.md` | the task | what is done, what is next, what failed | moves to `history/` with the task |
+  | `current-prompt.txt` | the run | the prompt being worked on, with what you sent while it ran | not touched: it moves to `history/<time>_prompt.txt` when the run ends, or `_prompt_unfinished.txt` if it was stopped, failed or killed |
 
   `memory.md` and `task-progress.md` go with every request, so they cost tokens each time; an
   exploration read again costs more, because its output stays in the conversation as well.

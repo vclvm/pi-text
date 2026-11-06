@@ -10,6 +10,7 @@
  *  - the same section carries the project's memory and the progress of the task. They are written
  *    without the model's help (lib/memory.ts): each session leaves a record, and one request turns
  *    it into memory, once the session goes idle, on quitting, or at the next start if neither ran.
+ *  - every prompt is kept too (lib/prompts.ts): current-prompt.txt while it runs, then history/.
  * `pibox task new` creates the task's files from the templates; `pibox task edit [rules]` opens them.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -19,6 +20,7 @@ import {
   DEFAULT_MEMORY_CHARS, gitHead, hashFile, memoryBlock, mergeSessions, progressPath, register,
   report, savePending, staleness, topicNames, unmerged, type Ask, type Pending,
 } from "./lib/memory.ts";
+import { PromptLog } from "./lib/prompts.ts";
 
 const NOTES = process.env.PI_PROJECT_NOTES || "";
 const MAX_CHARS = 20000;   // per file: the section goes with every request
@@ -96,6 +98,8 @@ export default function (pi: ExtensionAPI) {
   let stale = "";                    // once per session: its own edits are no news to it
   let stop = new AbortController();  // for good: the session is over
   let idle: NodeJS.Timeout | undefined;
+  const prompts = new PromptLog(NOTES);
+  let failed = false;                // the last attempt of the run ended in an error
 
   const flush = (cwd: string) => {
     if (!mine) return;
@@ -139,6 +143,14 @@ export default function (pi: ExtensionAPI) {
     merge(ctx, true);
   });
 
+  pi.on("input", async (event) => {
+    if (event.source !== "extension") prompts.submit(event.text, event.images?.length ?? 0, event.streamingBehavior !== undefined);
+    return { action: "continue" };
+  });
+
+  // Settled, not agent_end: that one also comes before each automatic retry.
+  pi.on("agent_settled", async (event) => prompts.finish(!event.aborted && !failed));
+
   pi.on("before_agent_start", async (event) => {
     clearTimeout(idle);
     if (remember) {
@@ -165,7 +177,8 @@ export default function (pi: ExtensionAPI) {
     if (hash) mine.files[abs] = hash;
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
+    failed = event.messages.at(-1)?.role === "assistant" && event.messages.at(-1)?.stopReason === "error";
     flush(ctx.cwd);
     if (!remember) return;
     clearTimeout(idle);
@@ -175,6 +188,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event, ctx) => {
     clearTimeout(idle);
+    prompts.finish(false);                                       // quit in the middle of a run
     flush(ctx.cwd);
     if (mine && event.reason === "quit" && unmerged(NOTES, mine)) {
       process.stderr.write("pi: updating the project memory…\n");
