@@ -192,6 +192,15 @@ extensions:
   searxng: ""
   # The most characters web_fetch returns of one page (the rest is cut off)
   fetch_max_chars: 20000
+  # Jira, for the jira_issue tool: when the current task names a ticket (ABC-123), every command
+  # (/design, /review…) reads it and its linked tickets. The address of your Jira, with its context
+  # path if it has one (https://jira.corp, https://corp.example/jira). "" = no Jira tool
+  jira_url: ""
+  # Your Jira token, READ-ONLY if Jira lets you choose: a personal access token (Jira Server / Data
+  # Center, sent as Bearer) or "email:api-token" (Jira Cloud, sent as Basic). Only the filtering
+  # proxy gets it and adds it to requests to jira_url's host; the agent never sees it, and the
+  # proxy lets only GET through, so nothing in Jira can be changed. "" = anonymous
+  jira_token: ""
 
 # ===================================================================================== repository
 # Where the agent downloads its dependencies from (Artifactory, Nexus…): the configuration files

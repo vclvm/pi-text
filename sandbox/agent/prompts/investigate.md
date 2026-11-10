@@ -6,6 +6,9 @@ Investigate: ${@:-the current task from `<project_notes>`}.
 If a current task is written in `<project_notes>`, it is the context of this question: keep to it.
 The current task decides what to work on and how; where it says anything different from the
 defaults below, the task wins. This command only sets the kind of work and the result expected.
+If the task names Jira tickets (ABC-123) or says to take something from Jira, and the `jira_issue`
+tool is there, read them first, with `linked: true` when the task points at related tickets: they
+are part of the task.
 
 Don't change the repository's code. A temporary test or script to reproduce or check something is
 fine; remove it when done, unless the user wants it kept.

@@ -5,6 +5,9 @@ argument-hint: "[focus]"
 Do the review the current task from `<project_notes>` asks for. Extra focus from the user: ${@:-none}.
 The current task decides what to work on and how; where it says anything different from the
 defaults below, the task wins. This command only sets the kind of work and the result expected.
+If the task names Jira tickets (ABC-123) or says to take something from Jira, and the `jira_issue`
+tool is there, read them first, with `linked: true` when the task points at related tickets: they
+are part of the task.
 
 What to review is what the task names: a branch against another, a range of commits, a module, a
 set of files. Only if the task names nothing:

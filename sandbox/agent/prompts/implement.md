@@ -5,6 +5,9 @@ argument-hint: "[extra instructions]"
 Implement the current task from `<project_notes>`. Extra instructions from the user: ${@:-none}.
 The current task decides what to work on and how; where it says anything different from the
 defaults below, the task wins. This command only sets the kind of work and the result expected.
+If the task names Jira tickets (ABC-123) or says to take something from Jira, and the `jira_issue`
+tool is there, read them first, with `linked: true` when the task points at related tickets: they
+are part of the task.
 If there is a design for it in `designs/` of the notes folder, follow the latest one.
 
 1. Read the code the task touches, starting from the most relevant files.

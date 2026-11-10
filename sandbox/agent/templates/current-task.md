@@ -4,7 +4,9 @@
      Describe the problem, the result you want and what the work covers ("the changes of this
      branch against master"). The command you give in Pi (/design, /implement, /review, /test,
      /investigate) only sets the kind of work and what it delivers: it follows this file.
-     Concrete beats long: names of classes, endpoints, an example to follow. -->
+     Concrete beats long: names of classes, endpoints, an example to follow.
+     A Jira ticket named here (ABC-123, "and its linked tickets") is read by every command, when
+     extensions.jira_url is set. -->
 <!-- One or two sentences. A change: what must work afterwards. A bug: what happens and what should.
      A question: what you want to understand ("how does X decide Y, and why is it built so"). -->
 

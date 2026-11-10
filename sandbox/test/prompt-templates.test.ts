@@ -12,6 +12,7 @@ test("no command replaces the current task", () => {
     const text = readFileSync(join(DIR, name), "utf8");
     assert.match(text, /<project_notes>/, name);
     assert.match(text, /the task wins/, name);
+    assert.match(text, /`jira_issue`/, `${name}: reads the Jira tickets the task names`);
   }
 });
 

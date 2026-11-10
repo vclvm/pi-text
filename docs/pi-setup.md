@@ -27,7 +27,7 @@ setup (§6), daily use (§7), and how the sandbox is built (§8–10). Part III 
 
 | Part | Tested on | Result |
 |---|---|---|
-| Pi extensions `sandbox-guard.ts`, `web.ts` (§9) | Pi 1.5.0 through the pi-text bridge | Path guard keeps `write`/`edit` in the projects and the vault, reading is free; `write`/`edit` of `.git/hooks` and `.obsidian` refused; risky bash and unapproved web access are refused without a UI; `web_fetch` and `web_search` return real content |
+| Pi extensions `sandbox-guard.ts`, `web.ts` (§9) | Pi 1.5.0 through the pi-text bridge | Path guard keeps `write`/`edit` in the projects and the vault, reading is free; `write`/`edit` of `.git/hooks` and `.obsidian` refused; risky bash and unapproved web access are refused without a UI; `web_fetch` and `web_search` return real content; `jira_issue` reads a ticket through the proxy, which adds the token and goes on over HTTPS (tested with mitmproxy 12.3.1 and a stand-in Jira) |
 | Egress policy `egress_policy.py` (§8.6) | mitmproxy 12.3.1 | GET/HEAD pass; POST/PUT, bodies, HTTP/1.1 upgrades, private and metadata IPs, other ports, denied hosts and raw TCP are refused; encrypted tunnels (CONNECT) are refused; allowed requests wait for approval except `egress.no_approval` hosts; an `egress.allow_private` host passes; allowed plain-HTTP requests are forwarded to an upstream HTTP proxy (`--mode upstream`), `network.upstream_no_proxy` hosts directly (the upstream proxy sees none of their requests); large downloads stream through; the journal records every decision |
 | `pibox` and the Compose stack (§6, §8) | zsh 5.9, yq 4.53, Docker Engine 29 + Compose 5 on Linux, against the real stack; `colima` a stand-in | `init` installs the components and the `config.yaml` template, links the command, keeps `config.yaml` on a second run and lists new template sections; `check` refuses placeholders; `setup` writes `.env`, `bridge.env`, `models.json` (two models with their own limits, reasoning and compat), the tools' settings and `colima.yaml`; `up` builds the images and starts bridge, proxy and the agent's engine (`privileged`), refuses stale generated files; `shell`, `log`, `review`, `down` work; `verify` passes: no route out, the Mac unreachable, tunnels and private addresses 403, POST 405, the bridge answers, projects and vault writable, `.obsidian` and extensions read-only, JDK 21 and 17, Maven, Gradle, Node, Python, the agent's Docker; the bridge container gets only its own settings |
 | Development toolchain (§8.4, §8.9, §8.10) | Docker Engine 29 on Linux; nginx in front of Maven Central, npm, PyPI and the Gradle plugin portal over plain HTTP, `registry:2` as Docker Hub mirror, a separate upstream proxy | JDK 17/21/25 (`jdk`), Maven 3.10 (`mvn test` on 17 and 25), Gradle 9.8 with a JDK 17 toolchain and `mavenCentral()` redirected by `init.gradle`, npm, pip in a venv, all through the generated settings (credentials with special characters included) and the proxy, the repository reached directly via `network.upstream_no_proxy`. The agent's engine (`privileged`): pulls through the mirror and from the HTTP registry, `docker compose up` + request to `docker:8088`, `docker build` with network in `RUN`, nested containers only GET through the proxy and no direct route, a Testcontainers Redis test passes. `sysbox` mode **not run here** |
@@ -1289,6 +1289,33 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
   `web_fetch` returns the text, the agent writes the note with `write`.
 
 ---
+
+### 9.4 `sandbox/extensions/jira.ts`: the task's Jira tickets
+
+With `extensions.jira_url` set, Pi gets the tool `jira_issue`: a ticket's summary, status,
+description, parent, subtasks, links and last comments, and with `linked: true` the descriptions of
+the linked tickets too. Every command (`/design`, `/implement`, `/review`, `/test`, `/investigate`)
+reads the tickets the current task names before it starts, e.g. `current-task.md`:
+
+```markdown
+# Task
+Implement PAY-12 from Jira, and take its linked tickets into account.
+```
+
+- **The token never reaches the agent.** `extensions.jira_token` goes to the filtering proxy alone,
+  which adds `Authorization` to requests to `jira_url`'s host and to no other. A token
+  `email:api-token` (Jira Cloud) goes as Basic, any other as Bearer (a personal access token of Jira
+  Server / Data Center). `pibox config` shows only that it is set.
+- **Read-only.** The proxy lets only `GET` through, so nothing in Jira can be changed, whatever the
+  token may do. Prefer a read-only token anyway.
+- **Encrypted.** The agent asks for `http://` like every other request (§4.6); with an `https://`
+  `jira_url` the proxy itself connects to Jira over HTTPS, through the proxy on your Mac as a
+  `CONNECT` tunnel, so the token never travels in plain text. An `http://` `jira_url` with a token
+  makes `pibox setup` warn.
+- **Reachable.** `pibox setup` adds Jira's host to `egress.no_approval` and `egress.allow_private`
+  (an internal Jira works, without a question per request) and its port to `egress.ports`.
+- **Data, not instructions.** The tool says so with every ticket, and the system prompt tells the
+  model that a ticket's text can't change its rules.
 
 ## 10. The `pibox` command
 

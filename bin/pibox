@@ -408,6 +408,7 @@ typeset -A SETTING=(
   extensions.bash_approval PI_BASH_APPROVAL      extensions.web_plain_http PI_WEB_PLAIN_HTTP
   extensions.bash_timeout PI_BASH_TIMEOUT        extensions.memory_chars PI_MEMORY_CHARS
   extensions.searxng WEB_SEARCH_SEARXNG          extensions.fetch_max_chars WEB_FETCH_MAX_CHARS
+  extensions.jira_url JIRA_URL                   extensions.jira_token JIRA_TOKEN
   repository.apt_sources APT_SOURCES_FILE
   repository.maven_settings MAVEN_SETTINGS_FILE  repository.npmrc NPMRC_FILE
   repository.docker_daemon DOCKER_DAEMON_FILE    repository.pip_conf PIP_CONF_FILE
@@ -447,6 +448,7 @@ load_config() {                             # defaults, then config.yaml on top
   BRIDGE_PORT=8789 PROXY_PORT=8080 SANDBOX_SUBNET=172.30.0.0/24 MAC_PROXY_PORT="" UPSTREAM_NO_PROXY=""
   EGRESS_ALLOW_PRIVATE="" EGRESS_NO_APPROVAL="" EGRESS_ALLOW_ONLY="" EGRESS_DENY="" EGRESS_PORTS=80,443
   PI_BASH_APPROVAL=risky PI_BASH_TIMEOUT=600 PI_MEMORY_CHARS=20000 PI_WEB_PLAIN_HTTP=1 WEB_SEARCH_SEARXNG="" WEB_FETCH_MAX_CHARS=20000
+  JIRA_URL="" JIRA_TOKEN=""
   APT_SOURCES_FILE=""
   # Taken from your files by pibox setup: npm's and pip's index (also for building the images), the
   # Maven wrapper's repository and login.
@@ -597,6 +599,7 @@ typeset -A CHECK=(
   extensions.bash_approval 'one of:risky all off'                             extensions.web_plain_http bool
   extensions.bash_timeout int           extensions.memory_chars int
   extensions.searxng url                extensions.fetch_max_chars int
+  extensions.jira_url url
   repository.apt_sources file           repository.maven_settings file        repository.npmrc file
   repository.docker_daemon file         repository.pip_conf file             repository.docker_config file
   pi.apt_packages list                  pi.java_default 'one of:17 21 25'     pi.memory size
@@ -751,6 +754,7 @@ cmd_setup() {
   tooling "$SB/generated/c" proxy "$PROXY_PORT" /opt/jdk                      # Maven, Gradle, npm, pip, Docker
   image_names
   repo_hosts "$SB/generated/c"
+  jira_host
   client_docker_config
   dns_hosts
   for v in ${(ou)SETTING} EGRESS_TUNNEL NPM_REGISTRY MVNW_REPOURL MVNW_USERNAME MVNW_PASSWORD UPSTREAM_PROXY SANDBOX_PROXY_IP DIND_RUNTIME DIND_PRIVILEGED PI_DOCKER_HOST COMPOSE_PROFILES; do
@@ -1418,6 +1422,18 @@ repo_hosts() {                              # repo_hosts <dir>: the repositories
   print "repositories, reachable without asking you, also over HTTPS (egress): ${(j:, :)hosts}${ports:+; ports ${(j:, :)ports}}"
 }
 
+jira_host() {                               # Jira: reachable without asking you, also in your network
+  [[ -n "$JIRA_URL" ]] || return 0
+  local h=${${${JIRA_URL#*://}%%/*}##*@} port; local -aU l
+  port=${h##*:}; h=${h%%:*}; [[ "$port" == <-> ]] || port=""
+  l=(${(s:,:)EGRESS_NO_APPROVAL} $h);   EGRESS_NO_APPROVAL=${(j:,:)l}
+  l=(${(s:,:)EGRESS_ALLOW_PRIVATE} $h); EGRESS_ALLOW_PRIVATE=${(j:,:)l}
+  l=(${(s:,:)EGRESS_PORTS} 80 $port);   EGRESS_PORTS=${(j:,:)l}   # the agent asks for http://, the proxy goes on
+  print -r -- "jira: $h reachable without asking you (egress), read-only; ${JIRA_TOKEN:+the proxy adds the token, the agent never sees it}${JIRA_TOKEN:-no token: only what Jira shows anonymously}"
+  [[ -z "$JIRA_TOKEN" || "$JIRA_URL" == https://* ]] ||
+    warn "extensions.jira_url is http://: the Jira token goes over the network unencrypted"
+}
+
 tooling() {                                 # tooling <dir> <proxy host> <proxy port> <jdk dir or "">
   local dir=$1 ph=$2 pp=$3 jdks=$4 nonproxy="localhost|127.0.0.1|bridge|docker" v
   mkdir -p "$dir"; chmod 700 "$dir"
@@ -1572,6 +1588,7 @@ config)                                     # the settings in effect (secrets ma
   for k in ${(ok)SETTING}; do
     v="${eff[${SETTING[$k]}]-${(P)SETTING[$k]}}"
     [[ "$v" == *://*:*@* ]] && v="${v%%://*}://${${v#*://}%%:*}:***@${v#*@}"     # a password in a URL
+    [[ "$k" == *token* ]] && v="${v:+set (${#v} chars)}"
     print -r -- "$k: $v"
   done
   for kv in $BRIDGE_ENV; do

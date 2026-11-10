@@ -74,6 +74,10 @@ services:
       UPSTREAM_PROXY: ${UPSTREAM_PROXY:-}
       UPSTREAM_NO_PROXY: ${UPSTREAM_NO_PROXY:-}
       PROXY_PORT: ${PROXY_PORT:-8080}
+      # Jira (extensions.jira_url/jira_token): the proxy adds the token to requests to Jira's host;
+      # the agent's container never gets it
+      JIRA_URL: ${JIRA_URL:-}
+      JIRA_TOKEN: ${JIRA_TOKEN:-}
       # With an upstream proxy: a second listener through which tunnels to upstream_no_proxy hosts
       # connect directly (upstream mode can't); only loopback connections skip the policy there
       EGRESS_DIRECT_PORT: "18099"
@@ -165,6 +169,7 @@ services:
       PI_WEB_PLAIN_HTTP: ${PI_WEB_PLAIN_HTTP:-1}   # web.ts: send https:// pages as plain http:// requests
       WEB_SEARCH_SEARXNG: ${WEB_SEARCH_SEARXNG:-}
       WEB_FETCH_MAX_CHARS: ${WEB_FETCH_MAX_CHARS:-20000}
+      PI_JIRA_URL: ${JIRA_URL:-}                   # jira.ts: the jira_issue tool; the token stays in the proxy
       # Folders the file tools may touch (sandbox-guard.ts):
       PI_SANDBOX_ROOTS: ${PROJECTS_DIR}:${VAULT_DIR:?run pibox setup, it generates .env from config.yaml}:${NOTES_DIR:?run pibox setup, it generates .env from config.yaml}
       # Notes, tasks and reports, outside the repositories (project-context.ts); pibox run sets

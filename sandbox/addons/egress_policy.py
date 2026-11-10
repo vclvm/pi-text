@@ -19,7 +19,13 @@ Environment (all optional; lists are comma-separated domains, subdomains include
   UPSTREAM_PROXY        the upstream proxy of --mode upstream (needed to know where the rest goes)
   UPSTREAM_NO_PROXY     domains reached directly, not through the upstream proxy
   EGRESS_LOG            journal of every decision, default ~/.mitmproxy/egress.log
+  JIRA_URL, JIRA_TOKEN  requests to Jira's host get "Authorization" here, so the token never enters
+                        the agent's container. With an https:// JIRA_URL they leave as HTTPS, also
+                        when the agent asked for http://: the token never travels in plain text.
+                        A token "email:api-token" (Jira Cloud) goes as Basic, any other as Bearer
+                        (a personal access token of Jira Server / Data Center).
 """
+import base64
 import ipaddress
 import logging
 import os
@@ -29,6 +35,7 @@ import time
 
 from mitmproxy import ctx, http, tcp, udp
 from mitmproxy.net import server_spec
+from urllib.parse import urlsplit
 
 
 def _domains(name: str) -> set:
@@ -50,6 +57,22 @@ UPSTREAM = server_spec.parse(os.environ["UPSTREAM_PROXY"], "http") if os.environ
 # Only connections from the loopback count as internal (not checked again); anyone else connecting
 # to that port goes through the same policy as on the main port.
 DIRECT = ("http", ("127.0.0.2", int(os.environ["EGRESS_DIRECT_PORT"]))) if os.environ.get("EGRESS_DIRECT_PORT") else None
+
+
+def _jira() -> tuple[str, bool, int, str]:
+    """Jira's host, whether it speaks TLS, its port, and the Authorization header ("" = none)."""
+    url = urlsplit(os.environ.get("JIRA_URL", "").strip())
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return "", False, 0, ""
+    token = os.environ.get("JIRA_TOKEN", "").strip()
+    if ":" in token:
+        auth = "Basic " + base64.b64encode(token.encode()).decode()
+    else:
+        auth = f"Bearer {token}" if token else ""
+    return url.hostname.lower(), url.scheme == "https", url.port or (443 if url.scheme == "https" else 80), auth
+
+
+JIRA_HOST, JIRA_TLS, JIRA_PORT, JIRA_AUTH = _jira()
 LOG_FILE = os.environ.get("EGRESS_LOG") or os.path.expanduser("~/.mitmproxy/egress.log")
 log = logging.getLogger("egress")
 
@@ -166,6 +189,13 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     _route(flow, req.host)
     if UPSTREAM and _matches(req.host, NO_PROXY):
         req.authority = ""                    # direct: send "GET /path", not the proxy form
+    if JIRA_HOST and req.host.lower().rstrip(".") == JIRA_HOST:
+        if JIRA_TLS:                          # the agent speaks plain HTTP to us; Jira gets HTTPS
+            req.scheme, req.port = "https", JIRA_PORT
+            req.authority = ""                # inside the TLS connection: "GET /path", not the proxy form
+        if JIRA_AUTH:
+            req.headers["Authorization"] = JIRA_AUTH
+        flow.metadata["jira"] = True
     if _matches(req.host, NO_APPROVAL):
         _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url}")
     else:

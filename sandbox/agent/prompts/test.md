@@ -6,6 +6,9 @@ Test the implementation of the current task from `<project_notes>`. What to chec
 user: ${@:-the task's acceptance criteria}.
 The current task decides what to work on and how; where it says anything different from the
 defaults below, the task wins. This command only sets the kind of work and the result expected.
+If the task names Jira tickets (ABC-123) or says to take something from Jira, and the `jira_issue`
+tool is there, read them first, with `linked: true` when the task points at related tickets: they
+are part of the task.
 
 Don't change the code under test. Run the tests that cover the change first, then a wider run if
 it is cheap. If a test fails, find the cause from the evidence (output, code), not by guessing.
