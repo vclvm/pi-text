@@ -47,7 +47,8 @@ Install and configure:
   config         show the settings in effect (secrets masked)
 
 Run:
-  up             start the VM, build the images, start bridge, proxy and the agent's Docker engine
+  up [--build]   start the VM, build the images (only if what they are built from changed; --build:
+                 always), start bridge, proxy and the agent's Docker engine
   run [args]     Pi in a fresh container, in the current folder (args go to pi)
   task [new|edit [rules|memory]]
                  the project's task, rules and memory, outside its repository (folders.notes/<path under
@@ -1037,7 +1038,26 @@ vm_ca() {                                   # the CA certificates into the VM's 
     fi' sh "$SB/generated/ca"
 }
 
+build_fingerprint() {                       # what the images were built from, and the images themselves
+  # The build's inputs: the resolved compose files (build args from .env, extra_hosts), the
+  # Dockerfiles, and every file a Dockerfile copies or mounts; then the IDs of the built images.
+  # Same inputs and the images still there: nothing to build. Missing images print nothing.
+  local f; local -a files
+  files=("$SB"/{compose.yaml,Dockerfile.pi}(N.) "$SB"/generated/{ca,apt,build}/**/*(DN.) "$SB"/bridge/**/*(DN.))
+  { compose config 2>&1
+    for f in $files; do print -r -- "== ${f#$SB/}"; cat -- "$f"; done
+  } | if have shasum; then shasum -a 256; else sha256sum; fi | cut -d' ' -f1
+  dk; $reply image inspect --format '{{.Id}}' pibox.local/bridge pibox.local/pi 2>/dev/null || true
+}
+
 build_images() {                            # compose build, telling what happens and where things come from
+  local stamp="$SB/generated/build.stamp" now
+  now=$(build_fingerprint)
+  if [[ "${1:-}" != force && -f "$stamp" && "$now" == "$(<"$stamp")" ]]; then
+    print "the images are up to date (nothing they are built from changed since the last build): not building"
+    return 0
+  fi
+  rm -f "$stamp"
   local -A e; local kv
   for kv in ${(f)"$(grep -E "^[A-Z_][A-Z0-9_]*='" "$SB/.env")"}; do e[${kv%%=*}]=${${kv#*=\'}%\'}; done
   print "building the images (the first time takes a while; later only what changed). Sources:
@@ -1050,6 +1070,7 @@ build_images() {                            # compose build, telling what happen
   : >"$log"
   compose --progress plain build 2>&1 | build_progress "$log" ||
     die "building the images failed (the error is above; the whole output: $log)"
+  build_fingerprint >"$stamp"               # with the new image IDs
 }
 
 build_progress() {                          # build_progress <log>: BuildKit's plain output, readable
@@ -1122,8 +1143,11 @@ dk() {
 compose() { compose_args; local -a c=($reply); dk; $reply $c "$@" }
 
 vm_running() { colima status -p "$VM_PROFILE" >/dev/null 2>&1 }
+# Did pibox setup or init run since the last pibox up? setup always writes .env, init always
+# installs a new bin/pibox; both replace the files the containers mount.
+up_current() { [[ "$SB/generated/up.stamp" -nt "$SB/.env" && ! "$SB/bin/pibox" -nt "$SB/generated/up.stamp" ]] }
 running() {                                 # bridge and proxy must be up, or `compose run` would build and start them
-  [[ "$SB/generated/up.stamp" -nt "$SB/.env" && ! "$SB/bin/pibox" -nt "$SB/generated/up.stamp" ]] ||
+  up_current ||
     die "pibox setup or init ran since the last pibox up: run pibox up (it recreates the containers)"
   vm_running && [[ -n "$(compose ps -q --status running bridge 2>/dev/null)" ]] || die "the sandbox isn't running: pibox up"
 }
@@ -1620,11 +1644,20 @@ up)                                         # VM, images, bridge, proxy, the age
   vm_ca
   vm_dns_check
   [[ "$AGENT_DOCKER" != sysbox ]] || sysbox
-  build_images
-  print "starting the containers: bridge, proxy${PI_DOCKER_HOST:+, the agent's Docker engine}"
-  # Always new containers: pibox init/setup replace the files they mount, and a container keeps
-  # the old (deleted) ones until it is created again.
-  compose up -d --force-recreate --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
+  local rebuild=""; [[ "${1:-}" == --build ]] && rebuild=force
+  build_images $rebuild
+  # pibox init/setup replace the files the containers mount, and a container keeps the old
+  # (deleted) ones until it is created again: then new containers. Otherwise compose keeps the
+  # running ones (the proxy's approvals, the agent's containers in its Docker engine) and
+  # recreates only those whose image or settings changed.
+  local -a recreate=()
+  if up_current; then
+    print "starting the containers that aren't running or changed: bridge, proxy${PI_DOCKER_HOST:+, the agent's Docker engine}"
+  else
+    recreate=(--force-recreate)
+    print "starting the containers (new ones: pibox setup or init ran since the last pibox up): bridge, proxy${PI_DOCKER_HOST:+, the agent's Docker engine}"
+  fi
+  compose up -d $recreate --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
   touch "$SB/generated/up.stamp"
   for i in {1..30}; do                      # wait until the bridge accepts connections
     compose exec -T bridge python3 -c "import socket; socket.create_connection(('127.0.0.1', $BRIDGE_PORT), 1)" \

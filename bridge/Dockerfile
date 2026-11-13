@@ -12,7 +12,8 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt PIP_CERT=/etc/ssl/certs/ca-
 # Your pip.conf, if pibox setup put one into build/ (repository.pip_conf): pip reads your index
 # and login from it itself. Mounted for this step only, so the login doesn't stay in the image.
 # pip's downloads stay in BuildKit's cache between builds.
-RUN --mount=type=bind,source=.,target=/ctx --mount=type=cache,target=/root/.cache/pip \
+# Only build/ is mounted: a mount's content is part of the step's cache key.
+RUN --mount=type=bind,source=build,target=/ctx/build --mount=type=cache,target=/root/.cache/pip \
     if [ -f /ctx/build/pip.conf ]; then export PIP_CONFIG_FILE=/ctx/build/pip.conf; fi; \
     pip install -r requirements.txt
 # The code last: changing it doesn't reinstall the dependencies.

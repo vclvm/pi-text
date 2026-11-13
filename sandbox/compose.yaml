@@ -54,14 +54,20 @@ services:
     # Give the console a terminal size (docker attach resizes it later), then start it as the
     # unprivileged mitmproxy user. With UPSTREAM_PROXY set, allowed requests are forwarded there.
     # stream_large_bodies: big downloads (images, archives) pass through instead of being buffered.
+    # The HTTPS the proxy makes itself (web pages the agent asked for as https://, Jira) trusts the
+    # public CAs and your company's (network.ca_certs), e.g. of a proxy that inspects TLS.
     command:
       - sh
       - -c
       - >-
         stty cols 160 rows 48
+        && ca=""
+        && if ls /pibox-ca/*.crt >/dev/null 2>&1; then
+        cat "$$(python3 -c 'import certifi; print(certifi.where())')" /pibox-ca/*.crt > /tmp/pibox-ca.pem
+        && ca="--set ssl_verify_upstream_trusted_ca=/tmp/pibox-ca.pem"; fi
         && exec env HOME=/home/mitmproxy gosu mitmproxy
         mitmproxy --listen-port $${PROXY_PORT:-8080} --set connection_strategy=lazy
-        --set stream_large_bodies=1m
+        --set stream_large_bodies=1m $$ca
         $${UPSTREAM_PROXY:+--mode upstream:$$UPSTREAM_PROXY --mode regular@$$EGRESS_DIRECT_PORT}
         -s /addons/egress_policy.py
     environment:
@@ -83,6 +89,7 @@ services:
       EGRESS_DIRECT_PORT: "18099"
     volumes:
       - ./addons:/addons:ro
+      - ./generated/ca:/pibox-ca:ro
     networks:
       sandbox: { ipv4_address: "${SANDBOX_PROXY_IP:-172.30.0.10}" }   # fixed: containers inside the agent's Docker use it
       egress: {}

@@ -3,7 +3,8 @@
  * https_proxy environment), shown to the user first: Allow once / Allow host for the session / Deny.
  * Search backends: SearXNG (WEB_SEARCH_SEARXNG=http://searxng:8080) or DuckDuckGo's HTML endpoint.
  * PI_WEB_PLAIN_HTTP=1: send https:// URLs to the proxy as plain http:// requests (no tunnel), so a
- * filtering proxy can see the method; the proxy chain takes care of the connection to the site.
+ * filtering proxy can see the method, marked with X-Pibox-Https: 1 so that the proxy fetches them
+ * over HTTPS. Redirects are followed here, each as such a request.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -17,9 +18,13 @@ const PRIVATE_HOST = /^(localhost|.*\.local|.*\.internal|bridge|proxy|metadata(\
 export default function (pi: ExtensionAPI) {
   const allowedHosts = new Set<string>();
 
-  async function approve(url: URL, why: string, ctx: ExtensionContext): Promise<void> {
+  function check(url: URL): void {
     if (!/^https?:$/.test(url.protocol)) throw new Error(`Only http(s) URLs are allowed, got ${url.protocol}`);
     if (PRIVATE_HOST.test(url.hostname)) throw new Error(`Refusing private/internal host ${url.hostname}`);
+  }
+
+  async function approve(url: URL, why: string, ctx: ExtensionContext): Promise<void> {
+    check(url);
     if (allowedHosts.has(url.hostname)) return;
     if (!ctx.hasUI) throw new Error("Web access needs approval, but no UI is available");
     const choice = await ctx.ui.select(`🌐 ${why}\n\nGET ${url.href}\n`,
@@ -28,19 +33,49 @@ export default function (pi: ExtensionAPI) {
     else if (choice !== "Allow once") throw new Error("Request denied by the user");
   }
 
-  async function get(url: URL, signal?: AbortSignal): Promise<{ status: number; type: string; body: string }> {
+  type Reply = { status: number; type: string; location: string; body: string };
+
+  // One request, no redirects. PLAIN_HTTP: an https:// page goes to the proxy as "GET http://…"
+  // with X-Pibox-Https: 1, and the proxy fetches it over HTTPS (egress_policy.py).
+  async function getOnce(url: URL, signal?: AbortSignal): Promise<Reply> {
     const marker = "\n__PI_WEB__";
-    const args = ["--silent", "--show-error", "--location", "--max-redirs", "5", "--max-time", "30",
-      "--max-filesize", "5000000", "--proto", "=http,https", "--proto-redir", "=http,https",
-      "--user-agent", "pi-web/1.0", "--write-out", `${marker}%{http_code}|%{content_type}`];
+    const args = ["--silent", "--show-error", "--max-time", "30", "--max-filesize", "5000000",
+      "--proto", "=http,https", "--user-agent", "pi-web/1.0",
+      "--write-out", `${marker}%{http_code}|%header{location}|%{content_type}`];
     if (PROXY) args.push("--proxy", PROXY);
-    args.push("--", PLAIN_HTTP && url.protocol === "https:" ? "http:" + url.href.slice(6) : url.href);
+    const plain = PLAIN_HTTP && url.protocol === "https:";
+    if (plain) args.push("--header", "X-Pibox-Https: 1");
+    args.push("--", plain ? "http:" + url.href.slice(6) : url.href);
     const r = await pi.exec("curl", args, { signal, timeout: 35000, maxBuffer: 8 * 1024 * 1024 });
-    if (r.code !== 0 && !r.stdout.includes(marker)) throw new Error(`curl failed: ${r.stderr.trim()}`);
     const at = r.stdout.lastIndexOf(marker);
+    if (at < 0) throw new Error(`curl failed: ${r.stderr.trim() || `exit code ${r.code}`}`);
     const meta = r.stdout.slice(at + marker.length).trim();
-    const sep = meta.indexOf("|");
-    return { status: Number(meta.slice(0, sep)), type: meta.slice(sep + 1), body: r.stdout.slice(0, at) };
+    const a = meta.indexOf("|"), b = meta.lastIndexOf("|");
+    const status = Number(meta.slice(0, a));
+    // 000: no answer at all (the proxy refused the connection, a timeout): say why, not "empty page"
+    if (!status) throw new Error(`curl failed: ${r.stderr.trim() || `exit code ${r.code}`} (${url.href})`);
+    return { status, location: meta.slice(a + 1, b), type: meta.slice(b + 1), body: r.stdout.slice(0, at) };
+  }
+
+  // Redirects are followed here, not by curl: curl would follow an https:// Location through a
+  // tunnel, which the proxy refuses. Another host needs approval as the first one did.
+  async function get(url: URL, ctx: ExtensionContext, signal?: AbortSignal): Promise<Reply & { url: URL }> {
+    for (let hops = 0; ; hops++) {
+      const r = await getOnce(url, signal);
+      if (r.status < 300 || r.status >= 400 || !r.location) return { ...r, url };
+      if (hops >= 5) throw new Error(`too many redirects, the last to ${r.location}`);
+      const next = new URL(r.location, url);
+      if (next.hostname === url.hostname) check(next);
+      else await approve(next, `The page redirects from ${url.href}`, ctx);
+      url = next;
+    }
+  }
+
+  // A search engine's answer other than 200 (the proxy's refusal, a rate limit, a captcha page) is
+  // an error with its text, not "No results."
+  function answered(r: Reply): Reply {
+    if (r.status !== 200) throw new Error(`search failed: HTTP ${r.status}: ${toText(r.body).slice(0, 300)}`);
+    return r;
   }
 
   function toText(html: string): string {
@@ -64,11 +99,12 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, signal, _onUpdate, ctx) {
       const url = new URL(params.url);
       await approve(url, "The agent wants to read a web page", ctx);
-      const r = await get(url, signal);
+      const r = await get(url, ctx, signal);
       let text = /html/i.test(r.type) ? toText(r.body) : r.body;
       if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + `\n… [truncated, ${text.length} chars]`;
-      return { content: [{ type: "text", text: `HTTP ${r.status} ${r.type}\n\n${text}` }],
-               details: { url: url.href, status: r.status } };
+      const from = r.url.href !== url.href ? ` (redirected to ${r.url.href})` : "";
+      return { content: [{ type: "text", text: `HTTP ${r.status} ${r.type}${from}\n\n${text || "(empty body)"}` }],
+               details: { url: r.url.href, status: r.status } };
     },
   });
 
@@ -84,7 +120,7 @@ export default function (pi: ExtensionAPI) {
         const url = new URL("/search", SEARXNG);
         url.search = new URLSearchParams({ q: params.query, format: "json" }).toString();
         await approve(url, `Search: ${params.query}`, ctx);
-        const r = await get(url, signal);
+        const r = answered(await get(url, ctx, signal));
         for (const item of (JSON.parse(r.body).results ?? []).slice(0, 10)) {
           results.push({ title: item.title, url: item.url, snippet: item.content ?? "" });
         }
@@ -92,7 +128,7 @@ export default function (pi: ExtensionAPI) {
         const url = new URL("https://html.duckduckgo.com/html/");
         url.search = new URLSearchParams({ q: params.query }).toString();
         await approve(url, `Search: ${params.query}`, ctx);
-        const r = await get(url, signal);
+        const r = answered(await get(url, ctx, signal));
         const re = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
         for (const m of r.body.matchAll(re)) {
           let href = m[1].replace(/&amp;/g, "&");

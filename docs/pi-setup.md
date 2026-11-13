@@ -492,9 +492,14 @@ pibox verify
 
 `pibox up` starts the Colima VM if it isn't running and lists its shared folders (there must be
 exactly three: the projects, the vault, `~/.pi-sandbox`). With `agent_docker.mode: sysbox` it installs
-the sysbox runtime from `agent_docker.sysbox_deb_url` into the VM on the first run (§8.10). Then it builds the images (once; afterwards only
-what changed) and starts the bridge, the proxy and the agent's Docker engine, and waits until the
-bridge answers. Run it again after `pibox setup` or `pibox init`.
+the sysbox runtime from `agent_docker.sysbox_deb_url` into the VM on the first run (§8.10). Then it builds the images: the
+first time, and afterwards only when something they are built from changed (the Dockerfiles,
+the compose files, the generated build settings, CA certificates, apt sources) or an image is
+missing; `pibox up --build` builds anyway (BuildKit's cache still skips the unchanged steps).
+It starts the bridge, the proxy and the agent's Docker engine, and waits until the bridge
+answers. The running containers are kept, unless `pibox setup` or `pibox init` ran since the last
+`pibox up`: then they are created anew, since those replace the files they mount. Run it again
+after `pibox setup` or `pibox init`.
 
 Run this once after setup, and again after upgrades:
 
@@ -639,7 +644,9 @@ pibox run
   reviews; a task that names nothing gets the branch's work against the default branch plus
   uncommitted changes. Each writes one report into `designs/`, `implemented/`, `reviews/`,
   `tests/` or `investigations/` of the notes folder (named `<date>_<time>_<2-3 words>_<kind>.md`)
-  and answers with a short verdict and the file's path. `/design`, `/review` and `/investigate`
+  and answers with a short verdict and the file's path. A review report opens with its context:
+  what was compared, what the task and its tickets ask, what the changes do, what was verified
+  (commands run and their result); the findings come after. `/design`, `/review` and `/investigate`
   don't change the code; `/investigate` cites `file:line`, outputs and commits for every claim and
   proposes a fix without applying it.
 - **A new `.md` file in a repository asks first** (sandbox-guard): allow it for docs you want in
@@ -1281,7 +1288,10 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
   so the agent can't use the tool to probe its neighbours.
 - **`extensions.web_plain_http: true`** (the default; `PI_WEB_PLAIN_HTTP=1` in the agent's environment): an `https://` URL is requested from
   the proxy as `http://…`, a plain request whose method the proxy can check, instead of an
-  encrypted tunnel it would refuse. You still see and approve the original URL.
+  encrypted tunnel it would refuse. The request carries `X-Pibox-Https: 1`, and the proxy fetches
+  the page from the site over HTTPS (trusting the public CAs and those of `network.ca_certs`).
+  Redirects are followed by `web.ts` itself, each as such a request; one to another host is
+  asked for again. You still see and approve the original URL.
 - You approve a web request twice: once in Pi (with context: which tool, which query),
   then in the proxy console (the approval the agent can't bypass). Add trusted hosts to
   `egress.no_approval` if that feels redundant.

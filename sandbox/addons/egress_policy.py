@@ -19,6 +19,7 @@ Environment (all optional; lists are comma-separated domains, subdomains include
   UPSTREAM_PROXY        the upstream proxy of --mode upstream (needed to know where the rest goes)
   UPSTREAM_NO_PROXY     domains reached directly, not through the upstream proxy
   EGRESS_LOG            journal of every decision, default ~/.mitmproxy/egress.log
+A plain request with "X-Pibox-Https: 1" (the agent's web tools, for an https:// page) leaves as HTTPS.
   JIRA_URL, JIRA_TOKEN  requests to Jira's host get "Authorization" here, so the token never enters
                         the agent's container. With an https:// JIRA_URL they leave as HTTPS, also
                         when the agent asked for http://: the token never travels in plain text.
@@ -173,6 +174,21 @@ def http_connect(flow: http.HTTPFlow) -> None:
     _audit(logging.INFO, f"TUNNEL {req.host}:{req.port}")
 
 
+HTTPS_HEADER = "X-Pibox-Https"
+
+
+def _wants_https(req: http.Request) -> bool:
+    """The agent's web tools ask for an https:// page as plain "GET http://host/path" (so its method
+    can be checked here) with X-Pibox-Https: 1: the request then leaves as HTTPS to port 443 (or the
+    port given). Without this the site would only see plain HTTP and redirect to https://, which
+    the client could follow only through a tunnel, and tunnels are refused."""
+    if req.headers.pop(HTTPS_HEADER, "") != "1" or req.scheme != "http":
+        return False
+    if req.port == 80:
+        req.port = 443
+    return True
+
+
 def requestheaders(flow: http.HTTPFlow) -> None:
     if _internal(flow):
         return
@@ -183,10 +199,14 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         return _block(flow, 400, "request bodies are not allowed")
     if "upgrade" in req.headers:
         return _block(flow, 400, "protocol upgrades (WebSocket) are not allowed")
+    https = _wants_https(req)
     reason = _violation(req.host, req.port)
     if reason:
         return _block(flow, 403, reason)
     _route(flow, req.host)
+    if https:                                 # the site gets HTTPS, the agent stays on plain HTTP to us
+        req.scheme = "https"
+        req.authority = ""                    # inside the TLS connection: "GET /path", not the proxy form
     if UPSTREAM and _matches(req.host, NO_PROXY):
         req.authority = ""                    # direct: send "GET /path", not the proxy form
     if JIRA_HOST and req.host.lower().rstrip(".") == JIRA_HOST:

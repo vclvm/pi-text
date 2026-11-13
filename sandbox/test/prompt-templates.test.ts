@@ -21,3 +21,11 @@ test("/review takes what to review from the task, git status is no more than a f
   assert.doesNotMatch(text, /`git status`|`git diff`/);
   assert.match(text, /What to review is what the task names/);
 });
+
+test("/review's report opens with the context: compared, asked, changed, verified", () => {
+  const text = readFileSync(join(DIR, "review.md"), "utf8");
+  const at = (s: string) => text.indexOf(s);
+  assert.ok(at("1. Context") > 0 && at("1. Context") < at("2. Findings"));
+  for (const s of ["What was compared", "What the task asks", "What the changes do", "What was verified"])
+    assert.ok(at(s) > at("1. Context") && at(s) < at("2. Findings"), s);
+});
