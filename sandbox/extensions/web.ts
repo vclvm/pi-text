@@ -1,6 +1,7 @@
 /**
  * Read-only web tools. Every request is a GET made by curl (through PI_WEB_PROXY or the
  * https_proxy environment), shown to the user first: Allow once / Allow host for the session / Deny.
+ * `pibox run --allow-web` sets PI_WEB_TOKEN: no question here, and the proxy doesn't ask either.
  * Search backends: SearXNG (WEB_SEARCH_SEARXNG=http://searxng:8080) or DuckDuckGo's HTML endpoint.
  * PI_WEB_PLAIN_HTTP=1: send https:// URLs to the proxy as plain http:// requests (no tunnel), so a
  * filtering proxy can see the method, marked with X-Pibox-Https: 1 so that the proxy fetches them
@@ -13,6 +14,8 @@ const PROXY = process.env.PI_WEB_PROXY ?? process.env.https_proxy ?? process.env
 const SEARXNG = process.env.WEB_SEARCH_SEARXNG ?? "";
 const PLAIN_HTTP = process.env.PI_WEB_PLAIN_HTTP === "1";
 const MAX_CHARS = Number(process.env.WEB_FETCH_MAX_CHARS ?? 20000);
+// pibox run --allow-web: no approval here, and the proxy lets requests with this token pass too
+const WEB_TOKEN = process.env.PI_WEB_TOKEN ?? "";
 const PRIVATE_HOST = /^(localhost|.*\.local|.*\.internal|bridge|proxy|metadata(\.google\.internal)?)$|^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[?::1\]?$|\[?f[cd])/i;
 
 export default function (pi: ExtensionAPI) {
@@ -25,7 +28,7 @@ export default function (pi: ExtensionAPI) {
 
   async function approve(url: URL, why: string, ctx: ExtensionContext): Promise<void> {
     check(url);
-    if (allowedHosts.has(url.hostname)) return;
+    if (WEB_TOKEN || allowedHosts.has(url.hostname)) return;
     if (!ctx.hasUI) throw new Error("Web access needs approval, but no UI is available");
     const choice = await ctx.ui.select(`🌐 ${why}\n\nGET ${url.href}\n`,
       ["Allow once", `Allow ${url.hostname} for this session`, "Deny"]);
@@ -45,6 +48,7 @@ export default function (pi: ExtensionAPI) {
     if (PROXY) args.push("--proxy", PROXY);
     const plain = PLAIN_HTTP && url.protocol === "https:";
     if (plain) args.push("--header", "X-Pibox-Https: 1");
+    if (WEB_TOKEN) args.push("--header", `X-Pibox-Web-Token: ${WEB_TOKEN}`);
     args.push("--", plain ? "http:" + url.href.slice(6) : url.href);
     const r = await pi.exec("curl", args, { signal, timeout: 35000, maxBuffer: 8 * 1024 * 1024 });
     const at = r.stdout.lastIndexOf(marker);

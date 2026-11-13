@@ -19,6 +19,7 @@ Environment (all optional; lists are comma-separated domains, subdomains include
   UPSTREAM_PROXY        the upstream proxy of --mode upstream (needed to know where the rest goes)
   UPSTREAM_NO_PROXY     domains reached directly, not through the upstream proxy
   EGRESS_LOG            journal of every decision, default ~/.mitmproxy/egress.log
+  EGRESS_WEB_TOKENS     folder of the tokens of `pibox run --allow-web` runs (requests without approval)
 A plain request with "X-Pibox-Https: 1" (the agent's web tools, for an https:// page) leaves as HTTPS.
   JIRA_URL, JIRA_TOKEN  requests to Jira's host get "Authorization" here, so the token never enters
                         the agent's container. With an https:// JIRA_URL they leave as HTTPS, also
@@ -189,10 +190,24 @@ def _wants_https(req: http.Request) -> bool:
     return True
 
 
+WEB_TOKENS = os.environ.get("EGRESS_WEB_TOKENS", "")
+TOKEN_HEADER = "X-Pibox-Web-Token"
+
+
+def _token_allowed(req: http.Request) -> bool:
+    """pibox run --allow-web: the run's token is a file in EGRESS_WEB_TOKENS (only the proxy sees that
+    folder; pibox deletes the file when the run ends), and its requests carry it in X-Pibox-Web-Token.
+    They pass without approval; every other rule still holds. The header never leaves the proxy."""
+    token = req.headers.pop(TOKEN_HEADER, "")
+    return bool(WEB_TOKENS and re.fullmatch(r"[0-9a-f]{32}", token)
+                and os.path.isfile(os.path.join(WEB_TOKENS, token)))
+
+
 def requestheaders(flow: http.HTTPFlow) -> None:
     if _internal(flow):
         return
     req = flow.request
+    allowed = _token_allowed(req)             # first: the header goes, whatever is decided
     if req.method.upper() not in ALLOWED_METHODS:
         return _block(flow, 405, f"method {req.method} not allowed (GET/HEAD only)")
     if req.headers.get("content-length", "0") not in ("", "0") or "transfer-encoding" in req.headers:
@@ -218,6 +233,8 @@ def requestheaders(flow: http.HTTPFlow) -> None:
         flow.metadata["jira"] = True
     if _matches(req.host, NO_APPROVAL):
         _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url}")
+    elif allowed:
+        _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url} (pibox run --allow-web)")
     else:
         _audit(logging.INFO, f"ASK {req.method} {req.pretty_url}")
         flow.intercept()                  # waits in the console until you resume (a) or kill (x) it
