@@ -87,7 +87,7 @@ services:
       # With an upstream proxy: a second listener through which tunnels to upstream_no_proxy hosts
       # connect directly (upstream mode can't); only loopback connections skip the policy there
       EGRESS_DIRECT_PORT: "18099"
-      # pibox run --allow-web: a token per run, here only (the agent's container doesn't see this folder)
+      # pibox run --allow-search: a token per run, here only (the agent's container doesn't see this folder)
       EGRESS_WEB_TOKENS: /pibox-web
     volumes:
       - ./addons:/addons:ro

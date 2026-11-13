@@ -532,7 +532,7 @@ cd ~/Projects/api && pibox run
 `pibox run` checks that you're inside your projects or the vault, then starts a fresh `pi`
 container with that folder as its working directory. Because the paths are identical in the
 container, every folder works: one project, `~/Projects` for work across several, or the vault.
-`pibox log` follows the web journal, `pibox down` stops everything. `pibox run --allow-web`
+`pibox log` follows the web journal, `pibox down` stops everything. `pibox run --allow-search`
 (the first argument; the rest go to Pi) runs without any approval of web requests: `web_search`
 and `web_fetch` work without the approval console (§9.3).
 
@@ -1297,7 +1297,7 @@ It's an early warning that shows intent, while the OS layer does the enforcing.
 - You approve a web request twice: once in Pi (with context: which tool, which query),
   then in the proxy console (the approval the agent can't bypass). Add trusted hosts to
   `egress.no_approval` if that feels redundant.
-- **`pibox run --allow-web`**: no approval at all for this run, neither in Pi nor in the proxy.
+- **`pibox run --allow-search`**: no approval at all for this run, neither in Pi nor in the proxy.
   `pibox run` makes a random token, puts it where only the proxy sees it
   (`~/.pi-sandbox/generated/web-tokens/`) and gives it to the agent's container (`PI_WEB_TOKEN`);
   requests carrying it pass the proxy unasked, and the token is deleted when the run ends. The

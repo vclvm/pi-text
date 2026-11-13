@@ -19,7 +19,7 @@ Environment (all optional; lists are comma-separated domains, subdomains include
   UPSTREAM_PROXY        the upstream proxy of --mode upstream (needed to know where the rest goes)
   UPSTREAM_NO_PROXY     domains reached directly, not through the upstream proxy
   EGRESS_LOG            journal of every decision, default ~/.mitmproxy/egress.log
-  EGRESS_WEB_TOKENS     folder of the tokens of `pibox run --allow-web` runs (requests without approval)
+  EGRESS_WEB_TOKENS     folder of the tokens of `pibox run --allow-search` runs (requests without approval)
 A plain request with "X-Pibox-Https: 1" (the agent's web tools, for an https:// page) leaves as HTTPS.
   JIRA_URL, JIRA_TOKEN  requests to Jira's host get "Authorization" here, so the token never enters
                         the agent's container. With an https:// JIRA_URL they leave as HTTPS, also
@@ -195,7 +195,7 @@ TOKEN_HEADER = "X-Pibox-Web-Token"
 
 
 def _token_allowed(req: http.Request) -> bool:
-    """pibox run --allow-web: the run's token is a file in EGRESS_WEB_TOKENS (only the proxy sees that
+    """pibox run --allow-search: the run's token is a file in EGRESS_WEB_TOKENS (only the proxy sees that
     folder; pibox deletes the file when the run ends), and its requests carry it in X-Pibox-Web-Token.
     They pass without approval; every other rule still holds. The header never leaves the proxy."""
     token = req.headers.pop(TOKEN_HEADER, "")
@@ -234,7 +234,7 @@ def requestheaders(flow: http.HTTPFlow) -> None:
     if _matches(req.host, NO_APPROVAL):
         _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url}")
     elif allowed:
-        _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url} (pibox run --allow-web)")
+        _audit(logging.INFO, f"ALLOW {req.method} {req.pretty_url} (pibox run --allow-search)")
     else:
         _audit(logging.INFO, f"ASK {req.method} {req.pretty_url}")
         flow.intercept()                  # waits in the console until you resume (a) or kill (x) it

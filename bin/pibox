@@ -49,8 +49,8 @@ Install and configure:
 Run:
   up [--build]   start the VM, build the images (only if what they are built from changed; --build:
                  always), start bridge, proxy and the agent's Docker engine
-  run [--allow-web] [args]
-                 Pi in a fresh container, in the current folder (args go to pi); --allow-web:
+  run [--allow-search] [args]
+                 Pi in a fresh container, in the current folder (args go to pi); --allow-search:
                  web_search, web_fetch and the agent's other GET requests without approval, this run only
   task [new|edit [rules|memory]]
                  the project's task, rules and memory, outside its repository (folders.notes/<path under
@@ -1659,7 +1659,7 @@ up)                                         # VM, images, bridge, proxy, the age
     recreate=(--force-recreate)
     print "starting the containers (new ones: pibox setup or init ran since the last pibox up): bridge, proxy${PI_DOCKER_HOST:+, the agent's Docker engine}"
   fi
-  mkdir -p "$SB/generated/web-tokens"      # the proxy mounts it (pibox run --allow-web)
+  mkdir -p "$SB/generated/web-tokens"      # the proxy mounts it (pibox run --allow-search)
   compose up -d $recreate --remove-orphans bridge proxy ${PI_DOCKER_HOST:+docker}
   touch "$SB/generated/up.stamp"
   for i in {1..30}; do                      # wait until the bridge accepts connections
@@ -1675,9 +1675,9 @@ run)                                        # Pi in a fresh container, in the cu
   local h n; h=$(here); n=$(project_notes "$h"); mkdir -p "$n/.memory"
   [[ -f "$n/memory.md" || ! -f "$SB/agent/templates/memory.md" ]] || cp "$SB/agent/templates/memory.md" "$n/memory.md"
   compose_args; local -a c=($reply); dk
-  [[ "${1:-}" == --allow-web ]] || exec $reply $c run --rm -w "$h" -e PI_PROJECT_NOTES="$n" pi "$@"
+  [[ "${1:-}" == --allow-search ]] || exec $reply $c run --rm -w "$h" -e PI_PROJECT_NOTES="$n" pi "$@"
   shift
-  # --allow-web: web_search, web_fetch and every other GET of this run without approval, in Pi and
+  # --allow-search: web_search, web_fetch and every other GET of this run without approval, in Pi and
   # in the proxy. The run gets a random token; the proxy finds it in generated/web-tokens/ (a
   # folder only the proxy mounts) and lets requests carrying it pass. The file holds the PID of
   # this pibox and goes when the run ends; tokens of runs that are gone (killed) are removed here.
@@ -1685,13 +1685,13 @@ run)                                        # Pi in a fresh container, in the cu
   mkdir -p "$dir"
   for f in "$dir"/*(N.); do kill -0 "$(<"$f")" 2>/dev/null || rm -f "$f"; done
   tok=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-  [[ ${#tok} == 32 && "$tok" != *[^0-9a-f]* ]] || die "couldn't make a token for --allow-web"
+  [[ ${#tok} == 32 && "$tok" != *[^0-9a-f]* ]] || die "couldn't make a token for --allow-search"
   print -r -- "$$" >"$dir/$tok"
   trap 'rm -f "$dir/$tok"' EXIT
   trap 'rm -f "$dir/$tok"; exit 129' HUP
   trap 'rm -f "$dir/$tok"; exit 143' TERM
   trap ':' INT                              # Ctrl-C belongs to Pi; a handler (not "ignore") isn't inherited
-  print -u2 "web access without approval for this run (--allow-web): the agent's GET requests pass the proxy unasked"
+  print -u2 "web access without approval for this run (--allow-search): the agent's GET requests pass the proxy unasked"
   $reply $c run --rm -w "$h" -e PI_PROJECT_NOTES="$n" -e PI_WEB_TOKEN="$tok" pi "$@"
   local rc=$?
   rm -f "$dir/$tok"
